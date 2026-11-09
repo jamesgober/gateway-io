@@ -33,3 +33,11 @@ Technical decisions made while building the skeleton. Each says what, why, and w
 - `authenticate(Inspected::new(), &visit)`: `Ok(identified)` becomes the identity stamp (gatekeeper's token is Send + Sync + Clone + 'static and is kept in the slot); `Err(refusal)` becomes `Authentication::Refused` with `refusal.status()`.
 - Copy `identified.set_cookie()` or `refusal.set_cookie()` into the `AuthCookie`.
 - Web services: web-net 0.3's `Gate` impl lives in gatekeeper-io (feature `web-net`) and authorizes with `Gatekeeper::check(&Identified, &Rule, ..)`, which does not consume the token.
+
+## Web service wiring (web-net), agreed 2026-11-08
+
+- Call web-net from the gateway's `HttpService::call` after the core authenticated: `App::respond_identified(req, env, &who, reply)` with serve-net's own request and reply, where `who` is gatekeeper-io's `Identified`. Or `App::serve(req, env, Some(&who), reply) -> Served { outcome, route, cache }` to get the guest-cache report: `Cacheable::Guests { max_age }` only for a guest GET/HEAD 200 with no cookie and no CORS. `App::classify(&HttpHead)` in `head` for the lane and work class.
+- The "only cleared requests reach content" rule holds inside web-net: handlers and hooks receive only `Cx`, which has no public constructor and is built only after `G::authorize` passed (or the route is public), the authorized checkpoint, and the CSRF step for unsafe methods (web-net tests/pipeline.rs, tests/attacks.rs T-1/T-2).
+- `respond_identified` never writes the authentication cookie (web-net tests/gate_cookie.rs); the gateway does (G-15).
+- web-net 0.8 makes `App<G, V = dyn View>` for Luminess; the entry-point signatures do not change.
+- wasp-core's `Service::handle(Passport<Identified>) -> Exit` has no access to serve-net's request and reply, so wiring web-net needs a web-service path in the gateway (or a protocol-aware service seam). That is the first change of build-path step 4.
