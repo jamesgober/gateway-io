@@ -8,7 +8,7 @@ The platform's front door and the minimum of the core it hands requests to, as a
 |---|---|
 | `crates/wasp-core` | the passport and its stage types, the passport pool, customs, the gates seam (authentication, authorization), the service seam, the core, the hello stub |
 | `crates/gateway-io` | serve-net wiring: the bouncer door and egress, admission on the passport pool, the request and response pipelines, the urgent line as the transport's control line, server-time metrics |
-| `crates/wasp` | the process: boot phases 0 to 4, shutdown in reverse |
+| `crates/wasp` | the process: boot phases 0 to 4, shutdown in reverse; the first web site (web-net, content in memory) |
 
 ## The path of a request
 
@@ -17,7 +17,8 @@ The platform's front door and the minimum of the core it hands requests to, as a
  head complete ─▶ admission: reserve a passport, or 503 with nothing taken
  Passport<Arrived> ─▶ customs head ─▶ Passport<Inspected> ─▶ checkpoint
  core: authenticate ─▶ Passport<Identified> ─▶ guest cache ─▶ the profile's service
- service: route ─▶ authorize ─▶ Passport<Cleared> ─▶ reply ─▶ Exit
+ passport service: route ─▶ authorize ─▶ Passport<Cleared> ─▶ reply ─▶ Exit
+ web service (web-net): Handoff ─▶ site, url, route, 405 ─▶ authorize (core's access gate) ─▶ handler ─▶ serve-net's reply
  customs export ─▶ last checkpoint ─▶ encode ─▶ passport wiped and returned ─▶ net-io write (bouncer egress)
 ```
 
@@ -33,7 +34,11 @@ It reads `wasp.conf` from the working directory (or the file named by `WASP_CONF
 
 ```bash
 curl -i http://127.0.0.1:8080/
+curl -i http://127.0.0.1:8080/posts/hello-world
+curl -i http://127.0.0.1:8080/account
 ```
+
+The site: `/`, `/posts/:slug` (from an in-memory map), `/about`, `/account` (signed in only: guests get a 303 to `/sign-in`), `/sign-in`, `/health`.
 
 ## Configuration
 
@@ -48,7 +53,11 @@ curl -i http://127.0.0.1:8080/
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
 | `door.ban` | none | addresses refused at the door from boot |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests) |
-| `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests |
+| `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
+| `site.base` | none | the folder the site lives under (`/blog`) |
+| `site.hosts` | none | the site's hosts, canonical first; none answers localhost (development) |
+| `site.assets` | none | a folder served under `/static` |
+| `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`) |
 
 ## Check
 

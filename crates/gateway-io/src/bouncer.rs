@@ -52,9 +52,15 @@ impl DoorCheckpoint {
 }
 
 impl Checkpoint for DoorCheckpoint {
+    /// Judges the request's own ticket (its tag is the envelope's user word,
+    /// written when the head was complete), or the connection's before that.
     #[inline]
     fn check(&self, env: &Envelope, _at: CheckpointAt) -> Verdict {
-        match self.bouncer.egress(TicketTag::from(env.gate_tag())) {
+        let tag = match env.user_word() {
+            0 => TicketTag::from(env.gate_tag()),
+            word => TicketTag::from_raw(word),
+        };
+        match self.bouncer.egress(tag) {
             bouncer_io::Verdict::Deny(denial) => Verdict::Deny {
                 status: denial.code.http_status(),
             },

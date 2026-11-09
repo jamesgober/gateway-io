@@ -245,6 +245,14 @@ impl Passport<Identified> {
         &self.slot.body
     }
 
+    /// The passport's exit when an external service answered on the
+    /// protocol's own types: the passport carries no reply. Only the core's
+    /// [`crate::Handoff`] calls this.
+    pub(crate) fn handed_off(mut self) -> Exit {
+        self.slot.reply.mark_handed_off();
+        Exit { slot: self.slot }
+    }
+
     /// Writes the access stamp. Only [`crate::Access::authorize`] calls this,
     /// after the authorizer allowed the rule.
     #[inline]

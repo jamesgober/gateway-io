@@ -152,9 +152,14 @@ pub enum Decision {
 }
 
 /// Authorization: checks the matched route's rule, once per request.
+///
+/// It decides on the identity and the rule alone (checks against a specific
+/// object, such as "owner of this post", belong to the handler that loaded
+/// the object), so the same authorizer serves passport services and services
+/// that answer on the protocol's own types.
 pub trait Authorizer: Send + Sync + 'static {
     /// Decides whether `identity` may use the route `rule` protects.
-    fn authorize(&self, request: RequestView<'_>, identity: &Identity, rule: &Rule) -> Decision;
+    fn authorize(&self, identity: &Identity, rule: &Rule) -> Decision;
 }
 
 /// The first authorizer: the rule's own terms and nothing else. Guests pass
@@ -164,7 +169,7 @@ pub struct RuleTerms;
 
 impl Authorizer for RuleTerms {
     #[inline]
-    fn authorize(&self, _request: RequestView<'_>, identity: &Identity, rule: &Rule) -> Decision {
+    fn authorize(&self, identity: &Identity, rule: &Rule) -> Decision {
         if rule.allows_guests() {
             return Decision::Allow;
         }
@@ -209,10 +214,19 @@ impl Access {
         p: Passport<Identified>,
         rule: &Rule,
     ) -> Result<Passport<Cleared>, Exit> {
-        match self.authorizer.authorize(p.view(), p.identity(), rule) {
+        match self.authorizer.authorize(p.identity(), rule) {
             Decision::Allow => Ok(p.clear(AccessStamp { rule: rule.id() })),
             Decision::Deny(refusal) => Err(p.refuse_with(refusal)),
         }
+    }
+
+    /// The decision alone, for a service that answers on the protocol's own
+    /// types (the web service): it holds no passport, so it gets a decision
+    /// and enforces it itself.
+    #[inline]
+    #[must_use]
+    pub fn check(&self, identity: &Identity, rule: &Rule) -> Decision {
+        self.authorizer.authorize(identity, rule)
     }
 }
 

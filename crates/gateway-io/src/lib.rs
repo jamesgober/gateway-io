@@ -24,9 +24,13 @@ pub mod gateway;
 pub mod observe;
 pub mod pipeline;
 pub mod settings;
+pub mod tickets;
+pub mod web;
 
 pub use crate::control::UrgentControl;
 pub use crate::gateway::{Door, Gateway, OpenError};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::settings::{Settings, SettingsError};
+pub use crate::tickets::RequestTickets;
+pub use crate::web::{WaspGate, WebService, WebServices, Who};

@@ -296,6 +296,9 @@ pub enum ReplyKind {
     Refusal,
     /// Bytes from the core's guest output cache.
     Cached,
+    /// An external service wrote the reply on the protocol's own types; the
+    /// passport carries none.
+    HandedOff,
 }
 
 /// The way out: status, fields, body. Reused across requests.
@@ -401,6 +404,10 @@ impl Reply {
     #[must_use]
     pub fn kind(&self) -> ReplyKind {
         self.kind
+    }
+
+    pub(crate) fn mark_handed_off(&mut self) {
+        self.kind = ReplyKind::HandedOff;
     }
 
     /// Replaces whatever was written with a refusal: wiped, then a fixed body.

@@ -16,6 +16,8 @@ serve-net = { workspace = true }
 net-io = { workspace = true }
 # The door before any byte is read, request tickets, egress on every write.
 bouncer-io = { workspace = true }
+# The web service: site, url, router, authorize, handlers, render (public, generic).
+web-net = { workspace = true }
 
 [dev-dependencies]
 bouncer-io = { workspace = true }

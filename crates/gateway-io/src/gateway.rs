@@ -16,6 +16,8 @@ use crate::control::UrgentControl;
 use crate::observe::{ServerTime, TimeObserver};
 use crate::pipeline::{PassportAdmit, Pipeline};
 use crate::settings::Settings;
+use crate::tickets::RequestTickets;
+use crate::web::{WebService, WebServices};
 
 /// Why the gateway did not open.
 #[derive(Debug)]
@@ -31,6 +33,7 @@ impl std::error::Error for OpenError {}
 
 /// The gateway's door, open: accepting.
 pub struct Door {
+    tickets: Arc<RequestTickets>,
     running: Running,
     pool: Arc<PassportPool>,
     bouncer: Bouncer,
@@ -39,8 +42,23 @@ pub struct Door {
 
 impl Door {
     /// Binds every listener with the door closed, then opens it: the last step
-    /// of boot. `line` is the kernel's urgent line.
-    pub fn open(core: Arc<Core>, settings: &Settings, line: UrgentLine) -> Result<Door, OpenError> {
+    /// of boot. `line` is the kernel's urgent line; `web` holds a web service
+    /// for every external service the core declares (a missing one refuses to
+    /// open).
+    pub fn open(
+        core: Arc<Core>,
+        settings: &Settings,
+        line: UrgentLine,
+        web: WebServices,
+    ) -> Result<Door, OpenError> {
+        for (tag, name) in core.external_services() {
+            if web.get(tag).is_none() {
+                return Err(OpenError(format!(
+                    "service `{name}` is external but no web service is attached for it"
+                )));
+            }
+        }
+        let tickets = Arc::new(RequestTickets::new(settings.workers));
         let pool = Arc::new(PassportPool::new(
             settings.workers,
             settings.passports,
@@ -84,11 +102,18 @@ impl Door {
             .build()
             .map_err(|e| OpenError(format!("gateway configuration: {e}")))?;
         let bound = built
-            .bind(Pipeline::new(core, pool.clone(), bouncer.clone()))
+            .bind(Pipeline::new(
+                core,
+                pool.clone(),
+                bouncer.clone(),
+                tickets.clone(),
+                Arc::new(web),
+            ))
             .map_err(|e| OpenError(e.to_string()))?;
         let running = bound.open().map_err(|e| OpenError(e.to_string()))?;
         ejector.attach(running.server_handle());
         Ok(Door {
+            tickets,
             running,
             pool,
             bouncer,
@@ -106,6 +131,13 @@ impl Door {
     #[must_use]
     pub fn pool(&self) -> &PassportPool {
         &self.pool
+    }
+
+    /// Request tickets held right now (one per request between its head and
+    /// its end); zero when nothing is in flight.
+    #[must_use]
+    pub fn tickets_held(&self) -> usize {
+        self.tickets.held()
     }
 
     /// The process's bouncer (bans, revocations).
@@ -137,6 +169,7 @@ impl Door {
 /// everything else started and is stopped before anything else.
 pub struct Gateway {
     core: Arc<Core>,
+    web: Option<WebServices>,
     open: Option<Door>,
     link: Option<Link>,
     drain: Duration,
@@ -148,10 +181,23 @@ impl Gateway {
     pub fn new(core: Arc<Core>) -> Gateway {
         Gateway {
             core,
+            web: Some(WebServices::new()),
             open: None,
             link: None,
             drain: Settings::default().drain,
         }
+    }
+
+    /// Attaches a web service for the core's external service `name`.
+    /// An unknown name is refused when the gateway opens.
+    #[must_use]
+    pub fn web(mut self, name: &str, service: impl WebService) -> Gateway {
+        if let (Some(tag), Some(web)) = (self.core.service_tag(name), self.web.as_mut()) {
+            web.attach(tag, service);
+        } else {
+            self.web = None;
+        }
+        self
     }
 }
 
@@ -166,7 +212,11 @@ impl Subsystem for Gateway {
 
     fn start(&mut self, link: &Link) -> Result<(), Failure> {
         let settings = Settings::from_config(&link.foundation().config())?;
-        let open = Door::open(self.core.clone(), &settings, link.urgent().clone())?;
+        let web = self
+            .web
+            .take()
+            .ok_or_else(|| Failure::new("a web service names no service the core declares"))?;
+        let open = Door::open(self.core.clone(), &settings, link.urgent().clone(), web)?;
         let addr = open
             .local_addr()
             .map_or_else(|| settings.listen.clone(), |a| a.to_string());

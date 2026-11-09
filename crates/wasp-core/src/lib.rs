@@ -34,7 +34,7 @@ pub mod stub;
 pub use system_suite as suite;
 
 pub use crate::cache::{GuestCache, NoCache};
-pub use crate::core::{Core, CoreBuilder, CoreSubsystem, LoadError};
+pub use crate::core::{Core, CoreBuilder, CoreSubsystem, Handoff, LoadError, Routed};
 pub use crate::customs::{Customs, HeadRules};
 pub use crate::gates::{
     Access, AuthCookie, Authentication, Authenticator, Authorizer, Decision, EveryoneGuest, Rule,

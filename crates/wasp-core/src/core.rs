@@ -12,11 +12,13 @@ use crate::customs::{Customs, HeadRules};
 use crate::gates::{
     Access, AuthCookie, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms,
 };
+use crate::identity::Identity;
 use crate::passport::{Exit, Passport};
 use crate::profile::Profile;
 use crate::service::{Service, ServiceCtx};
+use crate::slot::Trip;
 use crate::slot::{ProfileId, ServiceTag};
-use crate::stage::Inspected;
+use crate::stage::{Identified, Inspected};
 use crate::suite::lifecycle::{Deadline, Failure, Link, Subsystem};
 use crate::suite::log;
 
@@ -34,13 +36,90 @@ impl std::error::Error for LoadError {}
 
 type ServiceFactory = Box<dyn FnOnce(ServiceCtx) -> Box<dyn Service> + Send>;
 
+/// A registered service: one that answers on passports, or one served outside
+/// the core on the protocol's own types (the web service on serve-net).
+enum Entry {
+    Passport(Box<dyn Service>),
+    External(String),
+}
+
+impl Entry {
+    fn name(&self) -> &str {
+        match self {
+            Entry::Passport(s) => s.name(),
+            Entry::External(n) => n,
+        }
+    }
+}
+
+/// What the core decided for one request.
+#[must_use = "a routed request carries a passport that must reach the pool"]
+pub enum Routed {
+    /// Answered, refused, or served from the cache: ready for the response
+    /// pipeline.
+    Exit(Exit),
+    /// Identified and assigned to an external service; the caller runs it and
+    /// then [`Handoff::finish`]es the passport.
+    Handoff(Handoff),
+}
+
+/// An identified request assigned to an external service. Only the core makes
+/// one, after authentication, so an external service can only ever be given an
+/// identified request.
+#[must_use = "a hand-off must be finished, or its passport never returns to the pool"]
+pub struct Handoff {
+    p: Passport<Identified>,
+    service: ServiceTag,
+}
+
+impl Handoff {
+    /// The service the profile names.
+    #[must_use]
+    pub fn service(&self) -> ServiceTag {
+        self.service
+    }
+
+    /// Who the request is from.
+    #[must_use]
+    pub fn identity(&self) -> &Identity {
+        self.p.identity()
+    }
+
+    /// The trip facts.
+    #[must_use]
+    pub fn trip(&self) -> &Trip {
+        self.p.trip()
+    }
+
+    /// The service answered on the protocol's own reply: the passport goes to
+    /// the response pipeline with no reply of its own (its authentication
+    /// cookie still rides on the response).
+    pub fn finish(self) -> Exit {
+        self.p.handed_off()
+    }
+
+    /// The service could not be run (none is attached for the tag): refuse.
+    pub fn refuse(self, status: u16) -> Exit {
+        self.p.refuse(status)
+    }
+}
+
+impl std::fmt::Debug for Handoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handoff")
+            .field("service", &self.service)
+            .field("passport", &self.p)
+            .finish()
+    }
+}
+
 /// Boot phases 1 to 3: declare profiles and services, then compile them into a
 /// [`Core`]. Every name is resolved here, once; at run time a profile and a
 /// service are array indexes.
 #[must_use = "a CoreBuilder does nothing until load()"]
 pub struct CoreBuilder {
     profiles: Vec<Profile>,
-    services: Vec<(String, ServiceFactory)>,
+    services: Vec<(String, Option<ServiceFactory>)>,
     authenticator: Box<dyn Authenticator>,
     authorizer: Arc<dyn Authorizer>,
     customs: Arc<dyn Customs>,
@@ -100,8 +179,18 @@ impl CoreBuilder {
     {
         self.services.push((
             name.to_owned(),
-            Box::new(move |ctx| Box::new(build(ctx)) as Box<dyn Service>),
+            Some(Box::new(move |ctx| {
+                Box::new(build(ctx)) as Box<dyn Service>
+            })),
         ));
+        self
+    }
+
+    /// Phase 2: a service served outside the core, on the protocol's own
+    /// types (the web service). The core still authenticates its requests and
+    /// assigns them; [`Core::route`] hands them over as a [`Handoff`].
+    pub fn external(mut self, name: &str) -> Self {
+        self.services.push((name.to_owned(), None));
         self
     }
 
@@ -158,20 +247,23 @@ impl CoreBuilder {
                 return Err(LoadError(format!("profile `{}` is declared twice", p.name)));
             }
         }
+        let access = Access::from_arc(self.authorizer.clone());
         let services = self
             .services
             .into_iter()
             .enumerate()
-            .map(|(i, (_, build))| {
-                build(ServiceCtx {
+            .map(|(i, (name, build))| match build {
+                Some(build) => Entry::Passport(build(ServiceCtx {
                     tag: ServiceTag(u8::try_from(i).unwrap_or(u8::MAX)),
-                    access: Access::from_arc(self.authorizer.clone()),
-                })
+                    access: access.clone(),
+                })),
+                None => Entry::External(name),
             })
             .collect();
         Ok(Core {
             profiles: self.profiles.into_boxed_slice(),
             services,
+            access,
             authenticator: self.authenticator,
             customs: self.customs,
             cache: self.cache,
@@ -183,7 +275,8 @@ impl CoreBuilder {
 /// only.
 pub struct Core {
     profiles: Box<[Profile]>,
-    services: Box<[Box<dyn Service>]>,
+    services: Box<[Entry]>,
+    access: Access,
     authenticator: Box<dyn Authenticator>,
     customs: Arc<dyn Customs>,
     cache: Box<dyn GuestCache>,
@@ -195,12 +288,26 @@ impl Core {
         CoreBuilder::new()
     }
 
-    /// One request: authenticate, answer from the guest cache, or assign the
-    /// profile's service. The service only ever sees an identified passport.
+    /// One request for a passport service: [`route`](Self::route), with a
+    /// hand-off to an external service refused (500), since no protocol layer
+    /// is here to run it.
     #[inline]
     pub fn handle(&self, p: Passport<Inspected>) -> Exit {
+        match self.route(p) {
+            Routed::Exit(exit) => exit,
+            Routed::Handoff(h) => h.refuse(500),
+        }
+    }
+
+    /// One request: authenticate, answer from the guest cache, or assign the
+    /// profile's service. A passport service runs here and the passport comes
+    /// back as an exit; an external service's request comes back as a
+    /// [`Handoff`]. Either way the service only ever sees an identified
+    /// request.
+    #[inline]
+    pub fn route(&self, p: Passport<Inspected>) -> Routed {
         let Some(profile) = self.profiles.get(usize::from(p.trip().profile.0)) else {
-            return p.refuse(500);
+            return Routed::Exit(p.refuse(500));
         };
         let mut p = p;
         let mut cookie = AuthCookie::from_buf(p.take_auth_cookie());
@@ -210,16 +317,57 @@ impl Core {
         p.put_auth_cookie(cookie.into_buf());
         let p = match decided {
             Authentication::Identified(identity) => p.identify(identity),
-            Authentication::Refused(refusal) => return p.refuse_with(refusal),
+            Authentication::Refused(refusal) => return Routed::Exit(p.refuse_with(refusal)),
         };
         let p = match self.cache.guest_hit(p) {
-            Ok(hit) => return hit,
+            Ok(hit) => return Routed::Exit(hit),
             Err(miss) => miss,
         };
         match self.services.get(usize::from(profile.service.0)) {
-            Some(service) => service.handle(p),
-            None => p.refuse(500),
+            Some(Entry::Passport(service)) => Routed::Exit(service.handle(p)),
+            Some(Entry::External(_)) => Routed::Handoff(Handoff {
+                p,
+                service: profile.service,
+            }),
+            None => Routed::Exit(p.refuse(500)),
         }
+    }
+
+    /// The access gate's handle, for external services (they authorize on
+    /// their own types with [`Access::check`]).
+    #[must_use]
+    pub fn access(&self) -> &Access {
+        &self.access
+    }
+
+    /// A service's tag by its registered name. Boot only.
+    #[must_use]
+    pub fn service_tag(&self, name: &str) -> Option<ServiceTag> {
+        self.services
+            .iter()
+            .position(|e| e.name() == name)
+            .and_then(|i| u8::try_from(i).ok())
+            .map(ServiceTag)
+    }
+
+    /// Whether the tag names an external service.
+    #[must_use]
+    pub fn is_external(&self, tag: ServiceTag) -> bool {
+        matches!(
+            self.services.get(usize::from(tag.0)),
+            Some(Entry::External(_))
+        )
+    }
+
+    /// The names of the external services, by tag.
+    pub fn external_services(&self) -> impl Iterator<Item = (ServiceTag, &str)> + '_ {
+        self.services
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Entry::External(n) => u8::try_from(i).ok().map(|t| (ServiceTag(t), n.as_str())),
+                Entry::Passport(_) => None,
+            })
     }
 
     /// The compiled profiles, by id.
@@ -242,12 +390,14 @@ impl Core {
 
     /// The registered services' names, by tag.
     pub fn service_names(&self) -> impl Iterator<Item = &str> + '_ {
-        self.services.iter().map(|s| s.name())
+        self.services.iter().map(Entry::name)
     }
 
     fn stop_services(&self) {
-        for service in self.services.iter() {
-            service.stop();
+        for entry in self.services.iter() {
+            if let Entry::Passport(service) = entry {
+                service.stop();
+            }
         }
     }
 }

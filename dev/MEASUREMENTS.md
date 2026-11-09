@@ -90,3 +90,61 @@ What the WASP path adds inside the server, timed around the gateway's `call` on 
 - Re-scanning field values in customs cost about 150 ns per request; the parser already refuses those bytes, so customs keeps only policy (G-10).
 - End to end, the WASP path is indistinguishable from bare serve-net within the noise of this machine (runs of the same server differ by more than the gap). The published comparison needs the reference box.
 - On a single connection, runs with a net-io gate installed were sometimes 10-25 us slower at p50 than without one, but not reproducibly; worth a quiet-machine run before concluding anything about the gate's write path.
+
+## Step 4: the web path (web-net 0.6 behind the core)
+
+Same benchmark (`cargo bench -p gateway-io --bench request_path`), now with two comparisons: the hello passport service against serve-net alone, and the web site path (core authenticates, hands off, web-net routes, authorizes through the core's access gate, renders) against web-net alone on serve-net with the same route. Since this step every request also takes its bouncer ticket at the head and releases it when done (G-16).
+
+WSL2 Linux (load average 82 to 90 on 32 CPUs), passport path:
+
+| server | connections | requests/s | p50 us | p99 us | p99.9 us | failed |
+|---|---|---|---|---|---|---|
+| serve-net alone | 1 | 30071 | 8.7 | 90.4 | 11096.0 | 0 |
+| gateway + hello | 1 | 20402 | 9.3 | 50.6 | 12194.9 | 0 |
+| difference at p50 | 1 | | +0.6 | | | |
+| serve-net alone | 8 | 78748 | 13.2 | 78.3 | 13039.9 | 0 |
+| gateway + hello | 8 | 72550 | 17.9 | 210.1 | 14906.8 | 0 |
+| difference at p50 | 8 | | +4.7 | | | |
+| serve-net alone | 32 | 60960 | 63.0 | 4037.2 | 43070.5 | 0 |
+| gateway + hello | 32 | 64683 | 65.9 | 10805.6 | 37427.8 | 0 |
+| difference at p50 | 32 | | +2.9 | | | |
+
+| connections | serve-net alone mean ns | gateway + hello mean ns | added, mean ns | gateway + hello p50 below | gateway + hello p99 below |
+|---|---|---|---|---|---|
+| 1 | 3332 | 3763 | +431 | 1.792µs | 10.24µs |
+| 8 | 8333 | 9888 | +1555 | 2.56µs | 40.96µs |
+| 32 | 70793 | 86251 | +15458 | 24.576µs | 262.144µs |
+
+WSL2 Linux, web path:
+
+| server | connections | requests/s | p50 us | p99 us | p99.9 us | failed |
+|---|---|---|---|---|---|---|
+| web-net alone | 1 | 39319 | 9.9 | 69.1 | 4340.2 | 0 |
+| gateway + web-net | 1 | 38493 | 10.5 | 55.6 | 4896.0 | 0 |
+| difference at p50 | 1 | | +0.6 | | | |
+| web-net alone | 8 | 67790 | 16.1 | 176.4 | 14064.1 | 0 |
+| gateway + web-net | 8 | 93152 | 17.1 | 142.3 | 13022.4 | 0 |
+| difference at p50 | 8 | | +1.0 | | | |
+
+| connections | web-net alone mean ns | gateway + web-net mean ns | added, mean ns | gateway + web-net p50 below | gateway + web-net p99 below |
+|---|---|---|---|---|---|
+| 1 | 6422 | 5449 | -973 | 2.56µs | 12.288µs |
+| 8 | 13134 | 15473 | +2339 | 3.072µs | 40.96µs |
+
+Windows (CPU near 100%), web path:
+
+| server | connections | requests/s | p50 us | p99 us | p99.9 us | failed |
+|---|---|---|---|---|---|---|
+| web-net alone | 1 | 20315 | 47.8 | 128.7 | 1247.0 | 0 |
+| gateway + web-net | 1 | 31454 | 21.4 | 89.1 | 766.5 | 0 |
+| difference at p50 | 1 | | -26.4 | | | |
+| web-net alone | 8 | 117161 | 45.0 | 230.8 | 1996.5 | 0 |
+| gateway + web-net | 8 | 120368 | 39.8 | 201.3 | 1684.3 | 0 |
+| difference at p50 | 8 | | -5.2 | | | |
+
+| connections | web-net alone mean ns | gateway + web-net mean ns | added, mean ns | gateway + web-net p50 below | gateway + web-net p99 below |
+|---|---|---|---|---|---|
+| 1 | 16696 | 14411 | -2285 | 5.12µs | 131.072µs |
+| 8 | 17399 | 17015 | -384 | 4.096µs | 163.84µs |
+
+Reading: on one connection on Linux, the platform adds 0.6 us at p50 on both paths, over serve-net alone and over web-net alone. Server-time means move by 1 to 2 us between runs, more than the difference; on Windows the gateway even measured faster than the bare servers in some rows. Every run ended with 0 passports in use and 0 request tickets held.

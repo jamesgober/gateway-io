@@ -34,7 +34,13 @@ fn settings(workers: u16, passports: u32) -> Settings {
 
 fn open(settings: &Settings) -> (Door, SocketAddr, UrgentLine) {
     let line = UrgentLine::detached();
-    let open = Door::open(core(), settings, line.clone()).expect("gateway opens");
+    let open = Door::open(
+        core(),
+        settings,
+        line.clone(),
+        gateway_io::WebServices::new(),
+    )
+    .expect("gateway opens");
     let addr = open.local_addr().expect("a TCP listener");
     (open, addr, line)
 }
@@ -144,6 +150,7 @@ fn hello_end_to_end_and_every_passport_returns() {
     drop(s);
     thread::sleep(Duration::from_millis(100));
     assert_eq!(open.pool().stats().in_use, 0, "every passport went back");
+    assert_eq!(open.tickets_held(), 0, "every request ticket released");
     let report = open.close(Duration::from_secs(2));
     assert_eq!(report.killed, 0);
 }
@@ -351,7 +358,13 @@ fn authentication_cookie_rides_on_answers_and_refusals() {
             .load()
             .expect("core loads"),
     );
-    let open = Door::open(core, &settings(1, 4), UrgentLine::detached()).expect("opens");
+    let open = Door::open(
+        core,
+        &settings(1, 4),
+        UrgentLine::detached(),
+        gateway_io::WebServices::new(),
+    )
+    .expect("opens");
     let addr = open.local_addr().expect("addr");
     let cleared = "__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly";
 

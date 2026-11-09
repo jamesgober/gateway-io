@@ -13,10 +13,15 @@ use std::time::Duration;
 
 use bouncer_io::{Bouncer, TicketTag};
 use serve_net::{
-    Admit, Admitted, Envelope, HttpReply, HttpRequest, HttpService, Outcome, ProfileTable, Shed,
-    WorkerId,
+    Admit, Admitted, Envelope, Finished, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService,
+    Outcome, ProfileTable, Shed, WorkerId,
 };
-use wasp_core::{Core, Exit, Lane, PassportPool, ProfileId, Refusal, RequestId, ServiceTag, Trip};
+use wasp_core::{
+    Core, Exit, Lane, PassportPool, ProfileId, Refusal, RequestId, Routed, ServiceTag, Trip,
+};
+
+use crate::tickets::RequestTickets;
+use crate::web::WebServices;
 
 /// Admission: a request is admitted only if its worker has a free passport.
 /// Runs once the head is complete and before any body byte is read, so a slow
@@ -64,49 +69,85 @@ impl Admit for PassportAdmit {
     }
 }
 
-/// The gateway's service: the passport pipeline around the core.
+/// The gateway's service: the passport pipeline around the core, and the
+/// hand-off to web services.
 pub struct Pipeline {
     core: Arc<Core>,
     pool: Arc<PassportPool>,
     bouncer: Bouncer,
+    tickets: Arc<RequestTickets>,
+    web: Arc<WebServices>,
+}
+
+/// How a request left the request pipeline.
+enum Flow {
+    /// A passport exit: encode its reply.
+    Exit(Exit),
+    /// A web service already wrote serve-net's reply; the passport goes back.
+    Web(Exit, Outcome),
+    /// Admission reserved a passport the shelf did not have (a bug; fail closed).
+    NoPassport,
 }
 
 impl Pipeline {
-    /// The pipeline over a loaded core, its pool, and the process's bouncer.
+    /// The pipeline over a loaded core, its pool, the process's bouncer, the
+    /// request tickets, and the web services by tag.
     #[must_use]
-    pub fn new(core: Arc<Core>, pool: Arc<PassportPool>, bouncer: Bouncer) -> Pipeline {
+    pub fn new(
+        core: Arc<Core>,
+        pool: Arc<PassportPool>,
+        bouncer: Bouncer,
+        tickets: Arc<RequestTickets>,
+        web: Arc<WebServices>,
+    ) -> Pipeline {
         Pipeline {
             core,
             pool,
             bouncer,
+            tickets,
+            web,
         }
     }
 
-    /// The request pipeline for one admitted request, ending in an exit.
+    /// A checkpoint on this request's ticket: `Some(status)` when the bouncer
+    /// denies it. Two atomic loads while nothing is revoked.
+    #[inline]
+    fn denied(&self, tag: TicketTag) -> Option<u16> {
+        match self.bouncer.egress(tag) {
+            bouncer_io::Verdict::Deny(d) => Some(d.code.http_status()),
+            _ => None,
+        }
+    }
+
+    /// The request pipeline for one admitted request.
     #[inline]
     fn request(
         &self,
         req: &HttpRequest<'_>,
         env: &Envelope,
-        ticket: &mut bouncer_io::Ticket,
-    ) -> Result<Exit, Shortfall> {
+        tag: TicketTag,
+        reply: &mut HttpReply,
+    ) -> Flow {
         let worker = env.worker().get();
-        let mut p = self.pool.take(worker).ok_or(Shortfall::NoPassport)?;
-        let id = RequestId::new();
+        let Some(mut p) = self.pool.take(worker) else {
+            return Flow::NoPassport;
+        };
+        let service = ServiceTag(env.tag());
         p.set_trip(Trip {
-            id,
+            id: RequestId::new(),
             conn: env.connection().get(),
             seq: env.seq().get(),
             worker,
             profile: ProfileId(env.profile().0),
-            service: ServiceTag(env.tag()),
+            service,
             lane: Lane(env.lane().0),
             client: env.client().addr(),
             arrived: env.arrived(),
             deadline: env.deadline(),
-            ticket: ticket.tag().get(),
+            ticket: tag.get(),
         });
-        // Copy the head (and spans) and the buffered body into the passport.
+        // Copy the head (and spans) into the passport; the body too, unless
+        // a web service reads it from serve-net's request itself.
         let head = req.head();
         let minor = match head.version() {
             serve_net::Version::Http10 => 0,
@@ -117,49 +158,60 @@ impl Pipeline {
         for (name, value) in head.headers() {
             slot.push_field(name, value);
         }
-        p.body_mut().extend_from_slice(req.body_bytes());
+        if !self.core.is_external(service) {
+            p.body_mut().extend_from_slice(req.body_bytes());
+        }
 
         // REQUEST: customs head.
         let p = match p.inspect(self.core.customs()) {
             Ok(p) => p,
-            Err(refused) => return Ok(refused),
+            Err(refused) => return Flow::Exit(refused),
         };
         // Checkpoint between gateway and core.
-        if let bouncer_io::Verdict::Deny(d) = ticket.checkpoint() {
-            return Ok(p.refuse_with(Refusal::status(d.code.http_status()).closing()));
+        if let Some(status) = self.denied(tag) {
+            return Flow::Exit(p.refuse_with(Refusal::status(status).closing()));
         }
         // CORE: authenticate, cache, assign the service.
-        Ok(self.core.handle(p))
+        match self.core.route(p) {
+            Routed::Exit(exit) => Flow::Exit(exit),
+            Routed::Handoff(h) => match self.web.get(h.service()) {
+                Some(web) => {
+                    let outcome = web.respond(req, env, h.identity(), reply);
+                    Flow::Web(h.finish(), outcome)
+                }
+                None => Flow::Exit(h.refuse(500)),
+            },
+        }
     }
 
-    /// The response pipeline: export check, the last checkpoint, encode.
+    /// The response pipeline for a passport exit: export check, the last
+    /// checkpoint, encode.
     #[inline]
-    fn respond(
-        &self,
-        exit: Exit,
-        ticket: &mut bouncer_io::Ticket,
-        reply: &mut HttpReply,
-    ) -> Outcome {
+    fn respond(&self, exit: Exit, tag: TicketTag, reply: &mut HttpReply) -> Outcome {
         let exit = match self.core.customs().export(exit.reply()) {
             Ok(()) => exit,
             Err(refusal) => exit.refuse_with(refusal),
         };
-        let exit = match ticket.checkpoint() {
-            bouncer_io::Verdict::Deny(d) => {
-                exit.refuse_with(Refusal::status(d.code.http_status()).closing())
-            }
-            _ => exit,
+        let exit = match self.denied(tag) {
+            Some(status) => exit.refuse_with(Refusal::status(status).closing()),
+            None => exit,
         };
         let close = encode(&exit, reply);
         self.pool.give_back(exit);
         if close { Outcome::Close } else { Outcome::Done }
     }
-}
 
-/// Why a request could not get as far as an exit.
-enum Shortfall {
-    /// Admission reserved a passport the shelf did not have (a bug; fail closed).
-    NoPassport,
+    /// The response pipeline for a web service's reply: the authentication
+    /// cookie, then the passport back to the pool. A revocation from here on
+    /// is serve-net's `BeforeReply` checkpoint, which replaces the reply whole.
+    #[inline]
+    fn respond_web(&self, exit: Exit, outcome: Outcome, reply: &mut HttpReply) -> Outcome {
+        if let Some(cookie) = exit.auth_cookie() {
+            reply.header("set-cookie", cookie);
+        }
+        self.pool.give_back(exit);
+        outcome
+    }
 }
 
 /// Writes the exit's reply into serve-net's reply. serve-net encodes it through
@@ -187,24 +239,45 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
 }
 
 impl HttpService for Pipeline {
-    fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
-        // The request's bouncer ticket, under the connection's. A connection the
-        // door never admitted (or one already released) fails closed.
+    /// The head is complete: the request's bouncer ticket, under the
+    /// connection's, is taken and held until `done`. A connection the door
+    /// never admitted, or one already revoked, is refused here.
+    fn head(&self, _head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
         let id = bouncer_io::RequestId(
             u128::from(env.connection().get()) << 32 | u128::from(env.seq().get()),
         );
-        let Ok(mut ticket) = self.bouncer.request(TicketTag::from(env.gate_tag()), id) else {
-            reply.text(503, wasp_core::refusal_text(503)).close();
-            return Outcome::Close;
+        let ticket = match self.bouncer.request(TicketTag::from(env.gate_tag()), id) {
+            Ok(ticket) => ticket,
+            Err(bouncer_io::BouncerError::Revoked) => return HeadAction::refuse(403),
+            Err(_) => return HeadAction::refuse(503),
         };
-        match self.request(req, env, &mut ticket) {
-            Ok(exit) => self.respond(exit, &mut ticket, reply),
-            Err(Shortfall::NoPassport) => {
+        match self.tickets.hold(env.worker().get(), ticket) {
+            Some(tag) => {
+                env.set_user_word(tag.get());
+                HeadAction::Proceed
+            }
+            None => HeadAction::refuse(503),
+        }
+    }
+
+    fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
+        let tag = TicketTag::from_raw(env.user_word());
+        match self.request(req, env, tag, reply) {
+            Flow::Exit(exit) => self.respond(exit, tag, reply),
+            Flow::Web(exit, outcome) => self.respond_web(exit, outcome, reply),
+            Flow::NoPassport => {
                 reply
                     .text(503, wasp_core::refusal_text(503))
                     .retry_after(Duration::from_secs(1));
                 Outcome::Done
             }
+        }
+    }
+
+    fn done(&self, env: &Envelope, _finished: &Finished) {
+        if env.user_word() != 0 {
+            self.tickets
+                .release(env.worker().get(), TicketTag::from_raw(env.user_word()));
         }
     }
 }

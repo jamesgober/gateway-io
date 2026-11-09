@@ -11,6 +11,11 @@ publish.workspace = true
 [dependencies]
 wasp-core = { path = "../wasp-core" }
 gateway-io = { path = "../gateway-io" }
+# The web site: site, url, router, handlers.
+web-net = { workspace = true }
+
+[dev-dependencies]
+bouncer-io = { workspace = true }
 
 [lints]
 workspace = true

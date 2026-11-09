@@ -18,7 +18,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gateway_io::{Door, ServerTime, Settings, TimeObserver};
+use gateway_io::{Door, ServerTime, Settings, TimeObserver, WaspGate, WebServices};
 use serve_net::{KeepAlive, ListenerSpec, Server, Workers};
 use wasp_core::Core;
 use wasp_core::stub::Hello;
@@ -133,14 +133,79 @@ fn print(name: &str, conns: usize, r: &Run) {
     );
 }
 
-fn main() {
-    let core = Arc::new(
-        Core::builder()
-            .service("hello", Hello::new)
-            .profile("site", "hello", |_| {})
-            .load()
-            .expect("core"),
+/// One server under test: its name, address, and server-time histogram.
+struct Under<'a> {
+    name: &'a str,
+    addr: SocketAddr,
+    time: &'a ServerTime,
+}
+
+/// Runs `a` and `b` alternately for each case and prints both tables.
+fn compare(title: &str, a: &Under<'_>, b: &Under<'_>, cases: &[(usize, usize)]) {
+    println!("### {title}");
+    println!();
+    println!("| server | connections | requests/s | p50 us | p99 us | p99.9 us | failed |");
+    println!("|---|---|---|---|---|---|---|");
+    let mut server_rows = Vec::new();
+    for &(conns, per) in cases {
+        // Alternate, and keep the better of two runs each, so neither server
+        // gets the quieter moment of a shared machine.
+        let mut best_a: Option<Run> = None;
+        let mut best_b: Option<Run> = None;
+        a.time.reset();
+        b.time.reset();
+        for _ in 0..2 {
+            let r = drive(a.addr, conns, per);
+            if best_a.as_ref().is_none_or(|x| r.p50 < x.p50) {
+                best_a = Some(r);
+            }
+            let r = drive(b.addr, conns, per);
+            if best_b.as_ref().is_none_or(|x| r.p50 < x.p50) {
+                best_b = Some(r);
+            }
+        }
+        if let (Some(ra), Some(rb)) = (best_a, best_b) {
+            print(a.name, conns, &ra);
+            print(b.name, conns, &rb);
+            println!(
+                "| difference at p50 | {conns} | | {:+.1} | | | |",
+                (rb.p50.as_nanos() as f64 - ra.p50.as_nanos() as f64) / 1000.0
+            );
+        }
+        server_rows.push((conns, a.time.summary(), b.time.summary()));
+    }
+    println!();
+    println!(
+        "Server time per request (head complete to reply handed to net-io), measured inside each server:"
     );
+    println!();
+    println!(
+        "| connections | {} mean ns | {} mean ns | added, mean ns | {} p50 below | {} p99 below |",
+        a.name, b.name, b.name, b.name
+    );
+    println!("|---|---|---|---|---|---|");
+    for (conns, sa, sb) in server_rows {
+        println!(
+            "| {conns} | {} | {} | {:+} | {:?} | {:?} |",
+            sa.mean.as_nanos(),
+            sb.mean.as_nanos(),
+            sb.mean.as_nanos() as i128 - sa.mean.as_nanos() as i128,
+            sb.p50,
+            sb.p99
+        );
+    }
+    println!();
+}
+
+fn bench_route<I: web_net::Identity, R: Send + Sync + 'static>() -> web_net::Route<I, R> {
+    web_net::get("/bench", |cx: &mut web_net::Cx<'_, I>| {
+        cx.html(200, PAGE);
+        Ok(())
+    })
+    .public()
+}
+
+fn main() {
     let settings = Settings {
         listen: "127.0.0.1:0".into(),
         workers: WORKERS,
@@ -149,9 +214,17 @@ fn main() {
         exempt: vec!["127.0.0.1".parse().expect("address")],
         ..Settings::default()
     };
-    let door = Door::open(core, &settings, UrgentLine::detached()).expect("gateway");
-    let wasp = door.local_addr().expect("address");
 
+    // 1. The passport path (hello service) against serve-net alone.
+    let core = Arc::new(
+        Core::builder()
+            .service("hello", Hello::new)
+            .profile("site", "hello", |_| {})
+            .load()
+            .expect("core"),
+    );
+    let door =
+        Door::open(core, &settings, UrgentLine::detached(), WebServices::new()).expect("gateway");
     let bare_time = Arc::new(ServerTime::default());
     let bare = Server::builder()
         .observer(TimeObserver::new(bare_time.clone()))
@@ -162,67 +235,83 @@ fn main() {
             reply.html(200, PAGE);
         }))
         .expect("bare serve-net");
-    let bare_addr = bare.local_addr().expect("address");
+
+    // 2. The web path (core, then web-net) against web-net alone on serve-net.
+    let web_core = Arc::new(
+        Core::builder()
+            .external("web")
+            .profile("site", "web", |_| {})
+            .load()
+            .expect("core"),
+    );
+    let site = web_net::App::with_gate(WaspGate::new(web_core.access().clone()))
+        .development()
+        .route(bench_route())
+        .build()
+        .expect("site");
+    let mut web = WebServices::new();
+    web.attach(web_core.service_tag("web").expect("tag"), site);
+    let web_door =
+        Door::open(web_core, &settings, UrgentLine::detached(), web).expect("web gateway");
+    let alone_time = Arc::new(ServerTime::default());
+    let alone_app = web_net::App::builder()
+        .development()
+        .route(bench_route())
+        .build()
+        .expect("web-net alone");
+    let alone = Server::builder()
+        .observer(TimeObserver::new(alone_time.clone()))
+        .listener(ListenerSpec::tcp("alone", "127.0.0.1:0"))
+        .workers(Workers::reactor(WORKERS))
+        .keep_alive(KeepAlive::new().max_requests(10_000_000))
+        .serve(alone_app)
+        .expect("web-net on serve-net");
 
     println!(
         "request path over loopback, {WORKERS} reactor workers, keep-alive, 1 request in flight per connection"
     );
     println!();
-    println!("| server | connections | requests/s | p50 us | p99 us | p99.9 us | failed |");
-    println!("|---|---|---|---|---|---|---|");
-    let mut server_rows = Vec::new();
-    for &(conns, per) in &[(1usize, 20_000usize), (8, 10_000), (32, 4_000)] {
-        // Alternate, and keep the better of two runs each, so neither server
-        // gets the quieter moment of a shared machine.
-        let mut best_bare: Option<Run> = None;
-        let mut best_wasp: Option<Run> = None;
-        bare_time.reset();
-        door.server_time().reset();
-        for _ in 0..2 {
-            let b = drive(bare_addr, conns, per);
-            if best_bare.as_ref().is_none_or(|x| b.p50 < x.p50) {
-                best_bare = Some(b);
-            }
-            let w = drive(wasp, conns, per);
-            if best_wasp.as_ref().is_none_or(|x| w.p50 < x.p50) {
-                best_wasp = Some(w);
-            }
-        }
-        if let (Some(b), Some(w)) = (best_bare, best_wasp) {
-            print("serve-net alone", conns, &b);
-            print("gateway (WASP path)", conns, &w);
-            println!(
-                "| difference at p50 | {conns} | | {:+.1} | | | |",
-                (w.p50.as_nanos() as f64 - b.p50.as_nanos() as f64) / 1000.0
-            );
-        }
-        server_rows.push((conns, bare_time.summary(), door.server_time().summary()));
-    }
-    println!();
-    println!(
-        "server time per request (head complete to reply handed to net-io), measured inside each server:"
+    compare(
+        "passport path: hello service",
+        &Under {
+            name: "serve-net alone",
+            addr: bare.local_addr().expect("a"),
+            time: &bare_time,
+        },
+        &Under {
+            name: "gateway + hello",
+            addr: door.local_addr().expect("a"),
+            time: door.server_time(),
+        },
+        &[(1, 20_000), (8, 10_000), (32, 4_000)],
     );
-    println!();
-    println!(
-        "| connections | serve-net alone mean ns | gateway mean ns | added by the WASP path, mean ns | gateway p50 below | gateway p99 below |"
+    compare(
+        "web path: web-net",
+        &Under {
+            name: "web-net alone",
+            addr: alone.local_addr().expect("a"),
+            time: &alone_time,
+        },
+        &Under {
+            name: "gateway + web-net",
+            addr: web_door.local_addr().expect("a"),
+            time: web_door.server_time(),
+        },
+        &[(1, 20_000), (8, 10_000)],
     );
-    println!("|---|---|---|---|---|---|");
-    for (conns, b, w) in server_rows {
+
+    for (name, d) in [("hello", &door), ("web", &web_door)] {
+        let stats = d.pool().stats();
         println!(
-            "| {conns} | {} | {} | {:+} | {:?} | {:?} |",
-            b.mean.as_nanos(),
-            w.mean.as_nanos(),
-            w.mean.as_nanos() as i128 - b.mean.as_nanos() as i128,
-            w.p50,
-            w.p99
+            "{name}: passports after the run: {} of {} in use, {} refused; request tickets held: {}",
+            stats.in_use,
+            stats.capacity,
+            stats.refused,
+            d.tickets_held()
         );
     }
-    let stats = door.pool().stats();
-    println!();
-    println!(
-        "passports after the run: {} of {} in use, {} refused",
-        stats.in_use, stats.capacity, stats.refused
-    );
     let _ = door.close(Duration::from_secs(2));
+    let _ = web_door.close(Duration::from_secs(2));
     let _ = bare.drain(Duration::from_secs(2));
+    let _ = alone.drain(Duration::from_secs(2));
 }
