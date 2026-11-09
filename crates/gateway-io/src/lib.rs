@@ -20,6 +20,7 @@
 
 pub mod bouncer;
 pub mod control;
+pub mod events;
 pub mod gateway;
 pub mod observe;
 pub mod pipeline;
@@ -28,6 +29,7 @@ pub mod tickets;
 pub mod web;
 
 pub use crate::control::UrgentControl;
+pub use crate::events::LogSink;
 pub use crate::gateway::{Door, Gateway, OpenError};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};

@@ -1,18 +1,20 @@
 //! Opening and closing the door.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bouncer_io::Bouncer;
+use bouncer_io::{Bouncer, EventSink};
 use serve_net::{DrainReport, KeepAlive, Limits, ListenerSpec, Running, Server, Workers};
+use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::{Health, UrgentLine};
-use wasp_core::suite::lifecycle::{Deadline, Failure, Link, Position, Subsystem};
+use wasp_core::suite::lifecycle::{Commit, Deadline, Failure, Link, Position, Subsystem};
 use wasp_core::suite::log;
 use wasp_core::{Core, PassportPool, SlotSizes};
 
 use crate::bouncer::{self, DoorCheckpoint};
 use crate::control::UrgentControl;
+use crate::events::LogSink;
 use crate::observe::{ServerTime, TimeObserver};
 use crate::pipeline::{PassportAdmit, Pipeline};
 use crate::settings::Settings;
@@ -51,6 +53,17 @@ impl Door {
         line: UrgentLine,
         web: WebServices,
     ) -> Result<Door, OpenError> {
+        Door::open_with_events(core, settings, line, web, None)
+    }
+
+    /// [`open`](Self::open), with the bouncer's events going to `events`.
+    pub fn open_with_events(
+        core: Arc<Core>,
+        settings: &Settings,
+        line: UrgentLine,
+        web: WebServices,
+        events: Option<Arc<dyn EventSink>>,
+    ) -> Result<Door, OpenError> {
         for (tag, name) in core.external_services() {
             if web.get(tag).is_none() {
                 return Err(OpenError(format!(
@@ -68,7 +81,7 @@ impl Door {
             },
         ));
         let (bouncer, ejector) =
-            bouncer::build(settings).map_err(|e| OpenError(format!("bouncer: {e}")))?;
+            bouncer::build(settings, events).map_err(|e| OpenError(format!("bouncer: {e}")))?;
 
         let mut builder = Server::builder()
             .listener(
@@ -172,7 +185,8 @@ pub struct Gateway {
     web: Option<WebServices>,
     open: Option<Door>,
     link: Option<Link>,
-    drain: Duration,
+    /// The settings in force: written at start and by a reload's commit.
+    applied: Arc<Mutex<Settings>>,
 }
 
 impl Gateway {
@@ -184,7 +198,7 @@ impl Gateway {
             web: Some(WebServices::new()),
             open: None,
             link: None,
-            drain: Settings::default().drain,
+            applied: Arc::new(Mutex::new(Settings::default())),
         }
     }
 
@@ -216,7 +230,14 @@ impl Subsystem for Gateway {
             .web
             .take()
             .ok_or_else(|| Failure::new("a web service names no service the core declares"))?;
-        let open = Door::open(self.core.clone(), &settings, link.urgent().clone(), web)?;
+        let events: Arc<dyn EventSink> = LogSink::spawn(link.foundation().clone())?;
+        let open = Door::open_with_events(
+            self.core.clone(),
+            &settings,
+            link.urgent().clone(),
+            web,
+            Some(events),
+        )?;
         let addr = open
             .local_addr()
             .map_or_else(|| settings.listen.clone(), |a| a.to_string());
@@ -229,7 +250,9 @@ impl Subsystem for Gateway {
             passports = stats.capacity,
             banned = settings.ban.len()
         );
-        self.drain = settings.drain;
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = settings;
+        }
         self.open = Some(open);
         self.link = Some(link.clone());
         Ok(())
@@ -240,10 +263,14 @@ impl Subsystem for Gateway {
             return Ok(());
         };
         // Keep a little of the kernel's deadline for the steps after this one.
+        let drain = self
+            .applied
+            .lock()
+            .map_or(Settings::default().drain, |s| s.drain);
         let budget = deadline
             .remaining()
             .saturating_sub(Duration::from_millis(500))
-            .min(self.drain);
+            .min(drain);
         let time = open.server_time().summary();
         let report = open.close(budget);
         if let Some(link) = &self.link {
@@ -267,6 +294,93 @@ impl Subsystem for Gateway {
             );
         }
         Ok(())
+    }
+
+    /// A reload: `door.ban` and `door.exempt` take effect at once (new bans
+    /// added, removed ones lifted, the allow list swapped whole), and so does
+    /// `gateway.drain`. Everything that shapes the listener and the pools
+    /// (address, workers, passports, limits, keep-alive) takes effect at the
+    /// next start and is logged as such.
+    fn reload(&mut self, config: &Config) -> Result<Commit, Failure> {
+        let next = Settings::from_config(config)?;
+        let (Some(open), Some(link)) = (&self.open, &self.link) else {
+            return Ok(Commit::none());
+        };
+        let current = self
+            .applied
+            .lock()
+            .map_err(|_| Failure::new("gateway settings lock poisoned"))?
+            .clone();
+        // Prepare everything that can fail before anything changes.
+        let allow = bouncer::allow_list(&next.exempt)?;
+        let ban: Vec<_> = next
+            .ban
+            .iter()
+            .filter(|a| !current.ban.contains(a))
+            .copied()
+            .collect();
+        let lift: Vec<_> = current
+            .ban
+            .iter()
+            .filter(|a| !next.ban.contains(a))
+            .copied()
+            .collect();
+        let mut later = Vec::new();
+        if next.listen != current.listen {
+            later.push("gateway.listen");
+        }
+        if next.workers != current.workers {
+            later.push("gateway.workers");
+        }
+        if next.passports != current.passports {
+            later.push("gateway.passports");
+        }
+        if next.head_timeout != current.head_timeout || next.max_body != current.max_body {
+            later.push("gateway limits");
+        }
+        if next.keep_alive_requests != current.keep_alive_requests {
+            later.push("gateway.keep_alive_requests");
+        }
+        let bouncer = open.bouncer().clone();
+        let applied = self.applied.clone();
+        let foundation = link.foundation().clone();
+        Ok(Commit::new(move || {
+            let mut failed = 0_u64;
+            if bouncer.replace_allow(allow).is_err() {
+                failed += 1;
+            }
+            for addr in &ban {
+                if bouncer::ban(&bouncer, *addr).is_err() {
+                    failed += 1;
+                }
+            }
+            for addr in &lift {
+                if bouncer::lift(&bouncer, *addr).is_err() {
+                    failed += 1;
+                }
+            }
+            log::info!(
+                foundation.log(),
+                "gateway reloaded",
+                banned = ban.len(),
+                lifted = lift.len(),
+                failed = failed,
+                at_restart = later.join(", ").as_str()
+            );
+            if let Ok(mut s) = applied.lock() {
+                // What a restart would need stays as it is running.
+                let running = s.clone();
+                *s = Settings {
+                    listen: running.listen,
+                    workers: running.workers,
+                    passports: running.passports,
+                    head_timeout: running.head_timeout,
+                    max_body: running.max_body,
+                    keep_alive_requests: running.keep_alive_requests,
+                    ..next
+                };
+            }
+        }))
     }
 
     fn health(&self) -> Health {

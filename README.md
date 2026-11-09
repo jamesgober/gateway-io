@@ -51,13 +51,15 @@ The site: `/`, `/posts/:slug` (from an in-memory map), `/about`, `/account` (sig
 | `gateway.head_timeout` | `10s` | the head deadline |
 | `gateway.max_body` | 1 MiB | the largest buffered body |
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
-| `door.ban` | none | addresses refused at the door from boot |
-| `door.exempt` | none | addresses exempt from the door's budgets (local load tests) |
+| `door.ban` | none | addresses refused at the door; changes apply on reload |
+| `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
 | `site.base` | none | the folder the site lives under (`/blog`) |
 | `site.hosts` | none | the site's hosts, canonical first; none answers localhost (development) |
 | `site.assets` | none | a folder served under `/static` |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`) |
+
+A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt` and `gateway.drain` at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
 
 ## Check
 
