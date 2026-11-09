@@ -1032,9 +1032,9 @@ dependencies = [
 
 [[package]]
 name = "web-net"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bcfac3c11d182427300c5ffe97e8eb2ef0d584316bf111a288acb7667384259"
+checksum = "bde332e4e1301c42a0cabecb73db2cdb77695601445ea80a8a818c8791f6ca82"
 dependencies = [
  "compress-lib",
  "cookie-net",

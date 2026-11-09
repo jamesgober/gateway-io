@@ -21,7 +21,7 @@ use wasp_core::{
 };
 
 use crate::tickets::RequestTickets;
-use crate::web::WebServices;
+use crate::web::{Caller, WebServices};
 
 /// Admission: a request is admitted only if its worker has a free passport.
 /// Runs once the head is complete and before any body byte is read, so a slow
@@ -176,7 +176,8 @@ impl Pipeline {
             Routed::Exit(exit) => Flow::Exit(exit),
             Routed::Handoff(h) => match self.web.get(h.service()) {
                 Some(web) => {
-                    let outcome = web.respond(req, env, h.identity(), reply);
+                    let caller = Caller::new(h.identity(), h.token_any());
+                    let outcome = web.respond(req, env, &caller, reply);
                     Flow::Web(h.finish(), outcome)
                 }
                 None => Flow::Exit(h.refuse(500)),

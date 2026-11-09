@@ -13,6 +13,8 @@
 //! ([`wasp_core::Access::check`]), and web-net builds a handler's context only
 //! after it passed, so no handler runs on an unauthorized request.
 
+use std::any::Any;
+
 use serve_net::{Envelope, HttpHead, HttpReply, HttpRequest, Outcome, WorkClass};
 use wasp_core::{Access, Decision, Identity, Rule, ServiceTag};
 use web_net::{Denial, Gate, Request};
@@ -66,15 +68,75 @@ impl Gate for WaspGate {
     }
 }
 
-/// A service that answers on serve-net's request and reply, given the
-/// identity the core decided. web-net's `App<WaspGate>` is one.
+/// Who an identified request is from, as the core hands it to a web service:
+/// the core's identity stamp, and the gate's own identity token when the
+/// authenticator kept one.
+#[derive(Clone, Copy)]
+pub struct Caller<'a> {
+    identity: &'a Identity,
+    token: Option<&'a (dyn Any + Send + Sync)>,
+}
+
+impl<'a> Caller<'a> {
+    pub(crate) fn new(
+        identity: &'a Identity,
+        token: Option<&'a (dyn Any + Send + Sync)>,
+    ) -> Caller<'a> {
+        Caller { identity, token }
+    }
+
+    /// The core's identity stamp.
+    #[must_use]
+    pub fn identity(&self) -> &'a Identity {
+        self.identity
+    }
+
+    /// The gate's own identity token, if the authenticator kept one of type `T`.
+    #[must_use]
+    pub fn token<T: Any>(&self) -> Option<&'a T> {
+        self.token?.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for Caller<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caller")
+            .field("identity", self.identity)
+            .field("token", &self.token.is_some())
+            .finish()
+    }
+}
+
+/// A web-net gate the gateway can serve: how it gets its own identity for an
+/// identified request. By default that is the token the authenticator kept,
+/// which is how a gate that authenticates and authorizes itself (the
+/// gatekeeper) plugs in: `impl WebGate for Gatekeeper {}`.
+pub trait WebGate: Gate {
+    /// Runs `f` with this gate's identity for `caller`; `None` when there is
+    /// none (the authenticator kept no token of this gate's type), which the
+    /// gateway answers with a 500 rather than serve without the gate.
+    fn with_identity<R>(caller: &Caller<'_>, f: impl FnOnce(&Self::Identity) -> R) -> Option<R> {
+        caller.token::<Self::Identity>().map(f)
+    }
+}
+
+impl WebGate for WaspGate {
+    /// The core's own identity: [`WaspGate`] authorizes with the core's access
+    /// gate, so it needs no token.
+    fn with_identity<R>(caller: &Caller<'_>, f: impl FnOnce(&Who) -> R) -> Option<R> {
+        Some(f(&Who(*caller.identity())))
+    }
+}
+
+/// A service that answers on serve-net's request and reply, given the caller
+/// the core identified. web-net's `App<G>` is one for every [`WebGate`].
 pub trait WebService: Send + Sync + 'static {
     /// Answers one identified request into `reply`.
     fn respond(
         &self,
         req: &HttpRequest<'_>,
         env: &Envelope,
-        who: &Identity,
+        caller: &Caller<'_>,
         reply: &mut HttpReply,
     ) -> Outcome;
 
@@ -85,16 +147,22 @@ pub trait WebService: Send + Sync + 'static {
     }
 }
 
-impl WebService for web_net::App<WaspGate> {
+impl<G: WebGate> WebService for web_net::App<G> {
     #[inline]
     fn respond(
         &self,
         req: &HttpRequest<'_>,
         env: &Envelope,
-        who: &Identity,
+        caller: &Caller<'_>,
         reply: &mut HttpReply,
     ) -> Outcome {
-        self.respond_identified(req, env, &Who(*who), reply)
+        G::with_identity(caller, |who| self.respond_identified(req, env, who, reply))
+            .unwrap_or_else(|| {
+                // Authentication kept no identity this gate can use: a wiring
+                // fault. Fail closed.
+                reply.text(500, wasp_core::refusal_text(500)).close();
+                Outcome::Close
+            })
     }
 
     fn classify(&self, head: &HttpHead<'_>) -> WorkClass {

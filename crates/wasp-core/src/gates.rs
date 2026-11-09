@@ -10,6 +10,7 @@
 //! itself, so a gate that forgets to run, or a stub that tries to skip one,
 //! cannot hand a service an unchecked passport.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use crate::identity::{Identity, PermSet};
@@ -29,49 +30,75 @@ pub enum Authentication {
     Refused(Refusal),
 }
 
-/// A `Set-Cookie` value authentication wants the response to carry, whatever
-/// the outcome (an answer, a refusal, a cached page): for example clearing the
-/// cookie of a session that no longer exists. Reused per passport and wiped
-/// with it.
+/// The gate's own identity token, kept in the passport for services that
+/// authorize with the gate directly (the web service hands it to web-net).
+pub type GateToken = Box<dyn Any + Send + Sync>;
+
+/// What authentication hands to the rest of the request besides its decision.
+///
+/// - a `Set-Cookie` value the response must carry, whatever the outcome (an
+///   answer, a refusal, a cached page): for example clearing the cookie of a
+///   session that no longer exists;
+/// - the gate's own identity token ([`keep`](Self::keep)), for services that
+///   authorize with the gate itself.
+///
+/// The cookie buffer is reused per passport and wiped with it; the token is
+/// dropped when the passport returns to the pool.
 #[derive(Debug)]
-pub struct AuthCookie {
-    value: Vec<u8>,
+pub struct AuthOut {
+    cookie: Vec<u8>,
+    token: Option<GateToken>,
 }
 
-impl AuthCookie {
-    pub(crate) fn from_buf(mut value: Vec<u8>) -> AuthCookie {
-        value.clear();
-        AuthCookie { value }
+impl AuthOut {
+    pub(crate) fn from_parts(mut cookie: Vec<u8>) -> AuthOut {
+        cookie.clear();
+        AuthOut {
+            cookie,
+            token: None,
+        }
     }
 
-    pub(crate) fn into_buf(self) -> Vec<u8> {
-        self.value
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<GateToken>) {
+        (self.cookie, self.token)
     }
 
     /// Sets the `Set-Cookie` value (the field value only, without the name).
-    pub fn set(&mut self, value: &[u8]) {
-        self.value.clear();
-        self.value.extend_from_slice(value);
+    pub fn set_cookie(&mut self, value: &[u8]) {
+        self.cookie.clear();
+        self.cookie.extend_from_slice(value);
     }
 
-    /// Whether a value was set.
+    /// Whether a cookie was set.
     #[must_use]
-    pub fn is_set(&self) -> bool {
-        !self.value.is_empty()
+    pub fn has_cookie(&self) -> bool {
+        !self.cookie.is_empty()
+    }
+
+    /// Keeps the gate's own identity token with the request (replacing one
+    /// kept before).
+    pub fn keep<T: Any + Send + Sync>(&mut self, token: T) {
+        self.token = Some(Box::new(token));
+    }
+
+    /// Whether a token was kept.
+    #[must_use]
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 }
 
 /// Authentication: the ID check, run by the core once per request.
 pub trait Authenticator: Send + Sync + 'static {
     /// Reads the credential where `profile.locator` says it is and decides.
-    /// A `Set-Cookie` the response must carry goes into `cookie`. Must not
-    /// block on the network: a remote store answers from local state when it
-    /// is unreachable.
+    /// A `Set-Cookie` the response must carry, and the gate's own identity
+    /// token, go into `out`. Must not block on the network: a remote store
+    /// answers from local state when it is unreachable.
     fn authenticate(
         &self,
         request: RequestView<'_>,
         profile: &Profile,
-        cookie: &mut AuthCookie,
+        out: &mut AuthOut,
     ) -> Authentication;
 }
 
@@ -86,7 +113,7 @@ impl Authenticator for EveryoneGuest {
         &self,
         _request: RequestView<'_>,
         _profile: &Profile,
-        _cookie: &mut AuthCookie,
+        _out: &mut AuthOut,
     ) -> Authentication {
         Authentication::Identified(Identity::guest())
     }

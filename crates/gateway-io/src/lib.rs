@@ -33,4 +33,4 @@ pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::settings::{Settings, SettingsError};
 pub use crate::tickets::RequestTickets;
-pub use crate::web::{WaspGate, WebService, WebServices, Who};
+pub use crate::web::{Caller, WaspGate, WebGate, WebService, WebServices, Who};

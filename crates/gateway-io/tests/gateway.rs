@@ -313,7 +313,12 @@ fn drain_deadline_kills_what_is_left() {
         .expect("timeout");
     s.write_all(b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\nfirst bytes")
         .expect("write");
-    thread::sleep(Duration::from_millis(200));
+    // Admitted (a passport reserved once the head was complete), body pending.
+    let until = Instant::now() + Duration::from_secs(5);
+    while open.pool().stats().in_use == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(open.pool().stats().in_use, 1, "the request is in flight");
     let started = Instant::now();
     let report = open.close(Duration::from_millis(300));
     assert!(report.deadline_hit, "{report:?}");
@@ -335,10 +340,10 @@ impl wasp_core::Authenticator for DeadSession {
         &self,
         request: wasp_core::RequestView<'_>,
         _profile: &wasp_core::Profile,
-        cookie: &mut wasp_core::AuthCookie,
+        out: &mut wasp_core::AuthOut,
     ) -> wasp_core::Authentication {
         if request.head().header("cookie").is_some() {
-            cookie.set(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
+            out.set_cookie(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
         }
         if request.head().header("x-banned").is_some() {
             wasp_core::Authentication::Refused(wasp_core::Refusal::status(403))

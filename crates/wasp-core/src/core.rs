@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::cache::{GuestCache, NoCache};
 use crate::customs::{Customs, HeadRules};
 use crate::gates::{
-    Access, AuthCookie, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms,
+    Access, AuthOut, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms,
 };
 use crate::identity::Identity;
 use crate::passport::{Exit, Passport};
@@ -83,6 +83,12 @@ impl Handoff {
     #[must_use]
     pub fn identity(&self) -> &Identity {
         self.p.identity()
+    }
+
+    /// The gate's own identity token, as authentication kept it.
+    #[must_use]
+    pub fn token_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.p.token_any()
     }
 
     /// The trip facts.
@@ -310,11 +316,10 @@ impl Core {
             return Routed::Exit(p.refuse(500));
         };
         let mut p = p;
-        let mut cookie = AuthCookie::from_buf(p.take_auth_cookie());
-        let decided = self
-            .authenticator
-            .authenticate(p.view(), profile, &mut cookie);
-        p.put_auth_cookie(cookie.into_buf());
+        let mut out = AuthOut::from_parts(p.take_auth_cookie());
+        let decided = self.authenticator.authenticate(p.view(), profile, &mut out);
+        let (cookie, token) = out.into_parts();
+        p.put_auth_out(cookie, token);
         let p = match decided {
             Authentication::Identified(identity) => p.identify(identity),
             Authentication::Refused(refusal) => return Routed::Exit(p.refuse_with(refusal)),

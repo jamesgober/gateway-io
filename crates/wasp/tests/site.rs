@@ -300,10 +300,10 @@ impl wasp_core::Authenticator for DeadSession {
         &self,
         request: wasp_core::RequestView<'_>,
         _profile: &wasp_core::Profile,
-        cookie: &mut wasp_core::AuthCookie,
+        out: &mut wasp_core::AuthOut,
     ) -> wasp_core::Authentication {
         if request.head().header("cookie").is_some() {
-            cookie.set(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
+            out.set_cookie(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
         }
         wasp_core::Authentication::Identified(wasp_core::Identity::guest())
     }

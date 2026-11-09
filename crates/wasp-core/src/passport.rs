@@ -212,8 +212,10 @@ impl Passport<Inspected> {
         std::mem::take(&mut self.slot.auth_cookie)
     }
 
-    pub(crate) fn put_auth_cookie(&mut self, buf: Vec<u8>) {
-        self.slot.auth_cookie = buf;
+    /// What authentication handed back: the cookie buffer and the token.
+    pub(crate) fn put_auth_out(&mut self, cookie: Vec<u8>, token: Option<crate::gates::GateToken>) {
+        self.slot.auth_cookie = cookie;
+        self.slot.gate_token = token;
     }
 
     /// The buffered body (customs checked its size).
@@ -232,6 +234,18 @@ impl Passport<Inspected> {
 }
 
 impl Passport<Identified> {
+    /// The gate's own identity token, if authentication kept one of type `T`.
+    #[must_use]
+    pub fn token<T: std::any::Any>(&self) -> Option<&T> {
+        self.slot.gate_token.as_deref()?.downcast_ref::<T>()
+    }
+
+    /// The token as kept, whatever its type.
+    #[must_use]
+    pub fn token_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.slot.gate_token.as_deref()
+    }
+
     /// Who the request is from.
     #[must_use]
     pub fn identity(&self) -> &Identity {
@@ -265,6 +279,12 @@ impl Passport<Identified> {
 static GUEST: Identity = Identity::guest();
 
 impl Passport<Cleared> {
+    /// The gate's own identity token, if authentication kept one of type `T`.
+    #[must_use]
+    pub fn token<T: std::any::Any>(&self) -> Option<&T> {
+        self.slot.gate_token.as_deref()?.downcast_ref::<T>()
+    }
+
     /// Who the request is from.
     #[must_use]
     pub fn identity(&self) -> &Identity {

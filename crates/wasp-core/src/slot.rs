@@ -560,6 +560,8 @@ pub struct Slot {
     /// A `Set-Cookie` value authentication asks the response to carry (for
     /// example clearing a dead session cookie), on answers and refusals alike.
     pub(crate) auth_cookie: Vec<u8>,
+    /// The gate's own identity token, kept by authentication.
+    pub(crate) gate_token: Option<crate::gates::GateToken>,
 }
 
 impl Slot {
@@ -574,6 +576,7 @@ impl Slot {
             access: None,
             reply: Reply::with_capacity(8, sizes.reply),
             auth_cookie: Vec::with_capacity(128),
+            gate_token: None,
         }
     }
 
@@ -589,6 +592,7 @@ impl Slot {
         self.access = None;
         wipe(&mut self.auth_cookie);
         self.auth_cookie.clear();
+        self.gate_token = None;
         self.trip = Trip {
             ticket: 0,
             client: None,
