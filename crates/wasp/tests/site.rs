@@ -357,3 +357,41 @@ fn a_missing_web_service_refuses_to_open() {
     .expect("refused");
     assert!(err.0.contains("web"), "{err}");
 }
+
+#[test]
+fn static_files_from_a_folder() {
+    let dir = std::env::temp_dir().join(format!("wasp-site-assets-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("hello.txt"), b"static hello").expect("file");
+    std::fs::write(dir.join(".env"), b"SECRET=1").expect("hidden");
+    let conf = format!(
+        "[site]\nassets = \"{}\"\n",
+        dir.display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    );
+    let (door, addr) = open_site(&conf);
+    let got = get_path(addr, "/static/hello.txt").expect("file");
+    assert_eq!(got.status, 200, "{}", got.head);
+    assert_eq!(got.body, "static hello");
+    assert!(
+        got.field("content-type")
+            .is_some_and(|t| t.starts_with("text/plain")),
+        "{}",
+        got.head
+    );
+    assert_eq!(
+        get_path(addr, "/static/.env").map(|g| g.status),
+        Some(404),
+        "hidden files"
+    );
+    let up = get_path(addr, "/static/%2e%2e/Cargo.toml").expect("traversal");
+    assert_ne!(up.status, 200, "{}", up.head);
+    assert_eq!(
+        get_path(addr, "/static/missing.txt").map(|g| g.status),
+        Some(404)
+    );
+    settle(&door);
+    let _ = door.close(Duration::from_secs(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
