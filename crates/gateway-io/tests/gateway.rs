@@ -277,8 +277,10 @@ fn drain_finishes_in_flight_work_and_refuses_new_connections() {
     }
     assert_eq!(open.pool().stats().in_use, 1, "the request is in flight");
     let started = Instant::now();
+    // Shutdown step 1 on this thread, so the probe below cannot race it; the
+    // drain (step 2, which closes the door again: idempotent) runs alongside.
+    open.running().close_door();
     let closer = thread::spawn(move || open.close(Duration::from_secs(5)));
-    thread::sleep(Duration::from_millis(100));
     // The door is closed: a new connection gets nothing.
     assert!(get(addr, "/").is_none(), "accepted after the door closed");
     let got = slow
@@ -315,4 +317,67 @@ fn drain_deadline_kills_what_is_left() {
     );
     let got = read_response(&mut s);
     assert!(got.as_ref().is_none_or(|g| g.status != 200), "{got:?}");
+}
+
+/// An authenticator that clears a dead session cookie and refuses a request
+/// carrying `x-banned`, as a real auth gate would.
+struct DeadSession;
+
+impl wasp_core::Authenticator for DeadSession {
+    fn authenticate(
+        &self,
+        request: wasp_core::RequestView<'_>,
+        _profile: &wasp_core::Profile,
+        cookie: &mut wasp_core::AuthCookie,
+    ) -> wasp_core::Authentication {
+        if request.head().header("cookie").is_some() {
+            cookie.set(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
+        }
+        if request.head().header("x-banned").is_some() {
+            wasp_core::Authentication::Refused(wasp_core::Refusal::status(403))
+        } else {
+            wasp_core::Authentication::Identified(wasp_core::Identity::guest())
+        }
+    }
+}
+
+#[test]
+fn authentication_cookie_rides_on_answers_and_refusals() {
+    let core = Arc::new(
+        Core::builder()
+            .authenticator(DeadSession)
+            .service("hello", Hello::new)
+            .profile("site", "hello", |_| {})
+            .load()
+            .expect("core loads"),
+    );
+    let open = Door::open(core, &settings(1, 4), UrgentLine::detached()).expect("opens");
+    let addr = open.local_addr().expect("addr");
+    let cleared = "__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly";
+
+    let got = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: a\r\nCookie: __Host-sid=dead\r\nConnection: close\r\n\r\n",
+    )
+    .expect("a response");
+    assert_eq!(got.status, 200);
+    assert!(has_field(&got, "set-cookie", cleared), "{}", got.head);
+
+    let got = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: a\r\nCookie: __Host-sid=dead\r\nX-Banned: 1\r\nConnection: close\r\n\r\n",
+    )
+    .expect("a response");
+    assert_eq!(got.status, 403);
+    assert!(has_field(&got, "set-cookie", cleared), "{}", got.head);
+
+    // A request without a cookie gets none: the buffer was wiped with the passport.
+    let got = get(addr, "/").expect("a response");
+    assert_eq!(got.status, 200);
+    assert!(
+        !got.head.to_ascii_lowercase().contains("set-cookie"),
+        "{}",
+        got.head
+    );
+    let _ = open.close(Duration::from_secs(1));
 }

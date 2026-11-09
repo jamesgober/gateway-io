@@ -173,6 +173,9 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
         // becomes an invalid field, which serve-net turns into a 500.
         out.header(std::str::from_utf8(name).unwrap_or("\u{0}"), value);
     }
+    if let Some(cookie) = exit.auth_cookie() {
+        out.header("set-cookie", cookie);
+    }
     out.body(reply.body_bytes());
     if let Some(after) = reply.retry_after() {
         out.retry_after(after);

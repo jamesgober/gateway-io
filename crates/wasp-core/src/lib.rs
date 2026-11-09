@@ -37,7 +37,8 @@ pub use crate::cache::{GuestCache, NoCache};
 pub use crate::core::{Core, CoreBuilder, CoreSubsystem, LoadError};
 pub use crate::customs::{Customs, HeadRules};
 pub use crate::gates::{
-    Access, Authentication, Authenticator, Authorizer, Decision, EveryoneGuest, Rule, RuleTerms,
+    Access, AuthCookie, Authentication, Authenticator, Authorizer, Decision, EveryoneGuest, Rule,
+    RuleTerms,
 };
 pub use crate::identity::{Identity, PermSet, SessionId, Standing, Subject, TenantId, UserId};
 pub use crate::passport::{Exit, Passport, RequestView};

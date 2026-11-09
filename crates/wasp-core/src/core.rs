@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::cache::{GuestCache, NoCache};
 use crate::customs::{Customs, HeadRules};
-use crate::gates::{Access, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms};
+use crate::gates::{
+    Access, AuthCookie, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms,
+};
 use crate::passport::{Exit, Passport};
 use crate::profile::Profile;
 use crate::service::{Service, ServiceCtx};
@@ -200,7 +202,13 @@ impl Core {
         let Some(profile) = self.profiles.get(usize::from(p.trip().profile.0)) else {
             return p.refuse(500);
         };
-        let p = match self.authenticator.authenticate(p.view(), profile) {
+        let mut p = p;
+        let mut cookie = AuthCookie::from_buf(p.take_auth_cookie());
+        let decided = self
+            .authenticator
+            .authenticate(p.view(), profile, &mut cookie);
+        p.put_auth_cookie(cookie.into_buf());
+        let p = match decided {
             Authentication::Identified(identity) => p.identify(identity),
             Authentication::Refused(refusal) => return p.refuse_with(refusal),
         };

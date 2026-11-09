@@ -207,6 +207,15 @@ impl Passport<Arrived> {
 }
 
 impl Passport<Inspected> {
+    /// The reused `Set-Cookie` buffer, lent to authentication.
+    pub(crate) fn take_auth_cookie(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.slot.auth_cookie)
+    }
+
+    pub(crate) fn put_auth_cookie(&mut self, buf: Vec<u8>) {
+        self.slot.auth_cookie = buf;
+    }
+
     /// The buffered body (customs checked its size).
     #[must_use]
     pub fn body(&self) -> &[u8] {
@@ -307,6 +316,12 @@ impl Exit {
     #[must_use]
     pub fn reply(&self) -> &Reply {
         &self.slot.reply
+    }
+
+    /// A `Set-Cookie` value authentication asked the response to carry.
+    #[must_use]
+    pub fn auth_cookie(&self) -> Option<&[u8]> {
+        (!self.slot.auth_cookie.is_empty()).then_some(&self.slot.auth_cookie[..])
     }
 
     /// The identity, when authentication ran before the exit.

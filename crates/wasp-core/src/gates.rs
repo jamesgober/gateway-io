@@ -29,12 +29,50 @@ pub enum Authentication {
     Refused(Refusal),
 }
 
+/// A `Set-Cookie` value authentication wants the response to carry, whatever
+/// the outcome (an answer, a refusal, a cached page): for example clearing the
+/// cookie of a session that no longer exists. Reused per passport and wiped
+/// with it.
+#[derive(Debug)]
+pub struct AuthCookie {
+    value: Vec<u8>,
+}
+
+impl AuthCookie {
+    pub(crate) fn from_buf(mut value: Vec<u8>) -> AuthCookie {
+        value.clear();
+        AuthCookie { value }
+    }
+
+    pub(crate) fn into_buf(self) -> Vec<u8> {
+        self.value
+    }
+
+    /// Sets the `Set-Cookie` value (the field value only, without the name).
+    pub fn set(&mut self, value: &[u8]) {
+        self.value.clear();
+        self.value.extend_from_slice(value);
+    }
+
+    /// Whether a value was set.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        !self.value.is_empty()
+    }
+}
+
 /// Authentication: the ID check, run by the core once per request.
 pub trait Authenticator: Send + Sync + 'static {
     /// Reads the credential where `profile.locator` says it is and decides.
-    /// Must not block on the network: a remote store answers from local state
-    /// when it is unreachable.
-    fn authenticate(&self, request: RequestView<'_>, profile: &Profile) -> Authentication;
+    /// A `Set-Cookie` the response must carry goes into `cookie`. Must not
+    /// block on the network: a remote store answers from local state when it
+    /// is unreachable.
+    fn authenticate(
+        &self,
+        request: RequestView<'_>,
+        profile: &Profile,
+        cookie: &mut AuthCookie,
+    ) -> Authentication;
 }
 
 /// The first authenticator: every request is a guest. Correct, only minimal:
@@ -44,7 +82,12 @@ pub struct EveryoneGuest;
 
 impl Authenticator for EveryoneGuest {
     #[inline]
-    fn authenticate(&self, _request: RequestView<'_>, _profile: &Profile) -> Authentication {
+    fn authenticate(
+        &self,
+        _request: RequestView<'_>,
+        _profile: &Profile,
+        _cookie: &mut AuthCookie,
+    ) -> Authentication {
         Authentication::Identified(Identity::guest())
     }
 }
