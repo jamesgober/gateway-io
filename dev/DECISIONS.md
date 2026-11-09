@@ -18,7 +18,7 @@ Technical decisions made while building the skeleton. Each says what, why, and w
 | G-12 | 2026-11-08 | The gateway subsystem sits at `Position::LAST` and is started last with `Boot::start`; the core subsystem is started before it. | Boot order "listeners open last" and the reverse stop order "the door closes first, the kernel last" both fall out of system-suite's start and stop order. |
 | G-13 | 2026-11-08 | The request's bouncer ticket lives for the duration of `call`; the response is checked at the last checkpoint before encode, and the connection's ticket by net-io's egress on every write. | The passport returns to the pool at the end of `call`, and with it anything per request. The gap between `call` returning and the write is the connection-level egress check's; a session-level revocation in that window (microseconds) is not seen until the next request. |
 | G-14 | 2026-11-08 | The request id is a ULID (id-forge), about 28 ns. | Time ordered and unique per process, for logs and tracing; a snowflake per worker is the cheaper option if the 28 ns ever matters. |
-| G-15 | 2026-11-08 | `Authenticator::authenticate` takes an `AuthCookie` out-parameter: a `Set-Cookie` value the response carries on every exit (answer, refusal, cached page). The buffer lives in the passport slot and is wiped with it. | gatekeeper-io's `Identified::set_cookie()` and `Refusal` can carry a cookie that clears a dead session; it must reach the client even when the request is refused, and even when a service (web-net) writes the reply itself. |
+| G-15 | 2026-11-08 | `Authenticator::authenticate` takes an `AuthCookie` out-parameter: a `Set-Cookie` value the response carries on every exit (answer, refusal, cached page). The buffer lives in the passport slot and is wiped with it. | gatekeeper-io's `Identified::set_cookie()` and `Refusal` can carry a cookie that clears a dead session; it must reach the client even when the request is refused. Agreed with gatekeeper-io and web-net: for web services web-net's finish step writes `identified.set_cookie()`, so when web-net is wired in the gateway skips the auth cookie on answers the web service wrote (it still writes it on refusals made before the service ran, and for every other service); otherwise the client gets it twice. |
 
 ## Limits found while building
 
@@ -26,3 +26,10 @@ Technical decisions made while building the skeleton. Each says what, why, and w
 - **A handler that blocks its worker cannot be cut by the drain deadline.** The transport closes everything it owns at the deadline, but a thread inside a service call finishes the call first; the kernel's shutdown deadline (exit 79) is the backstop. This is what `Work::Io`/`Work::Cpu` plus an offloading dispatcher fix.
 - **The slow-head defence is net-io's minimum rate** (256 B/s after a 5 s grace): a half-sent head is reset at about 5 s, before the 10 s head deadline would answer 408. No passport is ever taken for it.
 - **The default local port 8080 may be in use** on a shared machine; the boot then fails cleanly at phase 4 and unwinds the core (tested). Use `gateway.listen` or `WASP_CONFIG`.
+
+## Step 7 adapter (gatekeeper-io), agreed 2026-11-08
+
+- Build `Visit::new(peer)` from the passport (client address; cookie, authorization, user-agent bytes). When the head has more than one `Cookie` field, call `visit.duplicate_cookie_fields()`: every cookie read is then refused, as web-net does.
+- `authenticate(Inspected::new(), &visit)`: `Ok(identified)` becomes the identity stamp (gatekeeper's token is Send + Sync + Clone + 'static and is kept in the slot); `Err(refusal)` becomes `Authentication::Refused` with `refusal.status()`.
+- Copy `identified.set_cookie()` or `refusal.set_cookie()` into the `AuthCookie`.
+- Web services: web-net 0.3's `Gate` impl lives in gatekeeper-io (feature `web-net`) and authorizes with `Gatekeeper::check(&Identified, &Rule, ..)`, which does not consume the token.
