@@ -1,0 +1,338 @@
+//! The passport: the handle that moves a request through the platform.
+//!
+//! A passport is a box holding one [`Slot`]: moving it moves eight bytes. Its
+//! stage is part of its type, and each stage has only the methods that stage
+//! may use:
+//!
+//! | Stage | Produced by | Can |
+//! |---|---|---|
+//! | [`Arrived`] | the pool, once the head is complete | be filled (trip, head, body), be inspected |
+//! | [`Inspected`] | customs ([`Passport::inspect`]) | be read; go to the core |
+//! | [`Identified`] | the core's authentication (crate-private) | be read; go to the service |
+//! | [`Cleared`] | authorization ([`crate::Access::authorize`]) | write its reply |
+//!
+//! Every stage can be refused ([`Passport::refuse`]), which turns it into an
+//! [`Exit`] carrying a fixed refusal. Only a cleared passport can write content,
+//! and only this crate can produce `Identified` and `Cleared` passports, so a
+//! path that skips a gate does not compile:
+//!
+//! ```compile_fail,E0599
+//! // A service cannot write a reply before authorization.
+//! fn skip(mut p: wasp_core::Passport<wasp_core::Identified>) {
+//!     p.reply().text(200, "content without authorization");
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! // Nothing outside the core can identify a passport.
+//! fn forge(p: wasp_core::Passport<wasp_core::Inspected>) -> wasp_core::Passport<wasp_core::Identified> {
+//!     p.identify(wasp_core::Identity::guest())
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! // Nothing outside the core can clear a passport.
+//! fn forge(p: wasp_core::Passport<wasp_core::Identified>) -> wasp_core::Passport<wasp_core::Cleared> {
+//!     p.clear(wasp_core::AccessStamp { rule: 0 })
+//! }
+//! ```
+//!
+//! ```compile_fail,E0451
+//! // A passport is never built by hand.
+//! fn build() -> wasp_core::Passport<wasp_core::Cleared> {
+//!     wasp_core::Passport { slot: todo!(), _stage: std::marker::PhantomData }
+//! }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! // The head is fixed once customs passed it.
+//! fn rewrite(mut p: wasp_core::Passport<wasp_core::Inspected>) {
+//!     p.head_mut().set_line("GET", "/admin", 1);
+//! }
+//! ```
+
+use std::fmt;
+use std::marker::PhantomData;
+
+use crate::customs::Customs;
+use crate::identity::Identity;
+use crate::slot::{AccessStamp, Head, Refusal, Reply, Slot, Trip};
+use crate::stage::{Arrived, Cleared, Identified, Inspected, Stage};
+
+/// The handle that moves one request through the platform. See the module docs.
+#[must_use = "a passport must reach the response pipeline, or its slot never returns to the pool"]
+pub struct Passport<S: Stage> {
+    slot: Box<Slot>,
+    _stage: PhantomData<fn() -> S>,
+}
+
+// A passport must be able to move between threads (offload, lanes): seam 1.
+const _: () = {
+    const fn must_be_send<T: Send>() {}
+    must_be_send::<Passport<Arrived>>();
+    must_be_send::<Passport<Cleared>>();
+    must_be_send::<Exit>();
+};
+
+/// A read-only view of a request, for the gates and customs.
+#[derive(Clone, Copy)]
+pub struct RequestView<'a> {
+    slot: &'a Slot,
+}
+
+impl<'a> RequestView<'a> {
+    /// The trip facts.
+    #[must_use]
+    pub fn trip(&self) -> &'a Trip {
+        &self.slot.trip
+    }
+
+    /// The head.
+    #[must_use]
+    pub fn head(&self) -> &'a Head {
+        &self.slot.head
+    }
+
+    /// The buffered body.
+    #[must_use]
+    pub fn body(&self) -> &'a [u8] {
+        &self.slot.body
+    }
+
+    /// The identity, once authentication ran.
+    #[must_use]
+    pub fn identity(&self) -> Option<&'a Identity> {
+        self.slot.identity.as_ref()
+    }
+}
+
+impl fmt::Debug for RequestView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RequestView").field(&self.slot).finish()
+    }
+}
+
+impl<S: Stage> Passport<S> {
+    #[inline]
+    fn into_stage<T: Stage>(self) -> Passport<T> {
+        Passport {
+            slot: self.slot,
+            _stage: PhantomData,
+        }
+    }
+
+    /// The trip facts.
+    #[inline]
+    #[must_use]
+    pub fn trip(&self) -> &Trip {
+        &self.slot.trip
+    }
+
+    /// The head.
+    #[inline]
+    #[must_use]
+    pub fn head(&self) -> &Head {
+        &self.slot.head
+    }
+
+    /// A read-only view for the gates.
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> RequestView<'_> {
+        RequestView { slot: &self.slot }
+    }
+
+    /// The stage's name.
+    #[must_use]
+    pub fn stage(&self) -> &'static str {
+        S::NAME
+    }
+
+    /// Refuses the request: whatever the reply held is wiped and replaced by
+    /// the fixed refusal for `status`. Nothing after this runs.
+    #[inline]
+    pub fn refuse(self, status: u16) -> Exit {
+        self.refuse_with(Refusal::status(status))
+    }
+
+    /// [`refuse`](Self::refuse) with `Retry-After` or a close.
+    pub fn refuse_with(mut self, refusal: Refusal) -> Exit {
+        let status = if (400..=599).contains(&refusal.status) {
+            refusal.status
+        } else {
+            500
+        };
+        self.slot.reply.refuse(Refusal { status, ..refusal });
+        Exit { slot: self.slot }
+    }
+
+    pub(crate) fn from_slot(slot: Box<Slot>) -> Passport<S> {
+        Passport {
+            slot,
+            _stage: PhantomData,
+        }
+    }
+}
+
+impl Passport<Arrived> {
+    /// Writes the trip facts. The slot's home worker is kept.
+    #[inline]
+    pub fn set_trip(&mut self, trip: Trip) {
+        self.slot.trip = trip;
+    }
+
+    /// The head, to copy the request head into.
+    #[inline]
+    pub fn head_mut(&mut self) -> &mut Head {
+        &mut self.slot.head
+    }
+
+    /// The body buffer, to copy a buffered body into.
+    #[inline]
+    pub fn body_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.slot.body
+    }
+
+    /// Customs: checks the head and stamps it, or refuses the request.
+    #[inline]
+    pub fn inspect(mut self, customs: &dyn Customs) -> Result<Passport<Inspected>, Exit> {
+        match customs.head(self.view()) {
+            Ok(stamp) => {
+                self.slot.inspected = Some(stamp);
+                Ok(self.into_stage())
+            }
+            Err(refusal) => Err(self.refuse_with(refusal)),
+        }
+    }
+}
+
+impl Passport<Inspected> {
+    /// The buffered body (customs checked its size).
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.slot.body
+    }
+
+    /// Writes the identity stamp. Only the core calls this, right after the
+    /// authenticator decided.
+    #[inline]
+    pub(crate) fn identify(mut self, identity: Identity) -> Passport<Identified> {
+        self.slot.identity = Some(identity);
+        self.into_stage()
+    }
+}
+
+impl Passport<Identified> {
+    /// Who the request is from.
+    #[must_use]
+    pub fn identity(&self) -> &Identity {
+        // Set by `identify`, the only way to this stage.
+        self.slot.identity.as_ref().unwrap_or(&GUEST)
+    }
+
+    /// The buffered body.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.slot.body
+    }
+
+    /// Writes the access stamp. Only [`crate::Access::authorize`] calls this,
+    /// after the authorizer allowed the rule.
+    #[inline]
+    pub(crate) fn clear(mut self, stamp: AccessStamp) -> Passport<Cleared> {
+        self.slot.access = Some(stamp);
+        self.into_stage()
+    }
+}
+
+static GUEST: Identity = Identity::guest();
+
+impl Passport<Cleared> {
+    /// Who the request is from.
+    #[must_use]
+    pub fn identity(&self) -> &Identity {
+        self.slot.identity.as_ref().unwrap_or(&GUEST)
+    }
+
+    /// The rule that cleared it.
+    #[must_use]
+    pub fn access(&self) -> Option<AccessStamp> {
+        self.slot.access
+    }
+
+    /// The buffered body.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.slot.body
+    }
+
+    /// The reply, to write content into.
+    #[inline]
+    pub fn reply(&mut self) -> &mut Reply {
+        &mut self.slot.reply
+    }
+
+    /// Hands the reply to the response pipeline.
+    #[inline]
+    pub fn answer(self) -> Exit {
+        Exit { slot: self.slot }
+    }
+}
+
+impl<S: Stage> fmt::Debug for Passport<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Passport")
+            .field("stage", &S::NAME)
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
+/// A passport on its way out: its reply is final (an answer, a refusal, or a
+/// cached page). The response pipeline encodes it, writes it, and returns it to
+/// the pool.
+#[must_use = "an exit must be written and returned to the pool"]
+pub struct Exit {
+    slot: Box<Slot>,
+}
+
+impl Exit {
+    /// The trip facts.
+    #[must_use]
+    pub fn trip(&self) -> &Trip {
+        &self.slot.trip
+    }
+
+    /// The reply to encode.
+    #[must_use]
+    pub fn reply(&self) -> &Reply {
+        &self.slot.reply
+    }
+
+    /// The identity, when authentication ran before the exit.
+    #[must_use]
+    pub fn identity(&self) -> Option<&Identity> {
+        self.slot.identity.as_ref()
+    }
+
+    /// Replaces the reply with a refusal (a revocation at the last checkpoint,
+    /// or customs export refusing it).
+    pub fn refuse_with(mut self, refusal: Refusal) -> Exit {
+        self.slot.reply.refuse(refusal);
+        self
+    }
+
+    pub(crate) fn into_slot(self) -> Box<Slot> {
+        self.slot
+    }
+
+    pub(crate) fn home_worker(&self) -> u16 {
+        self.slot.home.worker
+    }
+}
+
+impl fmt::Debug for Exit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Exit").field("slot", &self.slot).finish()
+    }
+}

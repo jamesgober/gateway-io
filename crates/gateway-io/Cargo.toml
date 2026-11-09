@@ -1,0 +1,28 @@
+[package]
+name = "gateway-io"
+description = "The platform's front door: listeners, the bouncer door, the parser, the passport pipeline, and the response."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasp-core = { path = "../wasp-core" }
+# Listeners, the connection engine, HTTP/1.1 through http-net, drain.
+serve-net = { workspace = true }
+# The transport under serve-net (gate, control line, ids).
+net-io = { workspace = true }
+# The door before any byte is read, request tickets, egress on every write.
+bouncer-io = { workspace = true }
+
+[dev-dependencies]
+bouncer-io = { workspace = true }
+
+[[bench]]
+name = "request_path"
+harness = false
+
+[lints]
+workspace = true

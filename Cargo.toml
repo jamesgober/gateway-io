@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/wasp-core", "crates/gateway-io", "crates/wasp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "LicenseRef-Proprietary"
+authors = ["James Gober <me@jamesgober.com>"]
+publish = false
+
+# Published first-party crates only; nothing here is a path into another repository.
+# net-io stays on 0.6: serve-net 0.7 and bouncer-io 0.9 are built on net-io 0.6, and the
+# gate and control-line types cross between them, so one net-io version must be in the tree.
+[workspace.dependencies]
+serve-net = { version = "0.7.1", default-features = false, features = ["http1"] }
+net-io = "0.6.2"
+http-net = { version = "0.9.2", default-features = false }
+bouncer-io = { version = "0.9.2", features = ["net-io"] }
+system-suite = { version = "0.8", default-features = false, features = ["kernel", "signals", "config", "log"] }
+id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.bench]
+codegen-units = 1
+lto = "thin"
