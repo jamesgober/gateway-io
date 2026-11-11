@@ -28,7 +28,8 @@ impl Kind {
     }
 }
 
-/// One entry as the templates see it (`page.entry`, each of `page.posts`).
+/// One entry as the templates see it (`page.entry`, each of `page.posts`);
+/// its view schema is declared with the theme (`theme.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// `page` or `post`.
@@ -46,16 +47,6 @@ pub struct Entry {
     /// The date (`2026-11-09`), for posts.
     pub date: String,
 }
-
-luminess::view!(Entry as "entry" {
-    kind: text,
-    slug: text,
-    title: text,
-    url: text,
-    summary: text,
-    body: html,
-    date: text,
-});
 
 /// What an editor saves.
 #[derive(Clone, Debug)]

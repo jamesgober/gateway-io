@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Templates compile once, when the theme is loaded or changed, never per
-//! request. A reload compiles both engines and checks the templates the
+//! request. This is the only module that uses Luminess directly. A reload compiles both engines and checks the templates the
 //! routes need before swapping anything; a theme with an error is refused
 //! and the running one stays.
 
@@ -30,6 +30,18 @@ use crate::content::Entry;
 
 /// The templates every theme must have (the routes name them).
 pub const REQUIRED: &[&str] = &["home", "post", "page"];
+
+// The view schemas: every Luminess name the site uses is in this module, so
+// a Luminess upgrade changes this file and nothing else.
+luminess::view!(Entry as "entry" {
+    kind: text,
+    slug: text,
+    title: text,
+    url: text,
+    summary: text,
+    body: html,
+    date: text,
+});
 
 /// Site-wide values every page reads (`page.site`).
 #[derive(Clone, Debug, PartialEq, Eq)]
