@@ -45,7 +45,11 @@ fn main() -> ExitCode {
     }
 
     // PHASE 4: the door opens last.
-    if let Err(error) = boot.start(Gateway::new(wiring.core).web("web", wiring.site)) {
+    if let Err(error) = boot.start(
+        Gateway::new(wiring.core)
+            .web("web", wiring.site)
+            .stages(wiring.stages),
+    ) {
         return error.report();
     }
 

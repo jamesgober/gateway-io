@@ -224,7 +224,7 @@ fn error_pages_for_404_405_and_500() {
     .template("page");
     let app = App::with(
         WaspGate::new(core.access().clone()),
-        theme::load(&default_theme()).expect("theme"),
+        theme::Timed::untimed(theme::load(&default_theme()).expect("theme")),
     )
     .development()
     .route(ok)
@@ -382,4 +382,26 @@ fn the_watcher_reloads_a_changed_theme_through_the_kernel() {
 
     let _ = system.shutdown();
     let _ = std::fs::remove_dir_all(&conf_dir);
+}
+
+#[test]
+#[ignore = "web-net's ErrorPage carries no base path, so error pages of a site in a folder link /theme/site.css instead of /blog/theme/site.css; asked of web-net (its simplicity audit reworks that surface). Not worked around in gateway-io on purpose."]
+fn error_pages_of_a_site_in_a_folder_keep_its_base_path() {
+    let copy_conf = format!(
+        "[site]\nbase = \"/blog\"\ntheme = \"{}\"\ntheme_poll = \"0s\"\n",
+        slash(&default_theme())
+    );
+    let wiring = wasp::wire(&Config::from_text(&copy_conf).expect("config")).expect("wiring");
+    let mut web = WebServices::new();
+    web.attach(wiring.core.service_tag("web").expect("tag"), wiring.site);
+    let door = Door::open(wiring.core, &settings(), UrgentLine::detached(), web).expect("opens");
+    let addr = door.local_addr().expect("addr");
+    let got = get_path(addr, "/blog/missing");
+    assert_eq!(got.status, 404);
+    assert!(
+        got.body.contains(r#"href="/blog/theme/site.css""#),
+        "the error page's stylesheet is outside the site's folder: {}",
+        got.body
+    );
+    let _ = door.close(Duration::from_secs(1));
 }

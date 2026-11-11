@@ -30,19 +30,19 @@ use wasp_core::{Access, PermSet, Rule};
 use web_net::{App, Assets, BuildError, Cx, Route, get};
 
 use crate::content::{Kind, Manifest};
-use crate::theme::{Page, SiteInfo, SiteTheme};
+use crate::theme::{Page, SiteEngine, SiteInfo};
 
 /// The permission the account page needs (any signed-in account holds it).
 pub const MEMBER: PermSet = PermSet(1);
 
 /// A handler's context on this site.
-pub type SiteCx<'a> = Cx<'a, Who, SiteTheme>;
+pub type SiteCx<'a> = Cx<'a, Who, SiteEngine>;
 
 /// The site's app type.
-pub type SiteApp = App<WaspGate, SiteTheme>;
+pub type SiteApp = App<WaspGate, SiteEngine>;
 
 /// A route on this site.
-pub type SiteRoute = Route<Who, Rule, SiteTheme>;
+pub type SiteRoute = Route<Who, Rule, SiteEngine>;
 
 /// Where the site lives and what it serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,11 +90,11 @@ impl SiteSettings {
     }
 }
 
-/// Builds the site over the core's access gate, rendering with `theme`.
+/// Builds the site over the core's access gate, rendering with `engine`.
 pub fn build(
     access: Access,
     manifest: Manifest,
-    theme: SiteTheme,
+    engine: SiteEngine,
     settings: &SiteSettings,
 ) -> Result<SiteApp, BuildError> {
     let base = settings.base.trim_end_matches('/').to_owned();
@@ -118,7 +118,7 @@ pub fn build(
         }
     };
 
-    let mut builder = App::with(WaspGate::new(access), theme);
+    let mut builder = App::with(WaspGate::new(access), engine);
     if settings.hosts.is_empty() {
         builder = builder.development();
     }

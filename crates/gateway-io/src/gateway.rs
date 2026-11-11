@@ -17,7 +17,8 @@ use crate::control::UrgentControl;
 use crate::events::LogSink;
 use crate::observe::{ServerTime, TimeObserver};
 use crate::pipeline::{PassportAdmit, Pipeline};
-use crate::settings::Settings;
+use crate::settings::{Driver, Settings};
+use crate::stages::StageTimes;
 use crate::tickets::RequestTickets;
 use crate::web::{WebService, WebServices};
 
@@ -33,8 +34,27 @@ impl std::fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
+/// What [`Door::open_with`] can add to a plain open.
+#[derive(Clone, Default)]
+pub struct Extras {
+    /// Where the bouncer's events go (the log).
+    pub events: Option<Arc<dyn EventSink>>,
+    /// Stage timing (`gateway.stage_timing`).
+    pub stages: Option<Arc<StageTimes>>,
+}
+
+impl std::fmt::Debug for Extras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extras")
+            .field("events", &self.events.is_some())
+            .field("stages", &self.stages.as_ref().map(|s| s.enabled()))
+            .finish()
+    }
+}
+
 /// The gateway's door, open: accepting.
 pub struct Door {
+    stages: Arc<StageTimes>,
     tickets: Arc<RequestTickets>,
     running: Running,
     pool: Arc<PassportPool>,
@@ -53,17 +73,19 @@ impl Door {
         line: UrgentLine,
         web: WebServices,
     ) -> Result<Door, OpenError> {
-        Door::open_with_events(core, settings, line, web, None)
+        Door::open_with(core, settings, line, web, Extras::default())
     }
 
-    /// [`open`](Self::open), with the bouncer's events going to `events`.
-    pub fn open_with_events(
+    /// [`open`](Self::open), with the bouncer's events and stage timing.
+    pub fn open_with(
         core: Arc<Core>,
         settings: &Settings,
         line: UrgentLine,
         web: WebServices,
-        events: Option<Arc<dyn EventSink>>,
+        extras: Extras,
     ) -> Result<Door, OpenError> {
+        let Extras { events, stages } = extras;
+        let stages = stages.unwrap_or_else(|| Arc::new(StageTimes::new(false)));
         for (tag, name) in core.external_services() {
             if web.get(tag).is_none() {
                 return Err(OpenError(format!(
@@ -72,9 +94,14 @@ impl Door {
             }
         }
         let tickets = Arc::new(RequestTickets::new(settings.workers));
+        // A blocking worker is one connection's thread: one request at a time.
+        let per_worker = match settings.driver {
+            Driver::Reactor => settings.passports,
+            Driver::Blocking => 1,
+        };
         let pool = Arc::new(PassportPool::new(
             settings.workers,
-            settings.passports,
+            per_worker,
             SlotSizes {
                 body: 0,
                 ..SlotSizes::default()
@@ -93,7 +120,10 @@ impl Door {
                     .max_body(settings.max_body),
             )
             .keep_alive(KeepAlive::new().max_requests(settings.keep_alive_requests))
-            .workers(Workers::reactor(settings.workers))
+            .workers(match settings.driver {
+                Driver::Reactor => Workers::reactor(settings.workers),
+                Driver::Blocking => Workers::blocking(settings.workers),
+            })
             .drain_deadline(settings.drain)
             .catch_service_panics(true);
         for p in core.profiles() {
@@ -115,17 +145,19 @@ impl Door {
             .build()
             .map_err(|e| OpenError(format!("gateway configuration: {e}")))?;
         let bound = built
-            .bind(Pipeline::new(
+            .bind(Pipeline::with_stages(
                 core,
                 pool.clone(),
                 bouncer.clone(),
                 tickets.clone(),
                 Arc::new(web),
+                stages.clone(),
             ))
             .map_err(|e| OpenError(e.to_string()))?;
         let running = bound.open().map_err(|e| OpenError(e.to_string()))?;
         ejector.attach(running.server_handle());
         Ok(Door {
+            stages,
             tickets,
             running,
             pool,
@@ -165,6 +197,12 @@ impl Door {
         &self.time
     }
 
+    /// Stage timing (empty unless it was enabled).
+    #[must_use]
+    pub fn stage_times(&self) -> &StageTimes {
+        &self.stages
+    }
+
     /// The transport's server, for health and statistics.
     pub fn running(&self) -> &Running {
         &self.running
@@ -187,6 +225,7 @@ pub struct Gateway {
     link: Option<Link>,
     /// The settings in force: written at start and by a reload's commit.
     applied: Arc<Mutex<Settings>>,
+    stages: Option<Arc<StageTimes>>,
 }
 
 impl Gateway {
@@ -199,7 +238,16 @@ impl Gateway {
             open: None,
             link: None,
             applied: Arc::new(Mutex::new(Settings::default())),
+            stages: None,
         }
+    }
+
+    /// Records stage times into `stages` (shared with whatever else records
+    /// into it, such as the render engine).
+    #[must_use]
+    pub fn stages(mut self, stages: Arc<StageTimes>) -> Gateway {
+        self.stages = Some(stages);
+        self
     }
 
     /// Attaches a web service for the core's external service `name`.
@@ -231,12 +279,15 @@ impl Subsystem for Gateway {
             .take()
             .ok_or_else(|| Failure::new("a web service names no service the core declares"))?;
         let events: Arc<dyn EventSink> = LogSink::spawn(link.foundation().clone())?;
-        let open = Door::open_with_events(
+        let open = Door::open_with(
             self.core.clone(),
             &settings,
             link.urgent().clone(),
             web,
-            Some(events),
+            Extras {
+                events: Some(events),
+                stages: self.stages.clone(),
+            },
         )?;
         let addr = open
             .local_addr()
@@ -272,7 +323,24 @@ impl Subsystem for Gateway {
             .saturating_sub(Duration::from_millis(500))
             .min(drain);
         let time = open.server_time().summary();
+        let stages = open
+            .stage_times()
+            .enabled()
+            .then(|| open.stage_times().summaries());
         let report = open.close(budget);
+        if let (Some(stages), Some(link)) = (stages, &self.link) {
+            for (stage, s) in stages {
+                log::info!(
+                    link.foundation().log(),
+                    "gateway stage",
+                    stage = stage,
+                    count = s.count,
+                    mean_ns = u64::try_from(s.mean.as_nanos()).unwrap_or(u64::MAX),
+                    p50_ns_below = u64::try_from(s.p50.as_nanos()).unwrap_or(u64::MAX),
+                    p99_ns_below = u64::try_from(s.p99.as_nanos()).unwrap_or(u64::MAX)
+                );
+            }
+        }
         if let Some(link) = &self.link {
             log::info!(
                 link.foundation().log(),

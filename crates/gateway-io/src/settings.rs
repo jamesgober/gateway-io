@@ -5,6 +5,17 @@ use std::time::Duration;
 
 use wasp_core::suite::config::Config;
 
+/// net-io's driver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Driver {
+    /// One worker per CPU, each owning many connections (the default).
+    #[default]
+    Reactor,
+    /// One thread per connection, `workers` threads; a worker holds one
+    /// request at a time, so it gets one passport.
+    Blocking,
+}
+
 /// What the gateway opens and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -24,6 +35,11 @@ pub struct Settings {
     /// Requests per keep-alive connection before the close signal
     /// (`[gateway] keep_alive_requests`, default 1,000).
     pub keep_alive_requests: u32,
+    /// net-io's driver (`[gateway] driver`, `reactor` by default, or
+    /// `blocking`: one thread per connection, `workers` threads).
+    pub driver: Driver,
+    /// Stage timing (`[gateway] stage_timing`, default off).
+    pub stage_timing: bool,
     /// Addresses banned at the door from boot (`[door] ban`, default none).
     pub ban: Vec<IpAddr>,
     /// Addresses exempt from the door's budgets, for local load tests
@@ -42,6 +58,8 @@ impl Default for Settings {
             head_timeout: Duration::from_secs(10),
             max_body: 1024 * 1024,
             keep_alive_requests: 1000,
+            driver: Driver::Reactor,
+            stage_timing: false,
             ban: Vec::new(),
             exempt: Vec::new(),
         }
@@ -77,6 +95,18 @@ impl Settings {
         let passports: u64 = config
             .get_or("gateway.passports", u64::from(d.passports))
             .map_err(err)?;
+        let driver: String = config
+            .get_or("gateway.driver", "reactor".to_owned())
+            .map_err(err)?;
+        let driver = match driver.as_str() {
+            "reactor" => Driver::Reactor,
+            "blocking" => Driver::Blocking,
+            other => {
+                return Err(SettingsError(format!(
+                    "gateway.driver must be `reactor` or `blocking`, not `{other}`"
+                )));
+            }
+        };
         let settings = Settings {
             listen: config.get_or("gateway.listen", d.listen).map_err(err)?,
             workers: u16::try_from(workers)
@@ -98,6 +128,10 @@ impl Settings {
                 .ok_or_else(|| {
                     SettingsError("gateway.keep_alive_requests must be 1 to 4294967295".into())
                 })?,
+            driver,
+            stage_timing: config
+                .get_or("gateway.stage_timing", d.stage_timing)
+                .map_err(err)?,
             ban: addresses(config, "door.ban")?,
             exempt: addresses(config, "door.exempt")?,
         };

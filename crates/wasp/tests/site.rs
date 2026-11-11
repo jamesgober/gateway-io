@@ -353,7 +353,7 @@ fn the_authentication_cookie_goes_out_once_on_web_replies() {
     let site = wasp::site::build(
         core.access().clone(),
         wasp::content::Manifest::sample(),
-        wasp::theme::load(&theme_dir()).expect("theme"),
+        wasp::theme::Timed::untimed(wasp::theme::load(&theme_dir()).expect("theme")),
         &wasp::site::SiteSettings {
             theme: theme_dir(),
             ..wasp::site::SiteSettings::default()

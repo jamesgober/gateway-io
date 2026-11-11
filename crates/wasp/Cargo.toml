@@ -25,3 +25,7 @@ workspace = true
 [[bench]]
 name = "page"
 harness = false
+
+[[bench]]
+name = "stages"
+harness = false

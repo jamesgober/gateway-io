@@ -12,11 +12,13 @@ use std::sync::Mutex;
 
 use bouncer_io::{Ticket, TicketTag};
 
+use crate::stages::Stamps;
+
 /// One worker's live request tickets. Touched by the owning worker only on the
 /// inline path, so the lock is uncontended.
 #[repr(align(64))]
 struct Shelf {
-    live: Mutex<Vec<Ticket>>,
+    live: Mutex<Vec<(Ticket, Option<Stamps>)>>,
 }
 
 /// Request tickets, per worker.
@@ -43,25 +45,51 @@ impl RequestTickets {
     #[inline]
     #[must_use]
     pub fn hold(&self, worker: u16, ticket: Ticket) -> Option<TicketTag> {
+        self.hold_at(worker, ticket, None)
+    }
+
+    /// [`hold`](Self::hold), with the moment the head hook ran (stage timing).
+    pub(crate) fn hold_at(
+        &self,
+        worker: u16,
+        ticket: Ticket,
+        hook: Option<std::time::Instant>,
+    ) -> Option<TicketTag> {
         let shelf = self.shelves.get(usize::from(worker))?;
         let tag = ticket.tag();
-        shelf.live.lock().ok()?.push(ticket);
+        let stamps = hook.map(|h| Stamps {
+            hook: Some(h),
+            ..Stamps::start()
+        });
+        shelf.live.lock().ok()?.push((ticket, stamps));
         Some(tag)
     }
 
-    /// Releases the ticket with `tag`, when its request is done.
+    /// Keeps the stage marks of the request with `tag` (stage timing only).
+    pub(crate) fn set_stamps(&self, worker: u16, tag: TicketTag, stamps: Stamps) {
+        if let Some(shelf) = self.shelves.get(usize::from(worker))
+            && let Ok(mut live) = shelf.live.lock()
+            && let Some(entry) = live.iter_mut().find(|(t, _)| t.tag() == tag)
+        {
+            let hook = entry.1.and_then(|s| s.hook);
+            entry.1 = Some(Stamps { hook, ..stamps });
+        }
+    }
+
+    /// Releases the ticket with `tag`, when its request is done, and hands
+    /// back the request's stage marks if it had any.
     #[inline]
-    pub fn release(&self, worker: u16, tag: TicketTag) {
-        let Some(shelf) = self.shelves.get(usize::from(worker)) else {
-            return;
-        };
+    pub fn release(&self, worker: u16, tag: TicketTag) -> Option<Stamps> {
+        let shelf = self.shelves.get(usize::from(worker))?;
         // Taken out under the lock, dropped after it.
         let gone = shelf.live.lock().ok().and_then(|mut live| {
             live.iter()
-                .position(|t| t.tag() == tag)
+                .position(|(t, _)| t.tag() == tag)
                 .map(|i| live.swap_remove(i))
         });
+        let stamps = gone.as_ref().and_then(|(_, s)| *s);
         drop(gone);
+        stamps
     }
 
     /// Tickets held right now, for health and tests.

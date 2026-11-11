@@ -171,3 +171,45 @@ Inside the binary, the gateway's server-time histogram (head complete to page ha
 The render itself, measured alone (`cargo bench -p wasp --bench page`, Windows, fastest round): building the page view 44 ns (pointer clones and one title), rendering the post page 278 ns, the home page 644 ns. The template engine is under 1 us of the page; the rest of the server time is the web pipeline and the transport on a loaded machine. Server time inside the binary is several times what the in-process benchmark of step 4 measured for the same pipeline (p50 under 2.6 us on Linux); finding where the difference goes needs a quiet machine and a profiler, and is noted as a follow-up.
 
 Against the design (WASP-NEXUS 2.1): render 2-20 us estimated, 0.3 to 0.6 us measured; total server time 5-30 us estimated, 13 to 23 us mean measured.
+
+## Where the server time goes (2026-11-11)
+
+Stage timing (`gateway.stage_timing = true`; off by default, one branch per mark when off) splits each request's server time. serve-net stamps a request's arrival with net-io's loop clock, which the reactor reads right after the OS wait returns; every gateway mark is a real-clock read. Stages: `wake` (loop clock to the gateway's `head` hook: the completion, the receive, serve-net's engine, http-net's parse), `hook` (bouncer request ticket, admission, checkpoints, dispatch), `passport` (take, trip, head copy, customs), `core` (checkpoint, authentication, assignment), `service` (web-net: site, url, route, authorization, handler, finish), `render` (inside `service`: the template engine), `respond` (cookie, passport back), `to_reply` (serve-net's encode, the last checkpoint). Driven like `examples/hit.rs`: one keep-alive connection, the post page, 20,000 requests.
+
+**The binary and the process are the same.** Windows, reactor, 4 workers, means in ns (p50 below, p99 below):
+
+| stage | in process (`cargo bench -p wasp --bench stages`) | the release binary (`hit`) |
+|---|---|---|
+| wake | 6,783 (1,536 / 65,536) | 13,897 (1,536 / 196,608) |
+| hook | 487 (320 / 1,536) | 611 (448 / 1,536) |
+| passport | 452 (320 / 1,280) | 538 (320 / 1,280) |
+| core | 89 (112 / 320) | 119 (112 / 320) |
+| service | 2,338 (1,536 / 6,144) | 2,728 (1,536 / 6,144) |
+| render | 672 (512 / 2,048) | 834 (512 / 2,048) |
+| respond | 228 (224 / 448) | 263 (224 / 512) |
+| to_reply | 832 (640 / 2,560) | 1,128 (640 / 2,560) |
+| total | 11,212 (5,120 / 81,920) | 19,287 (5,120 / 196,608) |
+
+Every stage after `wake` has the same p50 in both. The step-5 "gap" came from comparing a Windows mean (13 us) with a Linux p50 (under 2.6 us): on Windows the step-4 benchmark also measured a 14 us mean for this path.
+
+**The mean is the reactor turn on Windows.** `wake` is a few microseconds at p50 but carries a tail to 65-200 us (no blocking happens in that window, so the tail is the thread being preempted mid-turn on a loaded host, plus net-io's Windows receive path, which polls before each receive). On Linux the same stage is about 1 us:
+
+| | wake mean | wake p50 below | total mean | total p50 below | client p50 |
+|---|---|---|---|---|---|
+| Windows, reactor | 6.8-17.6 us | 1.5-6.1 us | 11.2-23.8 us | 5.1-16.4 us | 22-58 us |
+| WSL2 Linux, reactor (load average 54-63) | 1.0-2.7 us | 0.9-1.0 us | 3.7-9.9 us | 3.1-3.6 us | 11.2-12.0 us |
+
+The gateway's own stages (hook, passport, core, respond) are 0.5 to 1.5 us of the mean on both systems; web-net is about 1.5 us plus 0.5-0.7 us of render.
+
+**A/B, reactor against the blocking driver (`gateway.driver = "blocking"`), three alternating runs each, in process, 4 workers:**
+
+| | server time mean | server time p99 below | wake mean | client p50 |
+|---|---|---|---|---|
+| Windows, reactor | 20.2, 20.1, 18.3 us | 98 us | 11.4-11.6 us | 61.4, 56.3, 36.6 us |
+| Windows, blocking | 9.5, 9.1, 8.0 us | 20-41 us | 1.1-1.3 us | 58.3, 56.9, 40.7 us |
+| Linux, reactor | 6.2, 9.9, 3.7 us | 14-20 us | 1.0-2.6 us | 12.0, 11.6, 11.7 us |
+| Linux, blocking | 4.5, 5.5 us (a third run failed; see below) | 14 us | 0.6-1.0 us | 12.1, 11.2 us |
+
+On Windows the blocking driver halves the server time and cuts its p99 by 60-80%; what a client on the same machine sees does not move, because there the loopback and the client side dominate. On Linux the two drivers are the same within noise. The default stays the reactor (it holds thousands of connections per worker, and production is Linux); `gateway.driver = "blocking"` is the option for a Windows development machine (`workers` then is the number of connections). The root of the Windows tail is in net-io's Windows reactor path and goes to net-io with these numbers.
+
+One blocking run on each system ended with a non-200 reply mid-run before the benchmark reconnected on closed connections (now it does); with reconnects every run completed with 0 reconnects on Windows.

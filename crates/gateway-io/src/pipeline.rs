@@ -9,7 +9,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bouncer_io::{Bouncer, TicketTag};
 use serve_net::{
@@ -20,6 +20,7 @@ use wasp_core::{
     Core, Exit, Lane, PassportPool, ProfileId, Refusal, RequestId, Routed, ServiceTag, Trip,
 };
 
+use crate::stages::{StageTimes, Stamps};
 use crate::tickets::RequestTickets;
 use crate::web::{Caller, WebServices};
 
@@ -77,6 +78,7 @@ pub struct Pipeline {
     bouncer: Bouncer,
     tickets: Arc<RequestTickets>,
     web: Arc<WebServices>,
+    stages: Arc<StageTimes>,
 }
 
 /// How a request left the request pipeline.
@@ -100,12 +102,34 @@ impl Pipeline {
         tickets: Arc<RequestTickets>,
         web: Arc<WebServices>,
     ) -> Pipeline {
+        Pipeline::with_stages(
+            core,
+            pool,
+            bouncer,
+            tickets,
+            web,
+            Arc::new(StageTimes::new(false)),
+        )
+    }
+
+    /// [`new`](Self::new), recording stage times into `stages` when it is
+    /// enabled.
+    #[must_use]
+    pub fn with_stages(
+        core: Arc<Core>,
+        pool: Arc<PassportPool>,
+        bouncer: Bouncer,
+        tickets: Arc<RequestTickets>,
+        web: Arc<WebServices>,
+        stages: Arc<StageTimes>,
+    ) -> Pipeline {
         Pipeline {
             core,
             pool,
             bouncer,
             tickets,
             web,
+            stages,
         }
     }
 
@@ -127,6 +151,7 @@ impl Pipeline {
         env: &Envelope,
         tag: TicketTag,
         reply: &mut HttpReply,
+        marks: &mut Option<Stamps>,
     ) -> Flow {
         let worker = env.worker().get();
         let Some(mut p) = self.pool.take(worker) else {
@@ -167,17 +192,27 @@ impl Pipeline {
             Ok(p) => p,
             Err(refused) => return Flow::Exit(refused),
         };
+        if let Some(m) = marks {
+            m.passport = Some(Instant::now());
+        }
         // Checkpoint between gateway and core.
         if let Some(status) = self.denied(tag) {
             return Flow::Exit(p.refuse_with(Refusal::status(status).closing()));
         }
         // CORE: authenticate, cache, assign the service.
-        match self.core.route(p) {
+        let routed = self.core.route(p);
+        if let Some(m) = marks {
+            m.core = Some(Instant::now());
+        }
+        match routed {
             Routed::Exit(exit) => Flow::Exit(exit),
             Routed::Handoff(h) => match self.web.get(h.service()) {
                 Some(web) => {
                     let caller = Caller::new(h.identity(), h.token_any());
                     let outcome = web.respond(req, env, &caller, reply);
+                    if let Some(m) = marks {
+                        m.service = Some(Instant::now());
+                    }
                     Flow::Web(h.finish(), outcome)
                 }
                 None => Flow::Exit(h.refuse(500)),
@@ -244,6 +279,7 @@ impl HttpService for Pipeline {
     /// connection's, is taken and held until `done`. A connection the door
     /// never admitted, or one already revoked, is refused here.
     fn head(&self, _head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
+        let hook = self.stages.enabled().then(Instant::now);
         let id = bouncer_io::RequestId(
             u128::from(env.connection().get()) << 32 | u128::from(env.seq().get()),
         );
@@ -252,7 +288,7 @@ impl HttpService for Pipeline {
             Err(bouncer_io::BouncerError::Revoked) => return HeadAction::refuse(403),
             Err(_) => return HeadAction::refuse(503),
         };
-        match self.tickets.hold(env.worker().get(), ticket) {
+        match self.tickets.hold_at(env.worker().get(), ticket, hook) {
             Some(tag) => {
                 env.set_user_word(tag.get());
                 HeadAction::Proceed
@@ -263,7 +299,8 @@ impl HttpService for Pipeline {
 
     fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
         let tag = TicketTag::from_raw(env.user_word());
-        match self.request(req, env, tag, reply) {
+        let mut marks = self.stages.enabled().then(Stamps::start);
+        let outcome = match self.request(req, env, tag, reply, &mut marks) {
             Flow::Exit(exit) => self.respond(exit, tag, reply),
             Flow::Web(exit, outcome) => self.respond_web(exit, outcome, reply),
             Flow::NoPassport => {
@@ -272,13 +309,21 @@ impl HttpService for Pipeline {
                     .retry_after(Duration::from_secs(1));
                 Outcome::Done
             }
+        };
+        if let Some(mut m) = marks {
+            m.respond = Some(Instant::now());
+            self.tickets.set_stamps(env.worker().get(), tag, m);
         }
+        outcome
     }
 
-    fn done(&self, env: &Envelope, _finished: &Finished) {
-        if env.user_word() != 0 {
-            self.tickets
-                .release(env.worker().get(), TicketTag::from_raw(env.user_word()));
+    fn done(&self, env: &Envelope, finished: &Finished) {
+        if env.user_word() != 0
+            && let Some(stamps) = self
+                .tickets
+                .release(env.worker().get(), TicketTag::from_raw(env.user_word()))
+        {
+            self.stages.record(env.arrived(), finished, &stamps);
         }
     }
 }

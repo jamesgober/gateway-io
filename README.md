@@ -57,6 +57,8 @@ themes/default/static/   site.css                 (served under /theme/)
 | `gateway.head_timeout` | `10s` | the head deadline |
 | `gateway.max_body` | 1 MiB | the largest buffered body |
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
+| `gateway.driver` | `reactor` | net-io's driver; `blocking` (one thread per connection, `workers` threads) halves server time on a Windows development machine |
+| `gateway.stage_timing` | false | record where each request's server time goes; logged per stage when the gateway stops |
 | `door.ban` | none | addresses refused at the door; changes apply on reload |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
@@ -80,6 +82,7 @@ cargo test --workspace
 cargo bench -p wasp-core --bench passport
 cargo bench -p gateway-io --bench request_path
 cargo bench -p wasp --bench page
+cargo bench -p wasp --bench stages -- 4 20000 reactor
 cargo run --release -p wasp --example hit -- 127.0.0.1:8080 /posts/the-passport 20000
 ```
 

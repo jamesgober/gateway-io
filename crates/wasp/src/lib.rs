@@ -20,6 +20,9 @@ pub struct Wiring {
     pub site: site::SiteApp,
     /// The theme watcher (a kernel subsystem; start it before the gateway).
     pub theme: theme::ThemeWatcher,
+    /// Stage timing (`gateway.stage_timing`), shared by the gateway and the
+    /// render engine.
+    pub stages: Arc<gateway_io::StageTimes>,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -64,12 +67,18 @@ pub fn wire(config: &Config) -> Result<Wiring, String> {
     let theme = theme::load(&settings.theme).map_err(|e| e.0)?;
     let watcher =
         theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll);
+    let timing: bool = config
+        .get_or("gateway.stage_timing", false)
+        .map_err(|e| e.to_string())?;
+    let stages = Arc::new(gateway_io::StageTimes::new(timing));
     let manifest = content::Manifest::sample_at(&settings.base);
-    let site = site::build(core.access().clone(), manifest, theme, &settings)
+    let engine = theme::Timed::new(theme, stages.clone());
+    let site = site::build(core.access().clone(), manifest, engine, &settings)
         .map_err(|e| format!("site: {e}"))?;
     Ok(Wiring {
         core,
         site,
         theme: watcher,
+        stages,
     })
 }

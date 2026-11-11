@@ -84,8 +84,65 @@ luminess::view!(Page as "page" {
     message: text,
 });
 
-/// The theme web-net renders with.
+/// The theme: what the watcher reloads.
 pub type SiteTheme = Theme<Page>;
+
+/// A render engine that records the time of each render into the stage
+/// timing (when it is on). What web-net renders with.
+#[derive(Clone)]
+pub struct Timed<E> {
+    inner: E,
+    stages: Arc<gateway_io::StageTimes>,
+}
+
+impl<E> Timed<E> {
+    /// `inner`, timed into `stages`.
+    #[must_use]
+    pub fn new(inner: E, stages: Arc<gateway_io::StageTimes>) -> Timed<E> {
+        Timed { inner, stages }
+    }
+
+    /// `inner`, with timing off.
+    #[must_use]
+    pub fn untimed(inner: E) -> Timed<E> {
+        Timed::new(inner, Arc::new(gateway_io::StageTimes::new(false)))
+    }
+}
+
+impl<E: web_net::Render> web_net::Render for Timed<E> {
+    type View<'a> = E::View<'a>;
+
+    fn template(&self, name: &str) -> Option<web_net::TemplateId> {
+        self.inner.template(name)
+    }
+
+    #[inline]
+    fn render(
+        &self,
+        template: web_net::TemplateId,
+        view: &Self::View<'_>,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<(), web_net::RenderError> {
+        if !self.stages.enabled() {
+            return self.inner.render(template, view, out);
+        }
+        let t = std::time::Instant::now();
+        let done = self.inner.render(template, view, out);
+        self.stages.render(t.elapsed());
+        done
+    }
+
+    fn error_page(
+        &self,
+        page: &web_net::ErrorPage<'_>,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<bool, web_net::RenderError> {
+        self.inner.error_page(page, out)
+    }
+}
+
+/// The engine web-net renders the site with.
+pub type SiteEngine = Timed<SiteTheme>;
 
 /// Why a theme was refused.
 #[derive(Debug)]
