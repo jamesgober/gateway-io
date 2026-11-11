@@ -26,7 +26,8 @@ fn main() -> ExitCode {
     };
 
     // PHASES 1 to 3: the core, its services and profiles, the site.
-    let wiring = match wasp::wire(&boot.foundation().config()) {
+    let data = boot.foundation().paths().data().to_path_buf();
+    let wiring = match wasp::wire_in(&boot.foundation().config(), &data) {
         Ok(wiring) => wiring,
         Err(reason) => {
             log::error!(

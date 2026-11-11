@@ -22,9 +22,11 @@ pub mod core;
 pub mod customs;
 pub mod gates;
 pub mod identity;
+pub mod jobs;
 pub mod passport;
 pub mod pool;
 pub mod profile;
+pub mod provider;
 pub mod service;
 pub mod slot;
 pub mod stage;
@@ -41,9 +43,11 @@ pub use crate::gates::{
     Rule, RuleTerms,
 };
 pub use crate::identity::{Identity, PermSet, SessionId, Standing, Subject, TenantId, UserId};
+pub use crate::jobs::{InProcessJobs, Job, JobRefused, JobStats, Jobs, NoJobs, Submitted};
 pub use crate::passport::{Exit, Passport, RequestView};
 pub use crate::pool::{PassportPool, PoolStats};
 pub use crate::profile::{CredentialLocator, Profile, SessionSettings};
+pub use crate::provider::{Provider, ProviderError};
 pub use crate::service::{Service, ServiceCtx, Work};
 pub use crate::slot::{
     AccessStamp, Head, Inspection, Lane, ProfileId, Refusal, Reply, ReplyKind, RequestId,

@@ -1,6 +1,9 @@
 //! The service seam: what the core hands an identified passport to.
 
+use std::sync::Arc;
+
 use crate::gates::Access;
+use crate::jobs::Jobs;
 use crate::passport::{Exit, Passport};
 use crate::slot::ServiceTag;
 use crate::stage::Identified;
@@ -20,12 +23,24 @@ pub enum Work {
 
 /// What a service gets at boot: its tag and its handles. Held for the
 /// service's whole life, so nothing is looked up per request.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServiceCtx {
     /// The service's tag.
     pub tag: ServiceTag,
     /// The access gate: the only way to a cleared passport.
     pub access: Access,
+    /// The job runner: slow side work off the request path.
+    pub jobs: Arc<dyn Jobs>,
+}
+
+impl std::fmt::Debug for ServiceCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceCtx")
+            .field("tag", &self.tag)
+            .field("access", &self.access)
+            .field("jobs", &self.jobs.stats())
+            .finish()
+    }
 }
 
 /// A service: routes, authorizes, builds content, renders.

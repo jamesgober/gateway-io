@@ -13,8 +13,10 @@ use crate::gates::{
     Access, AuthOut, Authentication, Authenticator, Authorizer, EveryoneGuest, RuleTerms,
 };
 use crate::identity::Identity;
+use crate::jobs::{Jobs, NoJobs};
 use crate::passport::{Exit, Passport};
 use crate::profile::Profile;
+use crate::provider::Provider;
 use crate::service::{Service, ServiceCtx};
 use crate::slot::Trip;
 use crate::slot::{ProfileId, ServiceTag};
@@ -130,6 +132,8 @@ pub struct CoreBuilder {
     authorizer: Arc<dyn Authorizer>,
     customs: Arc<dyn Customs>,
     cache: Box<dyn GuestCache>,
+    providers: Vec<Arc<dyn Provider>>,
+    jobs: Arc<dyn Jobs>,
 }
 
 impl Default for CoreBuilder {
@@ -149,7 +153,23 @@ impl CoreBuilder {
             authorizer: Arc::new(RuleTerms),
             customs: Arc::new(HeadRules::default()),
             cache: Box::new(NoCache),
+            providers: Vec::new(),
+            jobs: Arc::new(NoJobs),
         }
+    }
+
+    /// Phase 3: a provider the core owns (a content store, a database). It
+    /// is flushed at shutdown step 4, after the services stopped.
+    pub fn provider(mut self, provider: Arc<dyn Provider>) -> Self {
+        self.providers.push(provider);
+        self
+    }
+
+    /// The job runner every service gets (default [`NoJobs`]: every job
+    /// refused). Stopped at shutdown step 3, with the services.
+    pub fn jobs(mut self, jobs: Arc<dyn Jobs>) -> Self {
+        self.jobs = jobs;
+        self
     }
 
     /// The authenticator (the auth gate).
@@ -262,6 +282,7 @@ impl CoreBuilder {
                 Some(build) => Entry::Passport(build(ServiceCtx {
                     tag: ServiceTag(u8::try_from(i).unwrap_or(u8::MAX)),
                     access: access.clone(),
+                    jobs: self.jobs.clone(),
                 })),
                 None => Entry::External(name),
             })
@@ -273,6 +294,8 @@ impl CoreBuilder {
             authenticator: self.authenticator,
             customs: self.customs,
             cache: self.cache,
+            providers: self.providers.into_boxed_slice(),
+            jobs: self.jobs,
         })
     }
 }
@@ -286,6 +309,8 @@ pub struct Core {
     authenticator: Box<dyn Authenticator>,
     customs: Arc<dyn Customs>,
     cache: Box<dyn GuestCache>,
+    providers: Box<[Arc<dyn Provider>]>,
+    jobs: Arc<dyn Jobs>,
 }
 
 impl Core {
@@ -336,6 +361,18 @@ impl Core {
             }),
             None => Routed::Exit(p.refuse(500)),
         }
+    }
+
+    /// The job runner, for external services.
+    #[must_use]
+    pub fn jobs(&self) -> &Arc<dyn Jobs> {
+        &self.jobs
+    }
+
+    /// The providers, in the order they were added.
+    #[must_use]
+    pub fn providers(&self) -> &[Arc<dyn Provider>] {
+        &self.providers
     }
 
     /// The access gate's handle, for external services (they authorize on
@@ -449,16 +486,36 @@ impl Subsystem for CoreSubsystem {
     }
 
     fn stop(&mut self, deadline: Deadline) -> Result<(), Failure> {
-        // 3: services stop. 4: providers flush (none yet). 5: gates persist
-        // (in-memory guest gate: nothing to persist). 6: the core stops.
+        // 3: services stop, and the jobs they queued finish (or are counted
+        // as left). 4: providers flush. 5: gates persist (in-memory guest
+        // gate: nothing to persist). 6: the core stops.
         self.core.stop_services();
+        let jobs = self.core.jobs.stop(deadline.instant());
+        let mut failed = Vec::new();
+        for p in self.core.providers.iter() {
+            if let Err(e) = p.flush() {
+                failed.push(format!("{}: {e}", p.name()));
+            }
+        }
         if let Some(link) = &self.link {
             log::info!(
                 link.foundation().log(),
                 "core stopped",
+                jobs_done = jobs.done,
+                jobs_failed = jobs.failed,
+                jobs_abandoned = jobs.abandoned,
+                providers = self.core.providers.len(),
+                provider_failures = failed.join("; ").as_str(),
                 remaining_ms = u64::try_from(deadline.remaining().as_millis()).unwrap_or(u64::MAX)
             );
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Failure::new(format!(
+                "providers failed to flush: {}",
+                failed.join("; ")
+            )))
+        }
     }
 }

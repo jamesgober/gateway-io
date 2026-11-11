@@ -95,6 +95,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bison-db"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19755079572457ab4a296429fdda5343617727b3625f124d44792926fbb7b979"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1025,6 +1031,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 name = "wasp"
 version = "0.1.0"
 dependencies = [
+ "bison-db",
  "bouncer-io",
  "gateway-io",
  "luminess",

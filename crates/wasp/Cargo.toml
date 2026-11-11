@@ -15,6 +15,8 @@ gateway-io = { path = "../gateway-io" }
 web-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
 luminess = { workspace = true }
+# The first durable content store (embedded, first-party).
+bison-db = { workspace = true }
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
