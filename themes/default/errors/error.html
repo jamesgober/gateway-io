@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ error.status }} {{ error.title }}</title>
+<link rel="stylesheet" href="/theme/site.css">
+</head>
+<body>
+<main class="error">
+<h1>{{ error.status }} {{ error.title }}</h1>
+<p>{{ error.message }}</p>
+<p class="reference">Reference: {{ error.reference }}</p>
+</main>
+</body>
+</html>

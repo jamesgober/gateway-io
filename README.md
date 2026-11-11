@@ -38,7 +38,13 @@ curl -i http://127.0.0.1:8080/posts/hello-world
 curl -i http://127.0.0.1:8080/account
 ```
 
-The site: `/`, `/posts/:slug` (from an in-memory map), `/about`, `/account` (signed in only: guests get a 303 to `/sign-in`), `/sign-in`, `/health`.
+The site: `/`, `/posts/:slug` and `/about` (from the in-memory content manifest), `/account` (signed in only: guests get a 303 to `/sign-in`), `/sign-in`, `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+
+```text
+themes/default/pages/    base, home, post, page   (view: page)
+themes/default/errors/   error, error/404         (view: error)
+themes/default/static/   site.css                 (served under /theme/)
+```
 
 ## Configuration
 
@@ -57,6 +63,9 @@ The site: `/`, `/posts/:slug` (from an in-memory map), `/about`, `/account` (sig
 | `site.base` | none | the folder the site lives under (`/blog`) |
 | `site.hosts` | none | the site's hosts, canonical first; none answers localhost (development) |
 | `site.assets` | none | a folder served under `/static` |
+| `site.name` | `WASP` | the site's name, in every page title |
+| `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
+| `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`) |
 
 A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt` and `gateway.drain` at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
@@ -70,6 +79,8 @@ cargo +1.89 clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo bench -p wasp-core --bench passport
 cargo bench -p gateway-io --bench request_path
+cargo bench -p wasp --bench page
+cargo run --release -p wasp --example hit -- 127.0.0.1:8080 /posts/the-passport 20000
 ```
 
 Decisions are in `dev/DECISIONS.md`; measurements in `dev/MEASUREMENTS.md`.

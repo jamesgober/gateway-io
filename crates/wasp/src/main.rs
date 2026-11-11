@@ -4,7 +4,8 @@
 //!  PHASE 0  foundation   config, log, error, kernel (signals hooked, urgent line)
 //!  PHASE 1  core boot    the core's seams: authenticator, authorizer, customs, cache
 //!  PHASE 2  core load    services register, profiles compile (invalid: refuse to start)
-//!  PHASE 3  post-load    services built with their context; the web site built
+//!  PHASE 3  post-load    services built with their context; the theme compiled, its
+//!                        watcher started; the web site built
 //!  PHASE 4  open         the gateway binds and opens the door: last
 //!
 //!  stop: 1-2 gateway (door closes, drain)  3-6 core  7 kernel (last)
@@ -37,6 +38,9 @@ fn main() -> ExitCode {
         }
     };
     if let Err(error) = boot.start(CoreSubsystem::new(wiring.core.clone())) {
+        return error.report();
+    }
+    if let Err(error) = boot.start(wiring.theme) {
         return error.report();
     }
 

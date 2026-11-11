@@ -19,7 +19,12 @@ fn free_port() -> u16 {
 
 fn write_conf(path: &Path, port: u16, door: &str) {
     let text = format!(
-        "[log]\nlevel = \"warn\"\nstderr = false\nfile = false\n\n[gateway]\nlisten = \"127.0.0.1:{port}\"\nworkers = 2\npassports = 8\n\n[door]\n{door}\n"
+        "[log]\nlevel = \"warn\"\nstderr = false\nfile = false\n\n[gateway]\nlisten = \"127.0.0.1:{port}\"\nworkers = 2\npassports = 8\n\n[site]\ntheme = \"{theme}\"\ntheme_poll = \"0s\"\n\n[door]\n{door}\n",
+        theme = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../themes/default")
+            .display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
     );
     std::fs::write(path, text).expect("config written");
 }

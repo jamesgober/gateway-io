@@ -1,0 +1,8 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.entry.title }}</h1>
+<time>{{ page.entry.date }}</time>
+{{ page.entry.body }}
+</article>
+{% endblock %}

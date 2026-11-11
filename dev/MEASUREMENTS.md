@@ -148,3 +148,26 @@ Windows (CPU near 100%), web path:
 | 8 | 17399 | 17015 | -384 | 4.096µs | 163.84µs |
 
 Reading: on one connection on Linux, the platform adds 0.6 us at p50 on both paths, over serve-net alone and over web-net alone. Server-time means move by 1 to 2 us between runs, more than the difference; on Windows the gateway even measured faster than the bare servers in some rows. Every run ended with 0 passports in use and 0 request tickets held.
+
+## Step 5: one themed page through the wasp binary
+
+The release binary serving the site (web-net 0.9, Luminess 0.9.2, the default theme), measured from outside with `cargo run --release -p wasp --example hit -- 127.0.0.1:8090 /posts/the-passport 20000`: one keep-alive connection, one request at a time, request written to whole page read, after 1,000 warm-up requests. The page is the post page, 611 bytes; the home page (956 bytes, three posts) is the same within noise. Config: `keep_alive_requests = 1000000`, `door.exempt = ["127.0.0.1"]`; workers at their default (one per logical CPU).
+
+| | min | p50 | p90 | p99 | mean | pages/s |
+|---|---|---|---|---|---|---|
+| Windows (host at 58% CPU), three runs | 9.9 to 10.3 us | 40.5 to 45.3 us | 70.2 to 71.1 us | 86.9 to 89.7 us | 44.0 to 46.9 us | 21,200 to 22,600 |
+| WSL2 Linux (load average 12 to 20), best runs | 12.7 to 13.0 us | 15.3 to 16.2 us | 127.6 to 145.9 us | 362 to 790 us | 72.5 to 106.5 us | 9,400 to 13,800 |
+| WSL2 Linux, typical runs | 52 to 67 us | 104 to 134 us | 136 to 264 us | 280 to 3,640 us | 125 to 260 us | 3,800 to 8,000 |
+
+WSL runs fall into two regimes (about 15 us or about 125 us at p50) with the worker count at 4 or 32 alike: the guest's scheduling on a loaded host, not the code. The Windows host figures are the steadier ones.
+
+Inside the binary, the gateway's server-time histogram (head complete to page handed to net-io, so web-net's site, url, route, authorization, the render, and the gateway's passport path):
+
+| | requests | mean | p50 below |
+|---|---|---|---|
+| Windows | 84,001 | 13.1 us | 10.2 us |
+| WSL2 Linux | 84,000 | 14.7 to 23.5 us | 16.4 to 20.5 us |
+
+The render itself, measured alone (`cargo bench -p wasp --bench page`, Windows, fastest round): building the page view 44 ns (pointer clones and one title), rendering the post page 278 ns, the home page 644 ns. The template engine is under 1 us of the page; the rest of the server time is the web pipeline and the transport on a loaded machine. Server time inside the binary is several times what the in-process benchmark of step 4 measured for the same pipeline (p50 under 2.6 us on Linux); finding where the difference goes needs a quiet machine and a profiler, and is noted as a follow-up.
+
+Against the design (WASP-NEXUS 2.1): render 2-20 us estimated, 0.3 to 0.6 us measured; total server time 5-30 us estimated, 13 to 23 us mean measured.

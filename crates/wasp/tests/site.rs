@@ -22,9 +22,47 @@ fn settings() -> Settings {
     }
 }
 
+/// The repository's default theme.
+fn theme_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default")
+}
+
+/// `conf` with the default theme (and no watcher) in its `[site]` section.
+fn with_theme(conf: &str) -> String {
+    let theme = format!(
+        "theme = \"{}\"
+theme_poll = \"0s\"
+",
+        theme_dir()
+            .display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    );
+    if conf.contains(
+        "[site]
+",
+    ) {
+        conf.replacen(
+            "[site]
+",
+            &format!(
+                "[site]
+{theme}"
+            ),
+            1,
+        )
+    } else {
+        format!(
+            "{conf}
+[site]
+{theme}"
+        )
+    }
+}
+
 /// Opens the process's own wiring from configuration text.
 fn open_site(conf: &str) -> (Door, SocketAddr) {
-    let config = Config::from_text(conf).expect("config");
+    let config = Config::from_text(&with_theme(conf)).expect("config");
     let wiring = wasp::wire(&config).expect("wiring");
     let mut web = WebServices::new();
     web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
@@ -314,8 +352,12 @@ fn the_authentication_cookie_goes_out_once_on_web_replies() {
     let core = web_core(DeadSession);
     let site = wasp::site::build(
         core.access().clone(),
-        wasp::site::Content::sample(),
-        &wasp::site::SiteSettings::default(),
+        wasp::content::Manifest::sample(),
+        wasp::theme::load(&theme_dir()).expect("theme"),
+        &wasp::site::SiteSettings {
+            theme: theme_dir(),
+            ..wasp::site::SiteSettings::default()
+        },
     )
     .expect("site");
     let mut web = WebServices::new();

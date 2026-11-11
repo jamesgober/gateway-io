@@ -1,209 +1,188 @@
-//! The first site: web-net on the gateway, content from an in-memory map,
-//! templates as plain strings (build-path step 4).
+//! The site: web-net on the gateway, content from the in-memory manifest,
+//! pages and error pages rendered by the theme (build-path step 5).
 //!
-//! | Path | Rule | What |
-//! |---|---|---|
-//! | `/` | public | the home page, listing the posts |
-//! | `/posts/:slug` | public | a post, 404 when the map has no such slug |
-//! | `/about` | public | a static page |
-//! | `/account` | signed in | guests are sent to `/sign-in` (303) |
-//! | `/sign-in` | public | a placeholder until sign-in exists (step 7) |
-//! | `/health` | none | liveness, answered before the gate |
+//! | Path | Rule | Template | What |
+//! |---|---|---|---|
+//! | `/` | public | `home` | the post listing, newest first |
+//! | `/posts/:slug` | public | `post` | a post; 404 (themed) when there is none |
+//! | `/about` | public | `page` | the `about` page from the manifest |
+//! | `/account` | signed in | `page` | guests are sent to `/sign-in` (303) |
+//! | `/sign-in` | public | `page` | a placeholder until sign-in exists (step 7) |
+//! | `/health` | none | none | liveness, answered before the gate |
+//! | `/theme/...` | none | none | the theme's static files (the stylesheet) |
 //!
-//! Configuration (`[site]`): `base` (the folder the site lives under, for
-//! example `/blog`), `hosts` (the site's hosts; none means a development site
-//! answering localhost), `assets` (a folder served under `/static`).
+//! Error pages (404, 405, 500, ...) come from the theme's `errors/` folder
+//! through web-net's error-page hook.
+//!
+//! Configuration (`[site]`): `name`, `base` (the folder the site lives under,
+//! for example `/blog`), `hosts` (none means a development site answering
+//! localhost), `assets` (a folder served under `/static`), `theme` (the theme
+//! folder, default `themes/default`), `theme_poll` (how often the watcher
+//! looks for changes, default `1s`; `0s` turns it off).
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gateway_io::{WaspGate, Who};
 use wasp_core::suite::config::Config;
 use wasp_core::{Access, PermSet, Rule};
 use web_net::{App, Assets, BuildError, Cx, Route, get};
 
+use crate::content::{Kind, Manifest};
+use crate::theme::{Page, SiteInfo, SiteTheme};
+
 /// The permission the account page needs (any signed-in account holds it).
 pub const MEMBER: PermSet = PermSet(1);
 
-/// One post: title and body (plain text).
-#[derive(Clone, Debug)]
-pub struct Post {
-    /// The title.
-    pub title: &'static str,
-    /// The body, plain text.
-    pub body: &'static str,
-}
+/// A handler's context on this site.
+pub type SiteCx<'a> = Cx<'a, Who, SiteTheme>;
 
-/// The site's content, in memory until a content store exists (step 8).
-#[derive(Clone, Debug, Default)]
-pub struct Content {
-    posts: BTreeMap<&'static str, Post>,
-}
+/// The site's app type.
+pub type SiteApp = App<WaspGate, SiteTheme>;
 
-impl Content {
-    /// The sample content.
-    #[must_use]
-    pub fn sample() -> Content {
-        let mut posts = BTreeMap::new();
-        posts.insert(
-            "hello-world",
-            Post {
-                title: "Hello, world",
-                body: "The first page served through the gateway, the core, and the web service.",
-            },
-        );
-        posts.insert(
-            "the-passport",
-            Post {
-                title: "The passport",
-                body: "Every request carries one from the pool to the reply, and back, wiped.",
-            },
-        );
-        Content { posts }
-    }
-}
+/// A route on this site.
+pub type SiteRoute = Route<Who, Rule, SiteTheme>;
 
 /// Where the site lives and what it serves.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteSettings {
+    /// The site's name.
+    pub name: String,
     /// The folder the site is installed under (`/blog`), or empty.
     pub base: String,
     /// The site's hosts, canonical first; empty for a development site.
     pub hosts: Vec<String>,
     /// A folder served under `/static`.
     pub assets: Option<PathBuf>,
+    /// The theme folder.
+    pub theme: PathBuf,
+    /// How often the theme watcher looks for changes; zero turns it off.
+    pub theme_poll: Duration,
+}
+
+impl Default for SiteSettings {
+    fn default() -> SiteSettings {
+        SiteSettings {
+            name: "WASP".to_owned(),
+            base: String::new(),
+            hosts: Vec::new(),
+            assets: None,
+            theme: PathBuf::from("themes/default"),
+            theme_poll: Duration::from_secs(1),
+        }
+    }
 }
 
 impl SiteSettings {
     /// Reads `[site]`; every key is optional.
     pub fn from_config(config: &Config) -> Result<SiteSettings, String> {
-        let base: String = config
-            .get_or("site.base", String::new())
-            .map_err(|e| e.to_string())?;
-        let hosts: Vec<String> = config
-            .get_or("site.hosts", Vec::new())
-            .map_err(|e| e.to_string())?;
-        let assets: Option<PathBuf> = config.get("site.assets").map_err(|e| e.to_string())?;
+        let d = SiteSettings::default();
+        let e = |e: wasp_core::suite::Error| e.to_string();
         Ok(SiteSettings {
-            base,
-            hosts,
-            assets,
+            name: config.get_or("site.name", d.name).map_err(e)?,
+            base: config.get_or("site.base", d.base).map_err(e)?,
+            hosts: config.get_or("site.hosts", d.hosts).map_err(e)?,
+            assets: config.get("site.assets").map_err(e)?,
+            theme: config.get_or("site.theme", d.theme).map_err(e)?,
+            theme_poll: config.get_or("site.theme_poll", d.theme_poll).map_err(e)?,
         })
     }
 }
 
-/// HTML-escapes `text`.
-fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// The page template: a plain string.
-fn page(cx: &Cx<'_, Who>, title: &str, body: &str) -> String {
-    let home = escape(&cx.url("/"));
-    let about = escape(&cx.url("/about"));
-    let account = escape(&cx.url("/account"));
-    format!(
-        "<!doctype html><html lang=en><meta charset=utf-8><title>{t}</title>\
-         <nav><a href=\"{home}\">Home</a> | <a href=\"{about}\">About</a> | <a href=\"{account}\">Account</a></nav>\
-         <main><h1>{t}</h1>{body}</main></html>",
-        t = escape(title)
-    )
-}
-
-/// Builds the site over the core's access gate.
+/// Builds the site over the core's access gate, rendering with `theme`.
 pub fn build(
     access: Access,
-    content: Content,
+    manifest: Manifest,
+    theme: SiteTheme,
     settings: &SiteSettings,
-) -> Result<App<WaspGate>, BuildError> {
-    let content = Arc::new(content);
-    let mut builder = App::with_gate(WaspGate::new(access));
+) -> Result<SiteApp, BuildError> {
+    let base = settings.base.trim_end_matches('/').to_owned();
+    let site = Arc::new(SiteInfo {
+        name: settings.name.clone(),
+        home: format!("{base}/"),
+        about: format!("{base}/about"),
+        account: format!("{base}/account"),
+        css: format!("{base}/theme/site.css"),
+    });
+    let manifest = Arc::new(manifest);
+    let page = {
+        let site = site.clone();
+        let manifest = manifest.clone();
+        move |title: &str, entry, message: &str| Page {
+            site: site.clone(),
+            title: title.to_owned(),
+            entry,
+            posts: manifest.posts(),
+            message: message.to_owned(),
+        }
+    };
+
+    let mut builder = App::with(WaspGate::new(access), theme);
     if settings.hosts.is_empty() {
         builder = builder.development();
     }
     for host in &settings.hosts {
         builder = builder.host(host);
     }
-    if !settings.base.is_empty() {
-        builder = builder.base(&settings.base);
+    if !base.is_empty() {
+        builder = builder.base(&base);
     }
     if let Some(dir) = &settings.assets {
         builder = builder.assets(Assets::new("/static", dir.clone()));
     }
+    builder = builder.assets(Assets::new("/theme", settings.theme.join("static")));
 
-    let list = content.clone();
-    let home: Route<Who, Rule> = get("/", move |cx: &mut Cx<'_, Who>| {
-        let mut items = String::from("<ul>");
-        for (slug, post) in &list.posts {
-            let href = escape(&cx.url(&format!("/posts/{slug}")));
-            items.push_str(&format!(
-                "<li><a href=\"{href}\">{}</a></li>",
-                escape(post.title)
-            ));
-        }
-        items.push_str("</ul>");
-        let html = page(cx, "Home", &items);
-        cx.html(200, &html);
-        Ok(())
+    let p = page.clone();
+    let home: SiteRoute = get("/", move |cx: &mut SiteCx<'_>| {
+        cx.render(&p("Home", None, ""))
     })
     .public()
+    .template("home")
     .name("home");
 
-    let posts = content.clone();
-    let post: Route<Who, Rule> = get("/posts/:slug", move |cx: &mut Cx<'_, Who>| {
+    let p = page.clone();
+    let m = manifest.clone();
+    let post: SiteRoute = get("/posts/:slug", move |cx: &mut SiteCx<'_>| {
         let slug = cx.param("slug").map(|s| s.into_owned()).unwrap_or_default();
-        let Some(post) = posts.posts.get(slug.as_str()) else {
+        let Some(entry) = m.get(Kind::Post, &slug) else {
             return Err(web_net::Error::not_found("post.unknown"));
         };
-        let html = page(cx, post.title, &format!("<p>{}</p>", escape(post.body)));
-        cx.html(200, &html);
-        Ok(())
+        let view = p(&entry.title, Some(entry.clone()), "");
+        cx.render(&view)
     })
     .public()
+    .template("post")
     .name("post");
 
-    let about: Route<Who, Rule> = get("/about", |cx: &mut Cx<'_, Who>| {
-        let html = page(
-            cx,
-            "About",
-            "<p>A site in memory, on the platform's walking skeleton.</p>",
-        );
-        cx.html(200, &html);
-        Ok(())
+    let p = page.clone();
+    let m = manifest.clone();
+    let about: SiteRoute = get("/about", move |cx: &mut SiteCx<'_>| {
+        let entry = m.get(Kind::Page, "about");
+        cx.render(&p("About", entry, "Nothing here yet."))
     })
     .public()
+    .template("page")
     .name("about");
 
-    let account: Route<Who, Rule> = get("/account", |cx: &mut Cx<'_, Who>| {
-        let html = page(cx, "Account", "<p>Signed in.</p>");
-        cx.html(200, &html);
-        Ok(())
+    let p = page.clone();
+    let account: SiteRoute = get("/account", move |cx: &mut SiteCx<'_>| {
+        cx.render(&p("Account", None, "Signed in."))
     })
     .allow(Rule::needs(2, MEMBER))
+    .template("page")
     .name("account");
 
-    let sign_in: Route<Who, Rule> = get("/sign-in", |cx: &mut Cx<'_, Who>| {
-        let html = page(
-            cx,
+    let p = page;
+    let sign_in: SiteRoute = get("/sign-in", move |cx: &mut SiteCx<'_>| {
+        cx.render(&p(
             "Sign in",
-            "<p>Sign-in arrives with the gates (step 7).</p>",
-        );
-        cx.html(200, &html);
-        Ok(())
+            None,
+            "Sign-in arrives with the gates (step 7).",
+        ))
     })
     .public()
+    .template("page")
     .name("sign-in");
 
     builder

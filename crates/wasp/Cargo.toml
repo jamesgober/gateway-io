@@ -13,9 +13,15 @@ wasp-core = { path = "../wasp-core" }
 gateway-io = { path = "../gateway-io" }
 # The web site: site, url, router, handlers.
 web-net = { workspace = true }
+# The render engine: themes compiled at boot, values through the View trait.
+luminess = { workspace = true }
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "page"
+harness = false

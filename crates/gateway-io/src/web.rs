@@ -129,7 +129,8 @@ impl WebGate for WaspGate {
 }
 
 /// A service that answers on serve-net's request and reply, given the caller
-/// the core identified. web-net's `App<G>` is one for every [`WebGate`].
+/// the core identified. web-net's `App<G, E>` is one for every [`WebGate`]
+/// and every render engine.
 pub trait WebService: Send + Sync + 'static {
     /// Answers one identified request into `reply`.
     fn respond(
@@ -147,7 +148,7 @@ pub trait WebService: Send + Sync + 'static {
     }
 }
 
-impl<G: WebGate> WebService for web_net::App<G> {
+impl<G: WebGate, E: web_net::Render> WebService for web_net::App<G, E> {
     #[inline]
     fn respond(
         &self,
