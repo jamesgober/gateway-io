@@ -1,8 +1,8 @@
 # gateway-io
 
-Proprietary. All rights reserved.
+The front door of WASP, my platform for web applications and services, with the part of its core that requests are handed to and the binary that boots both. It is a working skeleton: it answers real requests, signs people in and out, renders themed pages, and keeps content across restarts.
 
-The platform's front door and the minimum of the core it hands requests to, as a walking skeleton that answers real requests.
+**Source-available, not open source.** The code is public so it can be read. It is not licensed for use, copying, or distribution; see [LICENSE](LICENSE).
 
 | Crate | What it holds |
 |---|---|
@@ -23,6 +23,14 @@ The platform's front door and the minimum of the core it hands requests to, as a
 ```
 
 For passport services, skipping a gate does not compile: only the core can produce `Identified`, only the core's `Access` (a service cannot make its own) can produce `Cleared`, and only `Cleared` can write a reply (see the `compile_fail` tests in `crates/wasp-core/src/passport.rs`). Web services answer on serve-net's own types after the core identified the request: there the per-route guarantee is web-net's (a handler's context exists only after its gate authorized the route), not the passport's.
+
+## Build
+
+Rust 1.89 or newer. On Windows, set `AWS_LC_SYS_PREBUILT_NASM=1` so the crypto dependency builds without a NASM install.
+
+```bash
+cargo build --release -p wasp
+```
 
 ## Run
 
@@ -76,7 +84,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
 | `site.base` | none | the folder the site lives under (`/blog`: a leading `/`, no trailing `/`) |
-| `site.hosts` | none | the site's hosts, canonical first; none answers localhost (development) |
+| `site.hosts` | none | the site's hosts, canonical first; none answers only the development hosts (`localhost`, `127.0.0.1`, `[::1]`) |
 | `site.assets` | none | a folder served under `/static` |
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
@@ -108,3 +116,7 @@ cargo run --release -p wasp --example hit -- 127.0.0.1:8080 /posts/the-passport 
 ```
 
 Decisions are in `dev/DECISIONS.md`; measurements in `dev/MEASUREMENTS.md`.
+
+## License
+
+Copyright (c) 2026 James Gober. All rights reserved. See [LICENSE](LICENSE).

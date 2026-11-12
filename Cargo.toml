@@ -11,7 +11,7 @@ authors = ["James Gober <me@jamesgober.com>"]
 publish = false
 
 # Published first-party crates only; nothing here is a path into another repository.
-# net-io stays on 0.6: serve-net 0.7 and bouncer-io 0.9 are built on net-io 0.6, and the
+# net-io stays on 0.6: serve-net 0.7, bouncer-io 0.10 and web-net 0.10 are built on net-io 0.6, and the
 # gate and control-line types cross between them, so one net-io version must be in the tree.
 [workspace.dependencies]
 serve-net = { version = "0.7.1", default-features = false, features = ["http1"] }
