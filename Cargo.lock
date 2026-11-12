@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "access-gate"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cff951e0f57ae1e258d05e9d8c5d72af95ab44f786df71ad29d6fe53736fa6e"
+checksum = "a83f8a503e2ac21d6312ec83b9b70a264ade487b1fcd2c7ecee1c5057f5becba"
 
 [[package]]
 name = "aead"
@@ -93,12 +93,13 @@ checksum = "444cfe20bfa9d52922da03be41d430bc09afe8ae58c8de61f5cd79ddbb0396b6"
 
 [[package]]
 name = "auth-gate"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7fe9c7aa5bcb1c52ebbca60838253f369af8338658e62ec825d6f2447d92915"
+checksum = "9738070ff2ce5f88d1ebd8dfa4971fd3054ba058ccf0c672a52e775cafc5bc7e"
 dependencies = [
  "crypt-io",
  "id-forge",
+ "loom",
  "mod-rand",
 ]
 
@@ -475,9 +476,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "gatekeeper-io"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40052f523077ef20fee3e6171a16458e106da42b06b28439d1fb8ce500821b70"
+checksum = "1f134fa04e2afad5131a874fd885fbdf8f0508dd5ca04447caefedafb4f66082"
 dependencies = [
  "access-gate",
  "audit-trail",
