@@ -292,9 +292,12 @@ impl fmt::Debug for Head {
             .iter()
             .map(|(n, _)| String::from_utf8_lossy(n.of(&self.bytes)))
             .collect();
+        // The query may carry secrets too (reset tokens, signed links,
+        // codes): only its length is shown.
         f.debug_struct("Head")
             .field("method", &self.method())
-            .field("target", &self.target())
+            .field("path", &self.path())
+            .field("query_len", &self.query().map_or(0, str::len))
             .field("fields", &names)
             .finish()
     }

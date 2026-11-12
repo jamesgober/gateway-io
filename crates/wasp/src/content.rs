@@ -108,7 +108,8 @@ pub struct Stored {
     pub title: String,
     /// The summary.
     pub summary: String,
-    /// The body, safe HTML prepared at save time.
+    /// The body as the author wrote it (plain text); it is escaped and split
+    /// into paragraphs again at every load.
     pub body: String,
     /// The date, for posts.
     pub date: String,
@@ -357,6 +358,29 @@ impl Manifest {
     /// Validates and prepares a draft, then stores it (replacing an entry with
     /// the same slug) and rebuilds the post listing, newest first.
     pub fn save(&mut self, draft: &Draft<'_>) -> Result<(), Invalid> {
+        self.validate(draft)?;
+        let entry = Arc::new(self.prepare(draft));
+        if let Some(store) = &self.store {
+            // The author's text is what is stored; the HTML is made again
+            // from it at every load, never trusted from the store.
+            store
+                .put(&Stored {
+                    kind: entry.kind.clone(),
+                    slug: entry.slug.clone(),
+                    title: entry.title.clone(),
+                    summary: entry.summary.clone(),
+                    body: draft.body.to_owned(),
+                    date: entry.date.clone(),
+                })
+                .map_err(|e| Invalid(e.0))?;
+        }
+        self.entries.insert(entry.slug.clone(), entry);
+        self.rebuild_posts();
+        Ok(())
+    }
+
+    /// The rules a draft must meet, at save and at load.
+    fn validate(&self, draft: &Draft<'_>) -> Result<(), Invalid> {
         let slug_ok = !draft.slug.is_empty()
             && draft
                 .slug
@@ -377,10 +401,20 @@ impl Manifest {
                 draft.slug
             )));
         }
+        Ok(())
+    }
+
+    /// A draft that passed validation, prepared: the body escaped and split
+    /// into paragraphs, the URL made for this site's base.
+    fn prepare(&self, draft: &Draft<'_>) -> Entry {
         let mut body = String::with_capacity(draft.body.len() + 32);
         for para in draft
             .body
-            .split("\n\n")
+            .split(
+                "
+
+",
+            )
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
@@ -392,7 +426,7 @@ impl Manifest {
             Kind::Page => format!("{}/{}", self.base, draft.slug),
             Kind::Post => format!("{}/posts/{}", self.base, draft.slug),
         };
-        let entry = Arc::new(Entry {
+        Entry {
             kind: draft.kind.as_str().to_owned(),
             slug: draft.slug.to_owned(),
             title: draft.title.to_owned(),
@@ -400,25 +434,11 @@ impl Manifest {
             summary: draft.summary.to_owned(),
             body,
             date: draft.date.to_owned(),
-        });
-        if let Some(store) = &self.store {
-            store
-                .put(&Stored {
-                    kind: entry.kind.clone(),
-                    slug: entry.slug.clone(),
-                    title: entry.title.clone(),
-                    summary: entry.summary.clone(),
-                    body: entry.body.clone(),
-                    date: entry.date.clone(),
-                })
-                .map_err(|e| Invalid(e.0))?;
         }
-        self.insert(entry);
-        Ok(())
     }
 
-    fn insert(&mut self, entry: Arc<Entry>) {
-        self.entries.insert(entry.slug.clone(), entry);
+    /// Rebuilds the post listing, newest first.
+    fn rebuild_posts(&mut self) {
         let mut posts: Vec<Arc<Entry>> = self
             .entries
             .values()
@@ -440,20 +460,30 @@ impl Manifest {
         let mut m = Manifest::with_base(base);
         let stored = store.load()?;
         for s in &stored {
-            let url = match s.kind.as_str() {
-                "post" => format!("{}/posts/{}", m.base, s.slug),
-                _ => format!("{}/{}", m.base, s.slug),
+            // The same rules and preparation as a save: what any writer put
+            // in the store is checked and escaped like an author's draft,
+            // never trusted as HTML.
+            let kind = match s.kind.as_str() {
+                "post" => Kind::Post,
+                "page" => Kind::Page,
+                other => {
+                    return Err(StoreError(format!("`{}`: unknown kind `{other}`", s.slug)));
+                }
             };
-            m.insert(Arc::new(Entry {
-                kind: s.kind.clone(),
-                slug: s.slug.clone(),
-                title: s.title.clone(),
-                summary: s.summary.clone(),
-                body: s.body.clone(),
-                date: s.date.clone(),
-                url,
-            }));
+            let draft = Draft {
+                kind,
+                slug: &s.slug,
+                title: &s.title,
+                summary: &s.summary,
+                body: &s.body,
+                date: &s.date,
+            };
+            m.validate(&draft).map_err(|e| StoreError(e.0))?;
+            let entry = Arc::new(m.prepare(&draft));
+            m.entries.insert(entry.slug.clone(), entry);
         }
+        // One listing for everything loaded, not one per entry.
+        m.rebuild_posts();
         m.store = Some(store);
         if stored.is_empty() && seed {
             for d in &sample_drafts() {
@@ -640,6 +670,47 @@ mod tests {
                 ..bad
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn what_the_store_holds_is_escaped_and_checked_at_load() {
+        // Review F-7: anything that writes the store (an import, a restore,
+        // another process) is treated like an author's draft.
+        let store = Arc::new(MemoryStore::new());
+        let put = |kind: &str, slug: &str, body: &str| {
+            store
+                .put(&Stored {
+                    kind: kind.into(),
+                    slug: slug.into(),
+                    title: "Imported".into(),
+                    summary: String::new(),
+                    body: body.into(),
+                    date: "2026-11-11".into(),
+                })
+                .expect("put");
+        };
+        put(
+            "post",
+            "x",
+            "hi<script>alert(1)</script><meta http-equiv=refresh content=\"0;url=https://evil.example/\">",
+        );
+        let m = Manifest::open(store.clone(), "", false).expect("open");
+        let body = &m.get(Kind::Post, "x").expect("entry").body;
+        assert!(!body.contains("<script"), "{body}");
+        assert!(!body.contains("<meta"), "{body}");
+        assert!(body.starts_with("<p>hi&lt;script&gt;"), "{body}");
+
+        put("post", "Bad Slug", "x");
+        assert!(
+            Manifest::open(store.clone(), "", false).is_err(),
+            "slug rule at load"
+        );
+        let _ = store.remove("Bad Slug");
+        put("script", "y", "x");
+        assert!(
+            Manifest::open(store.clone(), "", false).is_err(),
+            "unknown kind at load"
         );
     }
 }

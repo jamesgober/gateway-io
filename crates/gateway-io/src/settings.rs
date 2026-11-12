@@ -5,6 +5,10 @@ use std::time::Duration;
 
 use wasp_core::suite::config::Config;
 
+/// The largest `gateway.max_body` accepted: every admitted request may buffer
+/// that much.
+pub const MAX_BODY_CEILING: u64 = 64 << 20;
+
 /// net-io's driver.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Driver {
@@ -121,7 +125,15 @@ impl Settings {
             head_timeout: config
                 .get_or("gateway.head_timeout", d.head_timeout)
                 .map_err(err)?,
-            max_body: config.get_or("gateway.max_body", d.max_body).map_err(err)?,
+            max_body: {
+                let max: u64 = config.get_or("gateway.max_body", d.max_body).map_err(err)?;
+                if max > MAX_BODY_CEILING {
+                    return Err(SettingsError(format!(
+                        "gateway.max_body is at most {MAX_BODY_CEILING} bytes (64 MiB)"
+                    )));
+                }
+                max
+            },
             keep_alive_requests: u32::try_from(keep_alive)
                 .ok()
                 .filter(|n| *n >= 1)

@@ -97,7 +97,7 @@ fn stored_content_is_served_after_a_restart() {
                 slug: "kept".into(),
                 title: "Kept across a restart".into(),
                 summary: "Stored in bison-db.".into(),
-                body: "<p>Still here.</p>".into(),
+                body: "Still here.".into(),
                 date: "2026-11-11".into(),
             })
             .expect("put");

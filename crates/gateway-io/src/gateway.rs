@@ -425,21 +425,36 @@ impl Subsystem for Gateway {
         if next.keep_alive_requests != current.keep_alive_requests {
             later.push("gateway.keep_alive_requests");
         }
+        if next.driver != current.driver {
+            later.push("gateway.driver");
+        }
+        if next.stage_timing != current.stage_timing {
+            later.push("gateway.stage_timing");
+        }
         let bouncer = open.bouncer().clone();
         let applied = self.applied.clone();
         let foundation = link.foundation().clone();
         Ok(Commit::new(move || {
             let mut failed = 0_u64;
-            if bouncer.replace_allow(allow).is_err() {
+            let exempt_applied = bouncer.replace_allow(allow).is_ok();
+            if !exempt_applied {
                 failed += 1;
             }
+            // Only what took effect is recorded, so a ban that failed (a full
+            // table) is tried again by the next reload.
+            let mut banned_now: Vec<_> = Vec::new();
             for addr in &ban {
-                if bouncer::ban(&bouncer, *addr).is_err() {
+                if bouncer::ban(&bouncer, *addr).is_ok() {
+                    banned_now.push(*addr);
+                } else {
                     failed += 1;
                 }
             }
+            let mut lifted_now: Vec<_> = Vec::new();
             for addr in &lift {
-                if bouncer::lift(&bouncer, *addr).is_err() {
+                if bouncer::lift(&bouncer, *addr).is_ok() {
+                    lifted_now.push(*addr);
+                } else {
                     failed += 1;
                 }
             }
@@ -454,6 +469,13 @@ impl Subsystem for Gateway {
             if let Ok(mut s) = applied.lock() {
                 // What a restart would need stays as it is running.
                 let running = s.clone();
+                let mut applied_ban: Vec<_> = running
+                    .ban
+                    .iter()
+                    .filter(|a| !lifted_now.contains(a))
+                    .copied()
+                    .collect();
+                applied_ban.extend(banned_now);
                 *s = Settings {
                     listen: running.listen,
                     workers: running.workers,
@@ -461,6 +483,14 @@ impl Subsystem for Gateway {
                     head_timeout: running.head_timeout,
                     max_body: running.max_body,
                     keep_alive_requests: running.keep_alive_requests,
+                    driver: running.driver,
+                    stage_timing: running.stage_timing,
+                    ban: applied_ban,
+                    exempt: if exempt_applied {
+                        next.exempt
+                    } else {
+                        running.exempt
+                    },
                     ..next
                 };
             }

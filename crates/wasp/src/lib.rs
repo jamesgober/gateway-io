@@ -102,6 +102,22 @@ fn wire_with(
     let slow: bool = config
         .get_or("hello.slow_route", false)
         .map_err(|e| e.to_string())?;
+    if slow {
+        // The slow route holds a worker for up to 30 s per request: a drain
+        // test switch, never on an address others can reach.
+        let listen: String = config
+            .get_or("gateway.listen", "127.0.0.1:8080".to_owned())
+            .map_err(|e| e.to_string())?;
+        let loopback = listen
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or_else(|_| listen.starts_with("localhost:"));
+        if !loopback {
+            return Err(format!(
+                "hello.slow_route is for drain tests on a loopback address, not `{listen}`"
+            ));
+        }
+    }
     let service: String = config
         .get_or("site.service", "web".to_owned())
         .map_err(|e| e.to_string())?;

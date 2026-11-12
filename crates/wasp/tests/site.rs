@@ -407,3 +407,26 @@ fn static_files_from_a_folder() {
     let _ = door.close(Duration::from_secs(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn wrong_configuration_refuses_to_boot() {
+    // Review F-16 and N-3: values that would boot into a dead or exposed site.
+    let refused = |conf: &str| {
+        let config = Config::from_text(&with_theme(conf)).expect("config");
+        wasp::wire(&config).expect_err(conf)
+    };
+    assert!(refused("[site]\nbase = \"blog\"\n").contains("site.base"));
+    assert!(refused("[site]\nbase = \"/blog/\"\n").contains("site.base"));
+    assert!(refused("[site]\nbase = \"/a/../b\"\n").contains("site.base"));
+    assert!(
+        refused("[hello]\nslow_route = true\n[gateway]\nlisten = \"0.0.0.0:8080\"\n")
+            .contains("slow_route")
+    );
+    let config = Config::from_text("[gateway]\nmax_body = 10737418240\n").expect("config");
+    assert!(
+        Settings::from_config(&config).is_err(),
+        "no ceiling on the body"
+    );
+    let config = Config::from_text(&with_theme("[site]\nbase = \"/blog\"\n")).expect("config");
+    assert!(wasp::wire(&config).is_ok());
+}

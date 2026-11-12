@@ -245,6 +245,10 @@ impl Pipeline {
                     // service sets (a new session) comes later and wins.
                     if let Some(cookie) = h.auth_cookie() {
                         reply.header("set-cookie", cookie);
+                        // web-net decides caching without seeing this cookie:
+                        // forbid every cache. Field lines combine, so a
+                        // `public` web-net adds stays overruled by `no-store`.
+                        reply.header("cache-control", "private, no-store");
                     }
                     let caller = Caller::new(h.identity(), h.token_any());
                     let outcome = web.respond(req, env, &caller, reply);
@@ -352,6 +356,10 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
     }
     if let Some(cookie) = exit.auth_cookie() {
         out.header("set-cookie", cookie);
+    }
+    if reply.status_code() >= 400 {
+        out.header("x-content-type-options", "nosniff");
+        out.header("cache-control", "no-store");
     }
     out.body(reply.body_bytes());
     if let Some(after) = reply.retry_after() {

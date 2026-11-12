@@ -23,14 +23,34 @@ pub enum Work {
 
 /// What a service gets at boot: its tag and its handles. Held for the
 /// service's whole life, so nothing is looked up per request.
+///
+/// Only the core builds one, so the access gate a service holds is always
+/// the core's.
 #[derive(Clone)]
 pub struct ServiceCtx {
+    pub(crate) tag: ServiceTag,
+    pub(crate) access: Access,
+    pub(crate) jobs: Arc<dyn Jobs>,
+}
+
+impl ServiceCtx {
     /// The service's tag.
-    pub tag: ServiceTag,
+    #[must_use]
+    pub fn tag(&self) -> ServiceTag {
+        self.tag
+    }
+
     /// The access gate: the only way to a cleared passport.
-    pub access: Access,
+    #[must_use]
+    pub fn access(&self) -> &Access {
+        &self.access
+    }
+
     /// The job runner: slow side work off the request path.
-    pub jobs: Arc<dyn Jobs>,
+    #[must_use]
+    pub fn jobs(&self) -> &Arc<dyn Jobs> {
+        &self.jobs
+    }
 }
 
 impl std::fmt::Debug for ServiceCtx {

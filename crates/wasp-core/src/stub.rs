@@ -50,7 +50,7 @@ impl Service for Hello {
             "POST" => true,
             _ => return p.refuse(405),
         };
-        let mut p = match self.ctx.access.authorize(p, &HELLO_RULE) {
+        let mut p = match self.ctx.access().authorize(p, &HELLO_RULE) {
             Ok(cleared) => cleared,
             Err(refused) => return refused,
         };

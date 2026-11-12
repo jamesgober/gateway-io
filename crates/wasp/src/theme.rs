@@ -355,6 +355,10 @@ pub struct ThemeWatcher {
     theme: SiteTheme,
     dir: PathBuf,
     poll: Duration,
+    /// The folder's fingerprint when the theme was loaded: the watcher's
+    /// starting point, taken here and not on its thread, so an edit made
+    /// before the thread first runs is still a change.
+    seen: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     link: Option<Link>,
@@ -364,10 +368,12 @@ impl ThemeWatcher {
     /// A watcher for `theme`, loaded from `dir`.
     #[must_use]
     pub fn new(theme: SiteTheme, dir: PathBuf, poll: Duration) -> ThemeWatcher {
+        let seen = fingerprint(&dir);
         ThemeWatcher {
             theme,
             dir,
             poll,
+            seen,
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             link: None,
@@ -409,17 +415,17 @@ impl Subsystem for ThemeWatcher {
         if self.poll.is_zero() {
             return Ok(());
         }
-        let (theme, dir, poll, stop, link) = (
+        let (theme, dir, poll, stop, link, mut seen) = (
             self.theme.clone(),
             self.dir.clone(),
             self.poll,
             self.stop.clone(),
             link.clone(),
+            self.seen,
         );
         let thread = std::thread::Builder::new()
             .name("theme-watch".into())
             .spawn(move || {
-                let mut seen = fingerprint(&dir);
                 loop {
                     std::thread::park_timeout(poll);
                     if stop.load(Ordering::Acquire) {

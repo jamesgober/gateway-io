@@ -117,7 +117,26 @@ impl SiteSettings {
         let e = |e: wasp_core::suite::Error| e.to_string();
         Ok(SiteSettings {
             name: config.get_or("site.name", d.name).map_err(e)?,
-            base: config.get_or("site.base", d.base).map_err(e)?,
+            base: {
+                let base: String = config.get_or("site.base", d.base).map_err(e)?;
+                let ok = base.is_empty()
+                    || (base.starts_with('/')
+                        && !base.ends_with('/')
+                        && base[1..].split('/').all(|seg| {
+                            !seg.is_empty()
+                                && seg != "."
+                                && seg != ".."
+                                && seg
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+                        }));
+                if !ok {
+                    return Err(format!(
+                        "site.base must be empty or like `/blog` (a leading `/`, no trailing `/`), not `{base}`"
+                    ));
+                }
+                base
+            },
             hosts: config.get_or("site.hosts", d.hosts).map_err(e)?,
             assets: config.get("site.assets").map_err(e)?,
             theme: config.get_or("site.theme", d.theme).map_err(e)?,

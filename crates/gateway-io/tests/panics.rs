@@ -26,7 +26,7 @@ impl Service for Boom {
         if p.head().path() == "/boom" {
             panic!("a bug in a service");
         }
-        let mut p = match self.0.access.authorize(p, &Rule::public(1)) {
+        let mut p = match self.0.access().authorize(p, &Rule::public(1)) {
             Ok(p) => p,
             Err(e) => return e,
         };

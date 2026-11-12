@@ -22,7 +22,7 @@ The platform's front door and the minimum of the core it hands requests to, as a
  customs export ─▶ last checkpoint ─▶ encode ─▶ passport wiped and returned ─▶ net-io write (bouncer egress)
 ```
 
-Skipping a gate does not compile: only the core can produce `Identified`, only `Access::authorize` can produce `Cleared`, and only `Cleared` can write a reply (see the `compile_fail` tests in `crates/wasp-core/src/passport.rs`).
+For passport services, skipping a gate does not compile: only the core can produce `Identified`, only the core's `Access` (a service cannot make its own) can produce `Cleared`, and only `Cleared` can write a reply (see the `compile_fail` tests in `crates/wasp-core/src/passport.rs`). Web services answer on serve-net's own types after the core identified the request: there the per-route guarantee is web-net's (a handler's context exists only after its gate authorized the route), not the passport's.
 
 ## Run
 
@@ -64,18 +64,18 @@ themes/default/static/   site.css                 (served under /theme/)
 | Key | Default | Meaning |
 |---|---|---|
 | `gateway.listen` | `127.0.0.1:8080` | the listening address |
-| `gateway.workers` | logical CPUs, at most 64 | reactor workers |
+| `gateway.workers` | logical CPUs, at most 64 | reactor workers (1 to 256); with `blocking`, the connections served at once |
 | `gateway.passports` | 256 | passports per worker (requests in flight) |
 | `gateway.drain` | `10s` | the longest a drain may take |
 | `gateway.head_timeout` | `10s` | the head deadline |
-| `gateway.max_body` | 1 MiB | the largest buffered body |
+| `gateway.max_body` | 1 MiB | the largest buffered body (at most 64 MiB) |
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
-| `gateway.driver` | `reactor` | net-io's driver; `blocking` (one thread per connection, `workers` threads) halves server time on a Windows development machine |
+| `gateway.driver` | `reactor` | net-io's driver; `blocking` (one thread per connection: `workers` connections, plus a few threads that answer the ones over the cap) halves server time on a Windows development machine |
 | `gateway.stage_timing` | false | record where each request's server time goes; logged per stage when the gateway stops |
 | `door.ban` | none | addresses refused at the door; changes apply on reload |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
-| `site.base` | none | the folder the site lives under (`/blog`) |
+| `site.base` | none | the folder the site lives under (`/blog`: a leading `/`, no trailing `/`) |
 | `site.hosts` | none | the site's hosts, canonical first; none answers localhost (development) |
 | `site.assets` | none | a folder served under `/static` |
 | `site.name` | `WASP` | the site's name, in every page title |
@@ -88,7 +88,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
-| `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`) |
+| `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`; refused unless `gateway.listen` is a loopback address) |
 
 A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt` and `gateway.drain` at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
 

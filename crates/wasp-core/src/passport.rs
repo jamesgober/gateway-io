@@ -37,6 +37,25 @@
 //! }
 //! ```
 //!
+//! ```compile_fail,E0624
+//! // A service cannot clear a passport through an authorizer of its own:
+//! // only the core makes an `Access`.
+//! struct Yes;
+//! impl wasp_core::Authorizer for Yes {
+//!     fn authorize(&self, _: &wasp_core::Identity, _: &wasp_core::Rule) -> wasp_core::Decision {
+//!         wasp_core::Decision::Allow
+//!     }
+//! }
+//! let _ = wasp_core::Access::from_arc(std::sync::Arc::new(Yes));
+//! ```
+//!
+//! ```compile_fail,E0451
+//! // Nor build the context that carries the core's.
+//! fn build(access: wasp_core::Access) -> wasp_core::ServiceCtx {
+//!     wasp_core::ServiceCtx { tag: wasp_core::ServiceTag(0), access, jobs: todo!() }
+//! }
+//! ```
+//!
 //! ```compile_fail,E0451
 //! // A passport is never built by hand.
 //! fn build() -> wasp_core::Passport<wasp_core::Cleared> {
@@ -373,7 +392,14 @@ impl Exit {
     /// Replaces the reply with a refusal (a revocation at the last checkpoint,
     /// or customs export refusing it).
     pub fn refuse_with(mut self, refusal: Refusal) -> Exit {
-        self.slot.reply.refuse(refusal);
+        // A refusal is an error: a success status here (a customs rule's
+        // mistake) becomes a 500, never a 200 carrying an error text.
+        let status = if (400..=599).contains(&refusal.status) {
+            refusal.status
+        } else {
+            500
+        };
+        self.slot.reply.refuse(Refusal { status, ..refusal });
         self
     }
 

@@ -290,4 +290,39 @@ mod tests {
             .expect("thread");
         assert_eq!(pool.stats().in_use, 0);
     }
+
+    #[test]
+    fn an_exit_refusal_is_always_an_error_status() {
+        // Review F-12: a customs export that returns a success status.
+        let pool = pool();
+        let p = pool.admit_and_take(0).expect("a passport");
+        let exit = p.refuse(404).refuse_with(crate::slot::Refusal::status(200));
+        assert_eq!(exit.reply().status_code(), 500);
+        pool.give_back_and_release(exit);
+    }
+
+    #[test]
+    fn a_lost_passport_is_replaced_and_counted() {
+        let pool = pool();
+        let p = pool.admit_and_take(0).expect("a passport");
+        drop(p); // what a panic does
+        pool.release(0);
+        pool.replace_lost(0);
+        assert_eq!(pool.stats().lost, 1);
+        let a = pool.admit_and_take(0).expect("first");
+        let b = pool.admit_and_take(0).expect("second: capacity kept");
+        pool.give_back_and_release(a.refuse(500));
+        pool.give_back_and_release(b.refuse(500));
+    }
+
+    #[test]
+    fn debug_never_prints_the_query() {
+        let pool = pool();
+        let mut p = pool.admit_and_take(0).expect("a passport");
+        p.head_mut().set_line("GET", "/reset?token=s3cret", 1);
+        let shown = format!("{:?}", p.head());
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("/reset"), "{shown}");
+        pool.give_back_and_release(p.refuse(400));
+    }
 }

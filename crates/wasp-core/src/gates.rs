@@ -228,17 +228,10 @@ pub struct Access {
 }
 
 impl Access {
-    /// Wraps an authorizer.
+    /// Wraps the core's authorizer. Only the core makes an `Access`, so a
+    /// service cannot clear a passport through an authorizer of its own.
     #[must_use]
-    pub fn new(authorizer: impl Authorizer) -> Access {
-        Access {
-            authorizer: Arc::new(authorizer),
-        }
-    }
-
-    /// Wraps a shared authorizer.
-    #[must_use]
-    pub fn from_arc(authorizer: Arc<dyn Authorizer>) -> Access {
+    pub(crate) fn from_arc(authorizer: Arc<dyn Authorizer>) -> Access {
         Access { authorizer }
     }
 

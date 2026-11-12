@@ -159,7 +159,15 @@ fn hello_end_to_end_and_every_passport_returns() {
 fn customs_refuses_before_any_gate() {
     let (open, addr, _line) = open(&settings(1, 4));
     let long_target = format!("/{}", "a".repeat(5000));
-    assert_eq!(get(addr, &long_target).map(|g| g.status), Some(414));
+    let got = get(addr, &long_target).expect("reply");
+    assert_eq!(got.status, 414);
+    // Review N-4: the gateway's own refusals are never sniffed or cached.
+    assert!(
+        has_field(&got, "x-content-type-options", "nosniff"),
+        "{}",
+        got.head
+    );
+    assert!(has_field(&got, "cache-control", "no-store"), "{}", got.head);
     let many: String = (0..70).map(|i| format!("X-{i}: v\r\n")).collect();
     let got = exchange(
         addr,
