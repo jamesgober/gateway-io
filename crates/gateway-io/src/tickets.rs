@@ -7,18 +7,32 @@
 //! reply, which replaces a reply whole) judges exactly this request with one
 //! lock-free `egress` call. The ticket itself lives here, per worker, because
 //! dropping it releases it.
+//!
+//! A web reply sent in parts (a large file) parks its hand-off here between
+//! parts: the request keeps its passport and identity until the last part,
+//! and the later parts go straight to the web service, never through the
+//! passport pipeline again.
 
 use std::sync::Mutex;
 
 use bouncer_io::{Ticket, TicketTag};
+use wasp_core::Handoff;
 
 use crate::stages::Stamps;
+
+/// One live request.
+struct Entry {
+    ticket: Ticket,
+    stamps: Option<Stamps>,
+    /// A streamed web reply between parts.
+    parked: Option<Handoff>,
+}
 
 /// One worker's live request tickets. Touched by the owning worker only on the
 /// inline path, so the lock is uncontended.
 #[repr(align(64))]
 struct Shelf {
-    live: Mutex<Vec<(Ticket, Option<Stamps>)>>,
+    live: Mutex<Vec<Entry>>,
 }
 
 /// Request tickets, per worker.
@@ -61,18 +75,50 @@ impl RequestTickets {
             hook: Some(h),
             ..Stamps::start()
         });
-        shelf.live.lock().ok()?.push((ticket, stamps));
+        shelf.live.lock().ok()?.push(Entry {
+            ticket,
+            stamps,
+            parked: None,
+        });
         Some(tag)
+    }
+
+    /// Parks a streamed web reply's hand-off with its request until the next
+    /// part. Gives it back when the request is unknown.
+    pub(crate) fn park(&self, worker: u16, tag: TicketTag, h: Handoff) -> Result<(), Handoff> {
+        let Some(shelf) = self.shelves.get(usize::from(worker)) else {
+            return Err(h);
+        };
+        let Ok(mut live) = shelf.live.lock() else {
+            return Err(h);
+        };
+        match live.iter_mut().find(|e| e.ticket.tag() == tag) {
+            Some(entry) => {
+                entry.parked = Some(h);
+                Ok(())
+            }
+            None => Err(h),
+        }
+    }
+
+    /// The hand-off parked for the request with `tag`: `Some` means this
+    /// call is a later part of a streamed reply.
+    pub(crate) fn unpark(&self, worker: u16, tag: TicketTag) -> Option<Handoff> {
+        let shelf = self.shelves.get(usize::from(worker))?;
+        let mut live = shelf.live.lock().ok()?;
+        live.iter_mut()
+            .find(|e| e.ticket.tag() == tag)
+            .and_then(|e| e.parked.take())
     }
 
     /// Keeps the stage marks of the request with `tag` (stage timing only).
     pub(crate) fn set_stamps(&self, worker: u16, tag: TicketTag, stamps: Stamps) {
         if let Some(shelf) = self.shelves.get(usize::from(worker))
             && let Ok(mut live) = shelf.live.lock()
-            && let Some(entry) = live.iter_mut().find(|(t, _)| t.tag() == tag)
+            && let Some(entry) = live.iter_mut().find(|e| e.ticket.tag() == tag)
         {
-            let hook = entry.1.and_then(|s| s.hook);
-            entry.1 = Some(Stamps { hook, ..stamps });
+            let hook = entry.stamps.and_then(|s| s.hook);
+            entry.stamps = Some(Stamps { hook, ..stamps });
         }
     }
 
@@ -80,16 +126,36 @@ impl RequestTickets {
     /// back the request's stage marks if it had any.
     #[inline]
     pub fn release(&self, worker: u16, tag: TicketTag) -> Option<Stamps> {
-        let shelf = self.shelves.get(usize::from(worker))?;
+        self.release_all(worker, tag).0
+    }
+
+    /// [`release`](Self::release), and the hand-off still parked (a streamed
+    /// reply the client left before its last part), for the pool.
+    pub(crate) fn release_all(
+        &self,
+        worker: u16,
+        tag: TicketTag,
+    ) -> (Option<Stamps>, Option<Handoff>) {
+        let Some(shelf) = self.shelves.get(usize::from(worker)) else {
+            return (None, None);
+        };
         // Taken out under the lock, dropped after it.
         let gone = shelf.live.lock().ok().and_then(|mut live| {
             live.iter()
-                .position(|(t, _)| t.tag() == tag)
+                .position(|e| e.ticket.tag() == tag)
                 .map(|i| live.swap_remove(i))
         });
-        let stamps = gone.as_ref().and_then(|(_, s)| *s);
-        drop(gone);
-        stamps
+        match gone {
+            Some(Entry {
+                ticket,
+                stamps,
+                parked,
+            }) => {
+                drop(ticket);
+                (stamps, parked)
+            }
+            None => (None, None),
+        }
     }
 
     /// Tickets held right now, for health and tests.

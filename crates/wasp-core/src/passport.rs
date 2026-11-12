@@ -187,6 +187,12 @@ impl Passport<Arrived> {
         &mut self.slot.head
     }
 
+    /// Appends `bytes` to the body, wiping the old buffer when it grows.
+    #[inline]
+    pub fn push_body(&mut self, bytes: &[u8]) {
+        crate::slot::extend_wiped(&mut self.slot.body, bytes);
+    }
+
     /// The body buffer, to copy a buffered body into.
     #[inline]
     pub fn body_mut(&mut self) -> &mut Vec<u8> {

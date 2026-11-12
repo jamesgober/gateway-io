@@ -176,27 +176,129 @@ impl std::fmt::Display for ThemeError {
 
 impl std::error::Error for ThemeError {}
 
+/// The most a theme's templates may hold, all files together.
+pub const MAX_THEME_BYTES: u64 = 16 << 20;
+
+/// The most template files a theme may have.
+pub const MAX_THEME_FILES: usize = 2_000;
+
+/// The stack a theme compiles on: far more than a compiler needs, so a deep
+/// template is refused by the compiler's own limits, never by the stack.
+const COMPILE_STACK: usize = 64 << 20;
+
+/// The compiled engines of a theme.
+type Compiled = (luminess::Templates<Page>, luminess::Templates<ErrorView>);
+
+/// Every `.html` file under `root`, named by its path below `root` with `/`
+/// between folders and without the extension (as Luminess names them), in
+/// a fixed order. A symbolic link anywhere is refused, so a template can
+/// never read a file outside the theme; so is a theme over
+/// [`MAX_THEME_BYTES`] or [`MAX_THEME_FILES`].
+fn sources(
+    root: &Path,
+    budget: &mut u64,
+    files: &mut usize,
+) -> Result<Vec<(String, String)>, ThemeError> {
+    let fail =
+        |p: &Path, e: &dyn std::fmt::Display| ThemeError(format!("theme {}: {e}", p.display()));
+    let mut pending = vec![root.to_path_buf()];
+    let mut found = Vec::new();
+    while let Some(d) = pending.pop() {
+        let entries = std::fs::read_dir(&d).map_err(|e| fail(&d, &e))?;
+        for e in entries {
+            let e = e.map_err(|e| fail(&d, &e))?;
+            let path = e.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| fail(&path, &e))?;
+            if meta.file_type().is_symlink() {
+                return Err(fail(&path, &"symbolic links are refused in a theme"));
+            }
+            if meta.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let parts: Option<Vec<&str>> =
+                rel.components().map(|c| c.as_os_str().to_str()).collect();
+            let Some(parts) = parts else { continue };
+            let Some(name) = parts.join("/").strip_suffix(".html").map(str::to_owned) else {
+                continue;
+            };
+            *files += 1;
+            *budget = budget.saturating_sub(meta.len());
+            if *files > MAX_THEME_FILES || *budget == 0 {
+                return Err(fail(
+                    root,
+                    &format!(
+                        "over the theme limits ({MAX_THEME_FILES} templates, {MAX_THEME_BYTES} bytes)"
+                    ),
+                ));
+            }
+            found.push((name, path));
+        }
+    }
+    found.sort();
+    found
+        .into_iter()
+        .map(|(name, path)| {
+            std::fs::read_to_string(&path)
+                .map(|src| (name, src))
+                .map_err(|e| fail(&path, &e))
+        })
+        .collect()
+}
+
 /// Compiles both engines of the theme in `dir`, checking the required
 /// templates, without touching anything running.
-fn compile(
-    dir: &Path,
-) -> Result<(luminess::Templates<Page>, luminess::Templates<ErrorView>), ThemeError> {
-    let read = |e: std::io::Error| ThemeError(format!("theme {}: {e}", dir.display()));
-    let pages = Engine::<Page>::builder()
-        .directory(dir.join("pages"), "html")
-        .map_err(read)?
+///
+/// The compile runs on its own thread with a large stack and inside
+/// `catch_unwind`: whatever a template does to the compiler, the answer is
+/// an `Err` (the theme is refused, the running one stays), never the end of
+/// the process.
+fn compile(dir: &Path) -> Result<Compiled, ThemeError> {
+    let mut budget = MAX_THEME_BYTES;
+    let mut files = 0;
+    let pages = sources(&dir.join("pages"), &mut budget, &mut files)?;
+    let errors = sources(&dir.join("errors"), &mut budget, &mut files)?;
+    let shown = dir.display().to_string();
+    let worker = std::thread::Builder::new()
+        .name("theme-compile".into())
+        .stack_size(COMPILE_STACK)
+        .spawn(move || {
+            let failed = ThemeError(format!("theme {shown}: the compiler failed"));
+            std::panic::catch_unwind(move || compile_sources(&shown, pages, errors))
+                .unwrap_or(Err(failed))
+        })
+        .map_err(|e| ThemeError(format!("theme {}: {e}", dir.display())))?;
+    worker.join().unwrap_or_else(|_| {
+        Err(ThemeError(format!(
+            "theme {}: the compiler failed",
+            dir.display()
+        )))
+    })
+}
+
+fn compile_sources(
+    shown: &str,
+    pages: Vec<(String, String)>,
+    errors: Vec<(String, String)>,
+) -> Result<Compiled, ThemeError> {
+    let pages = pages
+        .into_iter()
+        .fold(Engine::<Page>::builder(), |b, (n, s)| b.template(n, s))
         .compile()
-        .map_err(|e| ThemeError(format!("theme {} pages: {e}", dir.display())))?;
-    let errors = Engine::<ErrorView>::builder()
-        .directory(dir.join("errors"), "html")
-        .map_err(read)?
+        .map_err(|e| ThemeError(format!("theme {shown} pages: {e}")))?;
+    let errors = errors
+        .into_iter()
+        .fold(Engine::<ErrorView>::builder(), |b, (n, s)| b.template(n, s))
         .compile()
-        .map_err(|e| ThemeError(format!("theme {} errors: {e}", dir.display())))?;
+        .map_err(|e| ThemeError(format!("theme {shown} errors: {e}")))?;
+    let dir = shown;
     for name in REQUIRED {
         if !pages.contains(name) {
             return Err(ThemeError(format!(
-                "theme {}: pages/{name}.html is missing",
-                dir.display()
+                "theme {dir}: pages/{name}.html is missing"
             )));
         }
     }
@@ -232,7 +334,8 @@ pub fn fingerprint(dir: &Path) -> u64 {
         };
         for e in entries.flatten() {
             let path = e.path();
-            match e.metadata() {
+            // Links are not followed (and a theme with one is refused).
+            match std::fs::symlink_metadata(&path) {
                 Ok(m) if m.is_dir() => pending.push(path),
                 Ok(m) => files.push((path, m.len(), m.modified().ok())),
                 Err(_) => {}
@@ -322,10 +425,20 @@ impl Subsystem for ThemeWatcher {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let now = fingerprint(&dir);
-                    if now != seen {
-                        seen = now;
-                        reload_and_log(&theme, &dir, &link, "theme folder changed");
+                    // A panic here would end live reload in silence: log it
+                    // and keep watching.
+                    let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let now = fingerprint(&dir);
+                        if now != seen {
+                            seen = now;
+                            reload_and_log(&theme, &dir, &link, "theme folder changed");
+                        }
+                    }));
+                    if turn.is_err() {
+                        log::error!(
+                            link.foundation().log(),
+                            "theme watcher recovered from a panic"
+                        );
                     }
                 }
             })?;

@@ -409,3 +409,45 @@ fn error_pages_of_a_site_in_a_folder_keep_its_base_path() {
     );
     let _ = door.close(Duration::from_secs(1));
 }
+
+#[test]
+fn a_template_that_breaks_the_compiler_is_refused_not_fatal() {
+    // Review F-2: a 60,000-term `or` chain overflowed Luminess 0.9.2's stack
+    // and ended the process from the watcher thread.
+    let copy = ThemeCopy::new("deep-chain");
+    let theme = theme::load(&copy.0).expect("the default theme loads");
+    let chain = vec!["page.message"; 60_000].join(" or ");
+    std::fs::write(
+        copy.0.join("pages/page.html"),
+        format!("{{% extends \"base\" %}}{{% block content %}}{{% if {chain} %}}x{{% endif %}}{{% endblock %}}"),
+    )
+    .expect("write");
+    let dir = copy.0.clone();
+    let t = std::thread::Builder::new()
+        .name("theme-watch".into())
+        .spawn(move || theme::reload(&theme, &dir).map(|()| theme))
+        .expect("spawn");
+    let refused = t.join().expect("the watcher thread survives");
+    assert!(refused.is_err(), "the deep theme is refused");
+}
+
+#[test]
+fn a_theme_over_its_limits_or_with_a_link_is_refused() {
+    let copy = ThemeCopy::new("too-big");
+    let theme = theme::load(&copy.0).expect("loads");
+    // Over the total size: refused before anything is compiled.
+    let big = "x".repeat(usize::try_from(theme::MAX_THEME_BYTES).expect("fits") + 1);
+    std::fs::write(copy.0.join("pages/huge.html"), big).expect("write");
+    let err = theme::reload(&theme, &copy.0).expect_err("refused");
+    assert!(err.0.contains("limits"), "{err}");
+    std::fs::remove_file(copy.0.join("pages/huge.html")).expect("remove");
+    theme::reload(&theme, &copy.0).expect("back within the limits");
+
+    // A symbolic link (when this machine lets a test make one).
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc/hostname", copy.0.join("pages/leak.html")).expect("link");
+        let err = theme::reload(&theme, &copy.0).expect_err("refused");
+        assert!(err.0.contains("symbolic links"), "{err}");
+    }
+}

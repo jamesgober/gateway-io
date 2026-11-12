@@ -35,6 +35,9 @@ pub struct PoolStats {
     pub in_use: u64,
     /// Requests refused because a worker had no free passport.
     pub refused: u64,
+    /// Passports that never came back (a panic unwound past them) and were
+    /// replaced with new ones. Each one is a bug to look at; capacity is kept.
+    pub lost: u64,
 }
 
 /// The passport pool. See the module docs.
@@ -42,7 +45,9 @@ pub struct PassportPool {
     shelves: Box<[Shelf]>,
     per_worker: u32,
     retain: usize,
+    sizes: SlotSizes,
     refused: AtomicU64,
+    lost: AtomicU64,
 }
 
 impl PassportPool {
@@ -66,7 +71,9 @@ impl PassportPool {
             shelves,
             per_worker,
             retain: sizes.retain,
+            sizes,
             refused: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
         }
     }
 
@@ -161,6 +168,19 @@ impl PassportPool {
         }
     }
 
+    /// A passport taken from `worker` never came back (a panic unwound past
+    /// it; its slot wiped itself when it was dropped): put a new slot on the
+    /// shelf so the worker keeps its capacity, and count the loss.
+    #[cold]
+    pub fn replace_lost(&self, worker: u16) {
+        if let Some(shelf) = self.shelves.get(usize::from(worker))
+            && let Ok(mut free) = shelf.free.lock()
+        {
+            free.push(Box::new(Slot::new(worker, &self.sizes)));
+            self.lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// [`give_back`](Self::give_back) followed by [`release`](Self::release).
     #[inline]
     pub fn give_back_and_release(&self, exit: Exit) {
@@ -182,6 +202,7 @@ impl PassportPool {
             capacity,
             in_use,
             refused: self.refused.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
         }
     }
 }

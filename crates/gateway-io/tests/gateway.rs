@@ -399,3 +399,36 @@ fn authentication_cookie_rides_on_answers_and_refusals() {
     );
     let _ = open.close(Duration::from_secs(1));
 }
+
+#[test]
+fn the_blocking_driver_serves_every_connection_it_admits() {
+    // Review F-4: serve-net's blocking driver runs more threads than
+    // `workers`; every one of them needs a shelf.
+    let s = Settings {
+        driver: gateway_io::Driver::Blocking,
+        ..settings(4, 1)
+    };
+    let (door, addr, _line) = open(&s);
+    let mut conns: Vec<TcpStream> = (0..4)
+        .map(|_| {
+            let c = TcpStream::connect(addr).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            c
+        })
+        .collect();
+    for round in 0..3 {
+        for (i, c) in conns.iter_mut().enumerate() {
+            c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("send");
+            let got = read_response(c).expect("reply");
+            assert_eq!(
+                got.status, 200,
+                "connection {i}, round {round}: {}",
+                got.head
+            );
+        }
+    }
+    drop(conns);
+    let _ = door.close(Duration::from_secs(2));
+}

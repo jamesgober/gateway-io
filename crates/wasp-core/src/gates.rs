@@ -50,6 +50,14 @@ pub struct AuthOut {
     token: Option<GateToken>,
 }
 
+/// An `AuthOut` dropped mid-request (a panic in the authenticator) wipes the
+/// cookie it was lent.
+impl Drop for AuthOut {
+    fn drop(&mut self) {
+        crate::slot::wipe(&mut self.cookie);
+    }
+}
+
 impl AuthOut {
     pub(crate) fn from_parts(mut cookie: Vec<u8>) -> AuthOut {
         cookie.clear();
@@ -59,14 +67,15 @@ impl AuthOut {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<GateToken>) {
-        (self.cookie, self.token)
+    pub(crate) fn into_parts(mut self) -> (Vec<u8>, Option<GateToken>) {
+        (std::mem::take(&mut self.cookie), self.token.take())
     }
 
     /// Sets the `Set-Cookie` value (the field value only, without the name).
     pub fn set_cookie(&mut self, value: &[u8]) {
+        crate::slot::wipe(&mut self.cookie);
         self.cookie.clear();
-        self.cookie.extend_from_slice(value);
+        crate::slot::extend_wiped(&mut self.cookie, value);
     }
 
     /// Whether a cookie was set.

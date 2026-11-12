@@ -26,6 +26,21 @@ pub(crate) fn wipe(bytes: &mut [u8]) {
     std::hint::black_box(&*bytes);
 }
 
+/// Appends `part` to `buf`. When it does not fit, the bytes move to a larger
+/// buffer and the old one is wiped before it is freed, so a growing buffer
+/// never leaves a readable copy behind.
+#[inline]
+pub(crate) fn extend_wiped(buf: &mut Vec<u8>, part: &[u8]) {
+    let need = buf.len() + part.len();
+    if need > buf.capacity() {
+        let mut bigger = Vec::with_capacity(need.max(buf.capacity() * 2));
+        bigger.extend_from_slice(buf);
+        wipe(buf);
+        *buf = bigger;
+    }
+    buf.extend_from_slice(part);
+}
+
 /// A request id: a ULID, time ordered and unique within the process.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct RequestId(pub Ulid);
@@ -145,7 +160,7 @@ impl Span {
 #[inline]
 fn push(buf: &mut Vec<u8>, part: &[u8]) -> Span {
     let start = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-    buf.extend_from_slice(part);
+    extend_wiped(buf, part);
     let end = u32::try_from(buf.len()).unwrap_or(u32::MAX);
     Span { start, end }
 }
@@ -575,7 +590,7 @@ impl Slot {
             identity: None,
             access: None,
             reply: Reply::with_capacity(8, sizes.reply),
-            auth_cookie: Vec::with_capacity(128),
+            auth_cookie: Vec::with_capacity(256),
             gate_token: None,
         }
     }
@@ -607,6 +622,15 @@ impl Slot {
         if self.head.bytes.capacity() > retain {
             self.head.bytes.shrink_to(retain);
         }
+    }
+}
+
+/// A slot dropped anywhere but the pool (a panic unwound past its passport,
+/// or the pool itself ends) is wiped first: nothing a request carried goes
+/// back to the allocator readable.
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.wipe(0);
     }
 }
 

@@ -93,14 +93,26 @@ impl Door {
                 )));
             }
         }
-        let tickets = Arc::new(RequestTickets::new(settings.workers));
         // A blocking worker is one connection's thread: one request at a time.
-        let per_worker = match settings.driver {
-            Driver::Reactor => settings.passports,
-            Driver::Blocking => 1,
+        // serve-net runs `workers` threads for connections plus a headroom of
+        // threads that answer the connections over the cap; every one of
+        // them needs a shelf, so both numbers are set here, not derived.
+        let mut limits = Limits::new()
+            .head_timeout(settings.head_timeout)
+            .max_body(settings.max_body);
+        let (threads, per_worker) = match settings.driver {
+            Driver::Reactor => (settings.workers, settings.passports),
+            Driver::Blocking => {
+                let headroom = (settings.workers / 8).max(16);
+                limits = limits
+                    .max_connections(u32::from(settings.workers))
+                    .hard_cap_headroom(u32::from(headroom));
+                (settings.workers.saturating_add(headroom), 1)
+            }
         };
+        let tickets = Arc::new(RequestTickets::new(threads));
         let pool = Arc::new(PassportPool::new(
-            settings.workers,
+            threads,
             per_worker,
             SlotSizes {
                 body: 0,
@@ -114,11 +126,7 @@ impl Door {
             .listener(
                 ListenerSpec::tcp("web", settings.listen.as_str()).profile(serve_net::ProfileId(0)),
             )
-            .limits(
-                Limits::new()
-                    .head_timeout(settings.head_timeout)
-                    .max_body(settings.max_body),
-            )
+            .limits(limits)
             .keep_alive(KeepAlive::new().max_requests(settings.keep_alive_requests))
             .workers(match settings.driver {
                 Driver::Reactor => Workers::reactor(settings.workers),
@@ -136,14 +144,22 @@ impl Door {
             );
         }
         let time = Arc::new(ServerTime::default());
+        let admit = PassportAdmit::new(pool.clone());
         let built = builder
             .observer(TimeObserver::new(time.clone()))
             .gate(bouncer.clone())
             .checkpoint(DoorCheckpoint::new(bouncer.clone()))
-            .admit(PassportAdmit::new(pool.clone()))
+            .admit(admit.clone())
             .control(Arc::new(UrgentControl::new(line)))
             .build()
             .map_err(|e| OpenError(format!("gateway configuration: {e}")))?;
+        if admit.prepared_workers() > pool.workers() {
+            return Err(OpenError(format!(
+                "serve-net runs {} workers but the gateway has passports for {}",
+                admit.prepared_workers(),
+                pool.workers()
+            )));
+        }
         let bound = built
             .bind(Pipeline::with_stages(
                 core,
@@ -453,6 +469,11 @@ impl Subsystem for Gateway {
 
     fn health(&self) -> Health {
         match &self.open {
+            // Each lost passport is a panic that unwound past a request: the
+            // pool replaced it, but someone should look.
+            Some(open) if open.pool().stats().lost > 0 => {
+                Health::degraded("passports lost to panics (replaced)")
+            }
             Some(open) if open.running().health().is_ok() => Health::HEALTHY,
             Some(_) => Health::degraded("transport reports an issue"),
             None => Health::unhealthy("door closed"),

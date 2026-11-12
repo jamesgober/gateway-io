@@ -20,7 +20,7 @@ http-net = { version = "0.9.2", default-features = false }
 bouncer-io = { version = "0.9.2", features = ["net-io"] }
 system-suite = { version = "0.8", default-features = false, features = ["kernel", "signals", "config", "log"] }
 web-net = { version = "0.9", default-features = false }
-luminess = { version = "0.9.2", features = ["web-net"] }
+luminess = { version = "0.9.3", features = ["web-net"] }
 bison-db = { version = "1.0", default-features = false, features = ["std"] }
 gatekeeper-io = "0.6"
 key-vault = { version = "1.1", features = ["fetcher-file"] }

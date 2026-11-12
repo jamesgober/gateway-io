@@ -9,6 +9,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bouncer_io::{Bouncer, TicketTag};
@@ -31,6 +32,7 @@ use crate::web::{Caller, WebServices};
 pub struct PassportAdmit {
     pool: Arc<PassportPool>,
     retry_after: Duration,
+    prepared: Arc<AtomicU16>,
 }
 
 impl PassportAdmit {
@@ -40,16 +42,24 @@ impl PassportAdmit {
         PassportAdmit {
             pool,
             retry_after: Duration::from_secs(1),
+            prepared: Arc::new(AtomicU16::new(0)),
         }
+    }
+
+    /// The number of workers serve-net prepared admission for (0 before the
+    /// server is built). The gateway refuses to open when it is more than
+    /// the pool has shelves for.
+    #[must_use]
+    pub fn prepared_workers(&self) -> u16 {
+        self.prepared.load(Ordering::Acquire)
     }
 }
 
 impl Admit for PassportAdmit {
     fn prepare(&mut self, workers: u16, _profiles: &ProfileTable) {
-        // The pool is sized at boot for the configured workers. A worker the
-        // pool has no shelf for is refused at every admission (fail closed);
-        // the gateway checks the two agree before it opens.
-        debug_assert!(workers <= self.pool.workers());
+        // A worker the pool has no shelf for is refused at every admission
+        // (fail closed); the gateway reads this back and refuses to open.
+        self.prepared.store(workers, Ordering::Release);
     }
 
     #[inline]
@@ -81,12 +91,33 @@ pub struct Pipeline {
     stages: Arc<StageTimes>,
 }
 
+/// A passport out of its shelf for one call. If the call unwinds (a panic in
+/// a service, web-net, or the theme) before the passport is given back, the
+/// passport's slot wipes itself as it is dropped, and this puts a new slot on
+/// the shelf so the worker keeps its capacity (counted as `lost`).
+struct Loan<'a> {
+    pool: &'a PassportPool,
+    worker: u16,
+    out: bool,
+}
+
+impl Drop for Loan<'_> {
+    fn drop(&mut self) {
+        if self.out {
+            self.pool.replace_lost(self.worker);
+        }
+    }
+}
+
 /// How a request left the request pipeline.
 enum Flow {
     /// A passport exit: encode its reply.
     Exit(Exit),
     /// A web service already wrote serve-net's reply; the passport goes back.
     Web(Exit, Outcome),
+    /// A web service started a reply in parts: its hand-off is parked with
+    /// the request until the last part.
+    Parked(Outcome),
     /// Admission reserved a passport the shelf did not have (a bug; fail closed).
     NoPassport,
 }
@@ -152,11 +183,13 @@ impl Pipeline {
         tag: TicketTag,
         reply: &mut HttpReply,
         marks: &mut Option<Stamps>,
+        loan: &mut Loan<'_>,
     ) -> Flow {
         let worker = env.worker().get();
         let Some(mut p) = self.pool.take(worker) else {
             return Flow::NoPassport;
         };
+        loan.out = true;
         let service = ServiceTag(env.tag());
         p.set_trip(Trip {
             id: RequestId::new(),
@@ -184,7 +217,7 @@ impl Pipeline {
             slot.push_field(name, value);
         }
         if !self.core.is_external(service) {
-            p.body_mut().extend_from_slice(req.body_bytes());
+            p.push_body(req.body_bytes());
         }
 
         // REQUEST: customs head.
@@ -218,11 +251,64 @@ impl Pipeline {
                     if let Some(m) = marks {
                         m.service = Some(Instant::now());
                     }
-                    Flow::Web(h.finish(), outcome)
+                    if outcome == Outcome::More {
+                        // A reply in parts: the request keeps its passport,
+                        // and later parts skip the pipeline (authorized once).
+                        match self.tickets.park(worker, tag, h) {
+                            Ok(()) => {
+                                loan.out = false;
+                                Flow::Parked(outcome)
+                            }
+                            Err(h) => Flow::Web(h.finish(), outcome),
+                        }
+                    } else {
+                        Flow::Web(h.finish(), outcome)
+                    }
                 }
                 None => Flow::Exit(h.refuse(500)),
             },
         }
+    }
+
+    /// The next part of a web reply in parts, on the hand-off parked with the
+    /// request.
+    fn continue_web(
+        &self,
+        h: wasp_core::Handoff,
+        req: &HttpRequest<'_>,
+        env: &Envelope,
+        tag: TicketTag,
+        reply: &mut HttpReply,
+    ) -> Outcome {
+        let worker = env.worker().get();
+        let mut loan = Loan {
+            pool: &self.pool,
+            worker: h.trip().worker,
+            out: true,
+        };
+        let outcome = match self.web.get(h.service()) {
+            Some(web) => {
+                let caller = Caller::new(h.identity(), h.token_any());
+                web.respond(req, env, &caller, reply)
+            }
+            // Attached at open and never removed: unreachable. Ending the
+            // stream with `Close` would look complete, so let serve-net's
+            // service-error path cut it.
+            None => Outcome::Deferred,
+        };
+        if outcome == Outcome::More {
+            match self.tickets.park(worker, tag, h) {
+                Ok(()) => {
+                    loan.out = false;
+                    return outcome;
+                }
+                Err(h) => self.pool.give_back(h.finish()),
+            }
+        } else {
+            self.pool.give_back(h.finish());
+        }
+        loan.out = false;
+        outcome
     }
 
     /// The response pipeline for a passport exit: export check, the last
@@ -302,10 +388,32 @@ impl HttpService for Pipeline {
 
     fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
         let tag = TicketTag::from_raw(env.user_word());
+        let worker = env.worker().get();
+        // A later part of a reply in parts: the request was authorized when
+        // its first part ran. No passport, customs, or authentication again,
+        // and nothing here can refuse into a body already on the wire (a
+        // revocation is serve-net's checkpoint, which aborts the connection).
+        if let Some(h) = self.tickets.unpark(worker, tag) {
+            return self.continue_web(h, req, env, tag, reply);
+        }
         let mut marks = self.stages.enabled().then(Stamps::start);
-        let outcome = match self.request(req, env, tag, reply, &mut marks) {
-            Flow::Exit(exit) => self.respond(exit, tag, reply),
-            Flow::Web(exit, outcome) => self.respond_web(exit, outcome),
+        let mut loan = Loan {
+            pool: &self.pool,
+            worker: env.worker().get(),
+            out: false,
+        };
+        let outcome = match self.request(req, env, tag, reply, &mut marks, &mut loan) {
+            Flow::Exit(exit) => {
+                let o = self.respond(exit, tag, reply);
+                loan.out = false;
+                o
+            }
+            Flow::Web(exit, outcome) => {
+                let o = self.respond_web(exit, outcome);
+                loan.out = false;
+                o
+            }
+            Flow::Parked(outcome) => outcome,
             Flow::NoPassport => {
                 reply
                     .text(503, wasp_core::refusal_text(503))
@@ -321,11 +429,17 @@ impl HttpService for Pipeline {
     }
 
     fn done(&self, env: &Envelope, finished: &Finished) {
-        if env.user_word() != 0
-            && let Some(stamps) = self
-                .tickets
-                .release(env.worker().get(), TicketTag::from_raw(env.user_word()))
-        {
+        if env.user_word() == 0 {
+            return;
+        }
+        let (stamps, parked) = self
+            .tickets
+            .release_all(env.worker().get(), TicketTag::from_raw(env.user_word()));
+        if let Some(h) = parked {
+            // The client left before the last part.
+            self.pool.give_back(h.finish());
+        }
+        if let Some(stamps) = stamps {
             self.stages.record(env.arrived(), finished, &stamps);
         }
     }
