@@ -437,6 +437,11 @@ impl HttpService for Pipeline {
     }
 
     fn done(&self, env: &Envelope, finished: &Finished) {
+        // A web service forgets what it kept for the request (web-net's
+        // record of a reply in parts).
+        if let Some(web) = self.web.get(ServiceTag(env.tag())) {
+            web.done(env, finished);
+        }
         if env.user_word() == 0 {
             return;
         }

@@ -30,14 +30,14 @@ use gateway_io::gatekeeper::gatekeeper_io::{Gatekeeper, Login, LoginForm, Refusa
 use gateway_io::gatekeeper::{GatekeeperGate, Session, cookie_lines, visit};
 use wasp_core::suite::config::Config;
 use web_net::form_net::{self, Secret};
-use web_net::{App, Assets, Cx, Route, get, post};
+use web_net::{App, Assets, Context, Route, get, post};
 
 use crate::auth::ACCOUNT_READ;
 use crate::content::{Kind, Manifest};
 use crate::theme::{Form, Page, SiteEngine, SiteInfo};
 
 /// A handler's context on this site.
-pub type SiteCx<'a> = Cx<'a, Session, SiteEngine>;
+pub type SiteCx<'a> = Context<'a, Session, SiteEngine>;
 
 /// The site's app type.
 pub type SiteApp = App<GatekeeperGate, SiteEngine>;
@@ -177,7 +177,7 @@ pub fn build(
         .needs(gatekeeper.schema(), &[ACCOUNT_READ])
         .map_err(|e| format!("site rule: {e}"))?;
 
-    let mut builder = App::with(GatekeeperGate(gatekeeper.clone()), engine);
+    let mut builder = App::with_gate(GatekeeperGate(gatekeeper.clone())).render(engine);
     if settings.hosts.is_empty() {
         builder = builder.development();
     }
@@ -203,7 +203,7 @@ pub fn build(
     let p = page.clone();
     let m = manifest.clone();
     let post_page: SiteRoute = get("/posts/:slug", move |cx: &mut SiteCx<'_>| {
-        let slug = cx.param("slug").map(|s| s.into_owned()).unwrap_or_default();
+        let slug = cx.param("slug")?.into_owned();
         let Some(entry) = m.get(Kind::Post, &slug) else {
             return Err(web_net::Error::not_found("post.unknown"));
         };
@@ -233,7 +233,7 @@ pub fn build(
         let csrf = gk.csrf_token(&cleared).map_err(|r| refused(&r))?;
         let user = cleared.user().map(|u| u.to_string()).unwrap_or_default();
         let form = Form {
-            action: cx.url("/sign-out"),
+            action: cx.url("/sign-out")?,
             csrf,
             user,
             ..Form::default()
@@ -256,10 +256,10 @@ pub fn build(
                 .map_err(|r| refused(&r))?;
             let token = gk.login_form(&cleared, &v).map_err(|r| refused(&r))?;
             let next = cx.next_path()?;
-            let mut action = cx.url("/sign-in");
+            let mut action = cx.url("/sign-in")?;
             if let Some(next) = next {
                 action.push_str("?next=");
-                action.push_str(&query_value(&cx.url(&next)));
+                action.push_str(&query_value(&cx.url(&next)?));
             }
             if let Some(c) = token.set_cookie() {
                 cx.set_header("set-cookie", c);
@@ -279,7 +279,7 @@ pub fn build(
     let sign_in: SiteRoute = get("/sign-in", move |cx: &mut SiteCx<'_>| {
         if !cx.identity().identified().is_guest() {
             let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
-            return cx.see_other(&next);
+            return cx.redirect(303, &next);
         }
         show(cx, "", "")
     })
@@ -292,7 +292,7 @@ pub fn build(
     let sign_in_post: SiteRoute = post("/sign-in", move |cx: &mut SiteCx<'_>| {
         let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
         if !cx.identity().identified().is_guest() {
-            return cx.see_other(&next);
+            return cx.redirect(303, &next);
         }
         let form: SignIn = cx.form()?;
         let lines = cookie_lines(cx.request());
@@ -315,7 +315,7 @@ pub fn build(
                 for c in signed_in.set_cookies() {
                     cx.set_header("set-cookie", c);
                 }
-                cx.see_other(&next)
+                cx.redirect(303, &next)
             }
             Login::SecondFactor(_) => {
                 cx.status(501);
@@ -350,7 +350,7 @@ pub fn build(
         if let Some(c) = out.set_cookie() {
             cx.set_header("set-cookie", c);
         }
-        cx.see_other("/")
+        cx.redirect(303, "/")
     })
     .allow(Rule::signed_in())
     .csrf_exempt("the gatekeeper checks the session-bound token and the origin itself")

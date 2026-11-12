@@ -11,7 +11,7 @@ use wasp_core::suite::kernel::UrgentLine;
 use wasp_core::{
     AuthOut, Authentication, Authenticator, Core, Identity, Profile, RequestView, Rule,
 };
-use web_net::{App, Assets, CachePolicy, Cx, Route, get};
+use web_net::{App, Assets, CachePolicy, Context, Route, get};
 
 /// Sets a cookie on every request, as a session gate does for a guest.
 struct SetsCookie;
@@ -42,9 +42,8 @@ fn a_gate_cookie_forbids_every_cache() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join("a.txt"), b"asset").expect("file");
-    let page: Route<Who, Rule> = get("/news", |cx: &mut Cx<'_, Who>| {
-        cx.html(200, "<p>news</p>");
-        Ok(())
+    let page: Route<Who, Rule> = get("/news", |cx: &mut Context<'_, Who>| {
+        cx.html(200, "<p>news</p>")
     })
     .public()
     .cache(CachePolicy::Public { max_age: 3600 });

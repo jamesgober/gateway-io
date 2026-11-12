@@ -15,7 +15,7 @@
 
 use std::any::Any;
 
-use serve_net::{Envelope, HttpHead, HttpReply, HttpRequest, Outcome, WorkClass};
+use serve_net::{Envelope, Finished, HttpHead, HttpReply, HttpRequest, Outcome, WorkClass};
 use wasp_core::{Access, Decision, Identity, Rule, ServiceTag};
 use web_net::{Denial, Gate, Request};
 
@@ -52,7 +52,7 @@ impl Gate for WaspGate {
     /// were served without the gateway (`App::respond`), and then it refuses
     /// every request that needs a gate.
     fn authenticate(&self, _req: &Request<'_>) -> Result<Who, Denial> {
-        Err(Denial::status(500, "gateway.authenticates_in_core"))
+        Err(Denial::with_status(500, "gateway.authenticates_in_core"))
     }
 
     fn authorize(&self, who: &Who, rule: &Rule, _req: &Request<'_>) -> Result<(), Denial> {
@@ -62,7 +62,7 @@ impl Gate for WaspGate {
                 401 => Denial::sign_in("access.sign_in"),
                 403 => Denial::forbidden("access.forbidden"),
                 404 => Denial::hidden("access.hidden"),
-                other => Denial::status(other, "access.refused"),
+                other => Denial::with_status(other, "access.refused"),
             }),
         }
     }
@@ -146,6 +146,13 @@ pub trait WebService: Send + Sync + 'static {
         let _ = head;
         WorkClass::Quick
     }
+
+    /// serve-net reports the request done (its last byte handed over, or the
+    /// connection gone): what the service kept for it can go (web-net's
+    /// record of a reply in parts).
+    fn done(&self, env: &Envelope, finished: &Finished) {
+        let _ = (env, finished);
+    }
 }
 
 impl<G: WebGate, E: web_net::Render> WebService for web_net::App<G, E> {
@@ -157,17 +164,24 @@ impl<G: WebGate, E: web_net::Render> WebService for web_net::App<G, E> {
         caller: &Caller<'_>,
         reply: &mut HttpReply,
     ) -> Outcome {
-        G::with_identity(caller, |who| self.respond_identified(req, env, who, reply))
-            .unwrap_or_else(|| {
-                // Authentication kept no identity this gate can use: a wiring
-                // fault. Fail closed.
-                reply.text(500, wasp_core::refusal_text(500)).close();
-                Outcome::Close
-            })
+        G::with_identity(caller, |who| {
+            web_net::App::respond(self, req, env, Some(who), reply).outcome
+        })
+        .unwrap_or_else(|| {
+            // Authentication kept no identity this gate can use: a wiring
+            // fault. Fail closed.
+            reply.text(500, wasp_core::refusal_text(500)).close();
+            Outcome::Close
+        })
     }
 
     fn classify(&self, head: &HttpHead<'_>) -> WorkClass {
         web_net::App::classify(self, head).work
+    }
+
+    #[inline]
+    fn done(&self, env: &Envelope, finished: &Finished) {
+        serve_net::HttpService::done(self, env, finished);
     }
 }
 

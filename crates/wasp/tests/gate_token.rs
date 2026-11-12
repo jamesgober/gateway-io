@@ -17,7 +17,7 @@ use wasp_core::{
     AuthOut, Authentication, Authenticator, Core, Identity, PermSet, Profile, RequestView,
     SessionId, UserId,
 };
-use web_net::{App, Cx, Denial, Gate, Request, Route, get};
+use web_net::{App, Context, Denial, Gate, Request, Route, get};
 
 /// The gate's own identity: what gatekeeper-io's `Identified` is to its gate.
 #[derive(Clone, Debug)]
@@ -44,7 +44,7 @@ impl Gate for DoubleGate {
     type Rule = GateRule;
 
     fn authenticate(&self, _req: &Request<'_>) -> Result<GateIdentity, Denial> {
-        Err(Denial::status(500, "test.core_authenticates"))
+        Err(Denial::with_status(500, "test.core_authenticates"))
     }
 
     fn authorize(
@@ -101,21 +101,18 @@ fn open(keep_token: bool) -> (Door, SocketAddr) {
             .load()
             .expect("core"),
     );
-    let me: Route<GateIdentity, GateRule> = get("/me", |cx: &mut Cx<'_, GateIdentity>| {
+    let me: Route<GateIdentity, GateRule> = get("/me", |cx: &mut Context<'_, GateIdentity>| {
         let name = cx.identity().user.clone().unwrap_or_default();
-        cx.text(200, &format!("hello {name}"));
-        Ok(())
+        cx.text(200, &format!("hello {name}"))
     })
     .allow(GateRule::SignedIn);
-    let home: Route<GateIdentity, GateRule> = get("/", |cx: &mut Cx<'_, GateIdentity>| {
-        cx.text(200, "home");
-        Ok(())
+    let home: Route<GateIdentity, GateRule> = get("/", |cx: &mut Context<'_, GateIdentity>| {
+        cx.text(200, "home")
     })
     .public();
     let sign_in: Route<GateIdentity, GateRule> =
-        get("/sign-in", |cx: &mut Cx<'_, GateIdentity>| {
-            cx.text(200, "sign in");
-            Ok(())
+        get("/sign-in", |cx: &mut Context<'_, GateIdentity>| {
+            cx.text(200, "sign in")
         })
         .public();
     let app = App::with_gate(DoubleGate)

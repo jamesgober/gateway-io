@@ -137,7 +137,7 @@ impl Gate for GatekeeperGate {
     /// Never trusted to run: the core authenticates (see
     /// [`WaspGate::authenticate`](crate::WaspGate)).
     fn authenticate(&self, _req: &Request<'_>) -> Result<Session, Denial> {
-        Err(Denial::status(500, "gateway.authenticates_in_core"))
+        Err(Denial::with_status(500, "gateway.authenticates_in_core"))
     }
 
     fn authorize(
@@ -162,7 +162,7 @@ pub fn denial(refusal: &Refusal) -> Denial {
         RefusalKind::GuestOnly => Denial::forbidden("gate.guest_only"),
         RefusalKind::Banned { .. } => Denial::forbidden("gate.banned"),
         RefusalKind::Csrf => Denial::forbidden("gate.csrf"),
-        RefusalKind::Unavailable => Denial::status(503, "gate.unavailable"),
+        RefusalKind::Unavailable => Denial::unavailable("gate.unavailable"),
         RefusalKind::ForeignStage => Denial::forbidden("gate.foreign_stage"),
         _ => Denial::forbidden("gate.forbidden"),
     };

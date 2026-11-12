@@ -16,7 +16,7 @@ use wasp_core::{Core, CoreSubsystem};
 use web_net::{App, get};
 
 /// A page on a site behind the core's own access gate.
-type SiteCx<'a> = web_net::Cx<'a, gateway_io::Who, theme::SiteEngine>;
+type SiteCx<'a> = web_net::Context<'a, gateway_io::Who, theme::SiteEngine>;
 type SiteRoute = web_net::Route<gateway_io::Who, wasp_core::Rule, theme::SiteEngine>;
 
 fn default_theme() -> PathBuf {
@@ -226,15 +226,15 @@ fn error_pages_for_404_405_and_500() {
     })
     .public()
     .template("page");
-    let app = App::with(
-        WaspGate::new(core.access().clone()),
-        theme::Timed::untimed(theme::load(&default_theme()).expect("theme")),
-    )
-    .development()
-    .route(ok)
-    .route(boom)
-    .build()
-    .expect("app");
+    let app = App::with_gate(WaspGate::new(core.access().clone()))
+        .render(theme::Timed::untimed(
+            theme::load(&default_theme()).expect("theme"),
+        ))
+        .development()
+        .route(ok)
+        .route(boom)
+        .build()
+        .expect("app");
     let mut web = WebServices::new();
     web.attach(core.service_tag("web").expect("tag"), app);
     let door = Door::open(core, &settings(), UrgentLine::detached(), web).expect("opens");
@@ -389,7 +389,6 @@ fn the_watcher_reloads_a_changed_theme_through_the_kernel() {
 }
 
 #[test]
-#[ignore = "web-net's ErrorPage carries no base path, so error pages of a site in a folder link /theme/site.css instead of /blog/theme/site.css; asked of web-net (its simplicity audit reworks that surface). Not worked around in gateway-io on purpose."]
 fn error_pages_of_a_site_in_a_folder_keep_its_base_path() {
     let copy_conf = format!(
         "[site]\nbase = \"/blog\"\ntheme = \"{}\"\ntheme_poll = \"0s\"\n",

@@ -198,9 +198,9 @@ dependencies = [
 
 [[package]]
 name = "bouncer-io"
-version = "0.9.2"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3259c8f13d64faade84335150be75f70ac319b391b76c15aea2ac1f5946341f"
+checksum = "e390717b98325ce66068dc3e68fcd4ba96803525a3c2e94cbf244d18d9610c63"
 dependencies = [
  "better-bucket",
  "clock-lib",
@@ -279,9 +279,9 @@ dependencies = [
 
 [[package]]
 name = "compress-lib"
-version = "0.9.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee59300f1886992025c911f91659c8a0d9676c938e327224870371b5c0d6654e"
+checksum = "f30f5a86e977a267d245e350424f5d015fb0f7463b231c3547c7eeb167485c36"
 
 [[package]]
 name = "config-lib"
@@ -300,15 +300,6 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
-
-[[package]]
-name = "cookie-net"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa5ae6ab475000f6a1209eac4fb43c112d0228798db935f81d74f7218abd81a7"
-dependencies = [
- "parse-net 0.6.1",
-]
 
 [[package]]
 name = "cookie-net"
@@ -345,9 +336,9 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crypt-io"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3284b68b08302ea5e93eca2a77ed9a30a2869ab6611253467102be27368886"
+checksum = "5331b5c56d73aa1d4c5b9238b0f0aa5da157a64b5c2e1ccf81977c1908a6452c"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -386,6 +377,16 @@ name = "csrf-sec"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "109b9bebe65c1dc3872b5821f1dd4d5a40379f5b93d62671b95ecace9862c0ad"
+dependencies = [
+ "crypt-io",
+ "mod-rand",
+]
+
+[[package]]
+name = "csrf-sec"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74921e7516ed178c9065f3903a24ac58594f5f9f88d03f7acbac6256625a7065"
 dependencies = [
  "crypt-io",
  "mod-rand",
@@ -460,9 +461,9 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "form-net"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ac680bffad6387b3e48eef6a57706e589f3c18e1f859b47a0d2b0e983532ef"
+checksum = "92bd4341c5d2087c0121bd021995337d9e41ebea3e486f2b69b1475f5fcd773e"
 dependencies = [
  "crypt-io",
  "parse-net 0.6.1",
@@ -483,9 +484,9 @@ dependencies = [
  "access-gate",
  "audit-trail",
  "auth-gate",
- "cookie-net 0.8.0",
+ "cookie-net",
  "crypt-io",
- "csrf-sec",
+ "csrf-sec 0.9.3",
  "key-vault",
  "mod-rand",
 ]
@@ -674,9 +675,6 @@ name = "luminess"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ccd8fbe871b49e07a17d8a6dd54e2ca8c643b921e3b0331e0310a3dbda53d86"
-dependencies = [
- "web-net",
-]
 
 [[package]]
 name = "matchers"
@@ -701,9 +699,9 @@ checksum = "4a80b508fa38c5f39796f957b58b2f65227600f3bfb461c8d968e7babddb9a37"
 
 [[package]]
 name = "net-io"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14a2085537782c078643599245f86e9de6062215b4e6b530f845878c26e20b82"
+checksum = "c9938509979129045b3f8386b6ce1efb90b4422aeda0e1694cec984ac0d9853e"
 
 [[package]]
 name = "nu-ansi-term"
@@ -1187,13 +1185,13 @@ dependencies = [
 
 [[package]]
 name = "web-net"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdc084324bf3ad2f86e0134d4985c94391229dad6a428db40df4ca41ccd5ff91"
+checksum = "51f66ce55da178226177129c15e4f2a8fc0311b06b5eb0facb3b5430b052df41"
 dependencies = [
  "compress-lib",
- "cookie-net 0.7.1",
- "csrf-sec",
+ "cookie-net",
+ "csrf-sec 0.10.0",
  "form-net",
  "parse-net 0.9.3",
  "serve-net",

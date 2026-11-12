@@ -15,13 +15,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use luminess::Engine;
-use luminess::web::{ErrorView, Theme};
+use luminess::{Engine, RenderErrorKind};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::lifecycle::{Commit, Deadline, Failure, Link, Subsystem};
 use wasp_core::suite::log;
@@ -104,8 +103,144 @@ luminess::view!(Page as "page" {
     form: object(Form),
 });
 
-/// The theme: what the watcher reloads.
-pub type SiteTheme = Theme<Page>;
+/// What an error page template reads, as `error`: the facts web-net shows a
+/// visitor, and the site's own URLs (inside its base path) for the
+/// stylesheet and the home page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorView {
+    /// The status (`404`).
+    pub status: u16,
+    /// Its generic title.
+    pub title: String,
+    /// Its generic message.
+    pub message: String,
+    /// The request's reference, for support.
+    pub reference: String,
+    /// The stylesheet's URL.
+    pub css: String,
+    /// The home page's URL.
+    pub home: String,
+}
+
+luminess::view!(ErrorView as "error" {
+    status: int,
+    title: text,
+    message: text,
+    reference: text,
+    css: text,
+    home: text,
+});
+
+/// The theme as web-net's render engine: page templates and error page
+/// templates, reloaded in place (every clone renders from the same
+/// templates).
+///
+/// Template ids are indexes into an append-only table of names, so an id a
+/// route resolved at build stays valid across every reload.
+#[derive(Clone)]
+pub struct SiteTheme {
+    pages: Engine<Page>,
+    errors: Engine<ErrorView>,
+    names: Arc<RwLock<Vec<Box<str>>>>,
+}
+
+impl SiteTheme {
+    /// The page engine, for reloading.
+    #[must_use]
+    pub fn pages(&self) -> &Engine<Page> {
+        &self.pages
+    }
+
+    /// The error page engine, for reloading.
+    #[must_use]
+    pub fn error_pages(&self) -> &Engine<ErrorView> {
+        &self.errors
+    }
+
+    fn name(&self, id: web_net::TemplateId) -> Option<Box<str>> {
+        let names = self.names.read().ok()?;
+        names.get(usize::try_from(id.0).ok()?).cloned()
+    }
+}
+
+impl std::fmt::Debug for SiteTheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteTheme").finish_non_exhaustive()
+    }
+}
+
+fn convert(e: &luminess::RenderError) -> web_net::RenderError {
+    let code = match e.kind() {
+        RenderErrorKind::NotFound => "luminess.not_found",
+        RenderErrorKind::TooLarge => "luminess.too_large",
+        _ => "luminess.render",
+    };
+    web_net::RenderError::new(code).with_detail(e.to_string())
+}
+
+impl web_net::Render for SiteTheme {
+    type View<'a> = Page;
+
+    fn template(&self, name: &str) -> Option<web_net::TemplateId> {
+        if !self.pages.templates().contains(name) {
+            return None;
+        }
+        let mut names = self.names.write().ok()?;
+        let i = match names.iter().position(|n| &**n == name) {
+            Some(i) => i,
+            None => {
+                names.push(name.into());
+                names.len() - 1
+            }
+        };
+        u32::try_from(i).ok().map(web_net::TemplateId)
+    }
+
+    fn render(
+        &self,
+        template: web_net::TemplateId,
+        view: &Page,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<(), web_net::RenderError> {
+        let name = self
+            .name(template)
+            .ok_or_else(|| web_net::RenderError::new("luminess.not_found"))?;
+        // A block that fails is not an error: its fallback is written and
+        // the page goes out.
+        self.pages
+            .render(&name, view, out.buffer())
+            .map(|_| ())
+            .map_err(|e| convert(&e))
+    }
+
+    fn error_page(
+        &self,
+        page: &web_net::ErrorPage<'_>,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<bool, web_net::RenderError> {
+        let view = ErrorView {
+            status: page.status,
+            title: page.title.to_owned(),
+            message: page.message.to_owned(),
+            reference: page.reference.to_owned(),
+            css: page.url("/theme/site.css")?,
+            home: page.url("/")?,
+        };
+        let buf = out.buffer();
+        let start = buf.len();
+        for name in [format!("error/{}", page.status), "error".to_owned()] {
+            match self.errors.render(&name, &view, buf) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.kind() == RenderErrorKind::NotFound => {}
+                Err(e) => {
+                    buf.truncate(start);
+                    return Err(convert(&e));
+                }
+            }
+        }
+        Ok(false)
+    }
+}
 
 /// A render engine that records the time of each render into the stage
 /// timing (when it is on). What web-net renders with.
@@ -308,7 +443,11 @@ fn compile_sources(
 /// Loads the theme in `dir`.
 pub fn load(dir: &Path) -> Result<SiteTheme, ThemeError> {
     let (pages, errors) = compile(dir)?;
-    Ok(Theme::new(Engine::new(pages)).with_error_pages(Engine::new(errors)))
+    Ok(SiteTheme {
+        pages: Engine::new(pages),
+        errors: Engine::new(errors),
+        names: Arc::new(RwLock::new(Vec::new())),
+    })
 }
 
 /// Compiles the theme in `dir` again and swaps it into `theme` (every clone,
@@ -316,9 +455,7 @@ pub fn load(dir: &Path) -> Result<SiteTheme, ThemeError> {
 pub fn reload(theme: &SiteTheme, dir: &Path) -> Result<(), ThemeError> {
     let (pages, errors) = compile(dir)?;
     let _ = theme.pages().swap(pages);
-    if let Some(e) = theme.error_pages() {
-        let _ = e.swap(errors);
-    }
+    let _ = theme.error_pages().swap(errors);
     Ok(())
 }
 
@@ -468,9 +605,7 @@ impl Subsystem for ThemeWatcher {
         let theme = self.theme.clone();
         Ok(Commit::new(move || {
             let _ = theme.pages().swap(pages);
-            if let Some(e) = theme.error_pages() {
-                let _ = e.swap(errors);
-            }
+            let _ = theme.error_pages().swap(errors);
         }))
     }
 }

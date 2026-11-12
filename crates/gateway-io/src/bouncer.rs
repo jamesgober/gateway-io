@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bouncer_io::{
-    Actor, AllowList, BanSpec, Bouncer, BouncerError, Cidr, CloseKind, ConnId, EJECTED, Ejector,
-    EventSink, LiftSpec, Reason, TicketTag,
+    Actor, AllowList, Bouncer, BouncerError, Cidr, CloseKind, Directive, EJECTED, Ejector,
+    EventSink, Reason, TicketTag,
 };
 use net_io::{ConnectionId, ServerHandle};
 use serve_net::{Checkpoint, CheckpointAt, Envelope, Verdict};
@@ -33,8 +33,8 @@ pub fn allow_list(exempt: &[IpAddr]) -> Result<AllowList, BouncerError> {
 /// A ban from configuration, by the administrator.
 pub fn ban(bouncer: &Bouncer, addr: IpAddr) -> Result<(), BouncerError> {
     bouncer
-        .ban(
-            BanSpec::address(addr)
+        .apply(
+            Directive::ban(addr)
                 .for_duration(CONFIG_BAN)
                 .by(Actor::Admin(0))
                 .because(Reason::ADMIN),
@@ -44,8 +44,8 @@ pub fn ban(bouncer: &Bouncer, addr: IpAddr) -> Result<(), BouncerError> {
 
 /// Lifts a ban from configuration. Nothing to lift is not an error.
 pub fn lift(bouncer: &Bouncer, addr: IpAddr) -> Result<(), BouncerError> {
-    match bouncer.lift(
-        LiftSpec::key(addr)
+    match bouncer.apply(
+        Directive::lift(addr)
             .by(Actor::Admin(0))
             .because(Reason::ADMIN),
     ) {
@@ -81,7 +81,7 @@ impl DoorEjector {
 }
 
 impl Ejector for DoorEjector {
-    fn eject(&self, conn: ConnId, _kind: CloseKind) {
+    fn eject(&self, conn: bouncer_io::ConnectionId, _kind: CloseKind) {
         if let (Ok(server), Some(id)) = (self.server.lock(), ConnectionId::new(conn.0))
             && let Some(server) = server.as_ref()
         {
@@ -114,7 +114,7 @@ pub fn build(
     if let Some(sink) = events {
         builder = builder.event_sink(sink);
     }
-    let bouncer = builder.try_build()?;
+    let bouncer = builder.build()?;
     for addr in &settings.ban {
         ban(&bouncer, *addr)?;
     }

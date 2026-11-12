@@ -198,9 +198,8 @@ fn compare(title: &str, a: &Under<'_>, b: &Under<'_>, cases: &[(usize, usize)]) 
 }
 
 fn bench_route<I: web_net::Identity, R: Send + Sync + 'static>() -> web_net::Route<I, R> {
-    web_net::get("/bench", |cx: &mut web_net::Cx<'_, I>| {
-        cx.html(200, PAGE);
-        Ok(())
+    web_net::get("/bench", |cx: &mut web_net::Context<'_, I>| {
+        cx.html(200, PAGE)
     })
     .public()
 }

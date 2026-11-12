@@ -10,7 +10,7 @@ use gateway_io::{Door, Settings, WaspGate, WebServices, Who};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
 use wasp_core::{Core, Rule};
-use web_net::{App, Cx, Route, get};
+use web_net::{App, Context, Route, get};
 
 fn settings() -> Settings {
     Settings {
@@ -256,6 +256,13 @@ fn a_domain_site_and_localhost() {
         get_on(dev_addr, "localhost", "/").map(|g| g.status),
         Some(200)
     );
+    assert_eq!(
+        get_on(dev_addr, "127.0.0.1", "/").map(|g| g.status),
+        Some(200)
+    );
+    // Review F-8: and only the development hosts (no DNS rebinding).
+    let foreign = get_on(dev_addr, "attacker.example", "/").expect("a response");
+    assert_ne!(foreign.status, 200, "{}", foreign.head);
     let _ = door.close(Duration::from_secs(1));
     let _ = dev.close(Duration::from_secs(1));
 }
@@ -272,11 +279,10 @@ fn the_hello_passport_service_still_serves_when_chosen() {
 /// A web app with a slow page that also sets a cookie, to prove a revocation
 /// replaces the whole reply (no field of it leaves).
 fn slow_app(core: &Core) -> App<WaspGate> {
-    let slow: Route<Who, Rule> = get("/slow", |cx: &mut Cx<'_, Who>| {
+    let slow: Route<Who, Rule> = get("/slow", |cx: &mut Context<'_, Who>| {
         thread::sleep(Duration::from_millis(600));
         cx.set_header("x-secret", "leaked");
-        cx.html(200, "<p>content</p>");
-        Ok(())
+        cx.html(200, "<p>content</p>")
     })
     .public();
     App::with_gate(WaspGate::new(core.access().clone()))
