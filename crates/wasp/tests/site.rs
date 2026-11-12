@@ -331,58 +331,28 @@ fn a_revocation_during_a_web_request_replaces_the_whole_reply() {
     let _ = door.close(Duration::from_secs(1));
 }
 
-/// Clears a dead session cookie, as the auth gate does.
-struct DeadSession;
-impl wasp_core::Authenticator for DeadSession {
-    fn authenticate(
-        &self,
-        request: wasp_core::RequestView<'_>,
-        _profile: &wasp_core::Profile,
-        out: &mut wasp_core::AuthOut,
-    ) -> wasp_core::Authentication {
-        if request.head().header("cookie").is_some() {
-            out.set_cookie(b"__Host-sid=; Max-Age=0; Path=/; Secure; HttpOnly");
-        }
-        wasp_core::Authentication::Identified(wasp_core::Identity::guest())
-    }
-}
-
 #[test]
 fn the_authentication_cookie_goes_out_once_on_web_replies() {
-    let core = web_core(DeadSession);
-    let site = wasp::site::build(
-        core.access().clone(),
-        wasp::content::Manifest::sample(),
-        wasp::theme::Timed::untimed(wasp::theme::load(&theme_dir()).expect("theme")),
-        &wasp::site::SiteSettings {
-            theme: theme_dir(),
-            ..wasp::site::SiteSettings::default()
-        },
-    )
-    .expect("site");
-    let mut web = WebServices::new();
-    web.attach(core.service_tag("web").expect("tag"), site);
-    let door = Door::open(core, &settings(), UrgentLine::detached(), web).expect("opens");
-    let addr = door.local_addr().expect("addr");
-    let got = send(
-        addr,
-        "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: __Host-sid=dead\r\nConnection: close\r\n\r\n",
-    )
-    .expect("home");
-    assert_eq!(got.status, 200);
-    assert_eq!(got.count("set-cookie"), 1, "{}", got.head);
-    assert!(
-        got.field("set-cookie")
-            .is_some_and(|c| c.starts_with("__Host-sid=;"))
-    );
-    // And on a page web-net refuses (404), the same.
-    let got = send(
-        addr,
-        "GET /nope HTTP/1.1\r\nHost: localhost\r\nCookie: __Host-sid=dead\r\nConnection: close\r\n\r\n",
-    )
-    .expect("404");
-    assert_eq!(got.status, 404);
-    assert_eq!(got.count("set-cookie"), 1, "{}", got.head);
+    // A session cookie the gatekeeper can never accept: it clears it, once.
+    let (door, addr) = open_site("");
+    let dead = "__Host-sid=v1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for (target, status) in [("/", 200), ("/nope", 404), ("/account", 303)] {
+        let got = send(
+            addr,
+            &format!(
+                "GET {target} HTTP/1.1\r\nHost: localhost\r\nCookie: {dead}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("reply");
+        assert_eq!(got.status, status, "{target}: {}", got.head);
+        assert_eq!(got.count("set-cookie"), 1, "{target}: {}", got.head);
+        assert!(
+            got.field("set-cookie")
+                .is_some_and(|c| c.starts_with("__Host-sid=;")),
+            "{target}: {}",
+            got.head
+        );
+    }
     let _ = door.close(Duration::from_secs(1));
 }
 

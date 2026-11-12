@@ -54,6 +54,7 @@ fn main() {
             entry: entry.clone(),
             posts: manifest.posts(),
             message: String::new(),
+            form: None,
         });
     });
     let page = Page {
@@ -62,6 +63,7 @@ fn main() {
         entry: entry.clone(),
         posts: manifest.posts(),
         message: String::new(),
+        form: None,
     };
     let post_cost = measure(|| {
         buf.clear();

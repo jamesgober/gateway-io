@@ -29,7 +29,7 @@ use wasp_core::suite::log;
 use crate::content::Entry;
 
 /// The templates every theme must have (the routes name them).
-pub const REQUIRED: &[&str] = &["home", "post", "page"];
+pub const REQUIRED: &[&str] = &["home", "post", "page", "sign-in", "account"];
 
 // The view schemas: every Luminess name the site uses is in this module, so
 // a Luminess upgrade changes this file and nothing else.
@@ -60,6 +60,23 @@ pub struct SiteInfo {
 
 luminess::view!(SiteInfo as "site" { name: text, home: text, about: text, account: text, css: text });
 
+/// A form on a page (`page.form`): the sign-in form, the sign-out button.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Form {
+    /// Where it posts.
+    pub action: String,
+    /// The CSRF token, for the hidden `csrf` field.
+    pub csrf: String,
+    /// A message to show above it (a refused sign-in), or empty.
+    pub error: String,
+    /// The email to fill in again after a refusal, or empty.
+    pub email: String,
+    /// Who is signed in, or empty.
+    pub user: String,
+}
+
+luminess::view!(Form as "form" { action: text, csrf: text, error: text, email: text, user: text });
+
 /// What a page template reads, as `page`. Content is shared, not copied:
 /// `entry` and `posts` point into the manifest.
 #[derive(Clone, Debug)]
@@ -74,6 +91,8 @@ pub struct Page {
     pub posts: Arc<Vec<Arc<Entry>>>,
     /// A short message, for pages without an entry.
     pub message: String,
+    /// The page's form, if it has one.
+    pub form: Option<Arc<Form>>,
 }
 
 luminess::view!(Page as "page" {
@@ -82,6 +101,7 @@ luminess::view!(Page as "page" {
     entry: object(Entry),
     posts: list(object(Entry)),
     message: text,
+    form: object(Form),
 });
 
 /// The theme: what the watcher reloads.

@@ -18,6 +18,13 @@ net-io = { workspace = true }
 bouncer-io = { workspace = true }
 # The web service: site, url, router, authorize, handlers, render (public, generic).
 web-net = { workspace = true }
+# The gates (feature `gatekeeper`): authentication in the core, authorization
+# in web-net, sign-in and sign-out, CSRF.
+gatekeeper-io = { workspace = true, optional = true }
+
+[features]
+default = []
+gatekeeper = ["dep:gatekeeper-io"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }

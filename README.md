@@ -7,8 +7,8 @@ The platform's front door and the minimum of the core it hands requests to, as a
 | Crate | What it holds |
 |---|---|
 | `crates/wasp-core` | the passport and its stage types, the passport pool, customs, the gates seam (authentication, authorization), the service seam, the core, the hello stub |
-| `crates/gateway-io` | serve-net wiring: the bouncer door and egress, admission on the passport pool, the request and response pipelines, the urgent line as the transport's control line, server-time metrics |
-| `crates/wasp` | the process: boot phases 0 to 4, shutdown in reverse; the first web site (web-net, content in memory) |
+| `crates/gateway-io` | serve-net wiring: the bouncer door and egress, admission on the passport pool, the request and response pipelines, the urgent line as the transport's control line, server-time metrics; the gatekeeper adapter (feature `gatekeeper`) |
+| `crates/wasp` | the process: boot phases 0 to 4, shutdown in reverse; the first web site (web-net, Luminess themes, a content store), behind the gatekeeper |
 
 ## The path of a request
 
@@ -16,9 +16,9 @@ The platform's front door and the minimum of the core it hands requests to, as a
  net-io accept ─▶ bouncer door (address only, before any byte) ─▶ http-net parse (serve-net)
  head complete ─▶ admission: reserve a passport, or 503 with nothing taken
  Passport<Arrived> ─▶ customs head ─▶ Passport<Inspected> ─▶ checkpoint
- core: authenticate ─▶ Passport<Identified> ─▶ guest cache ─▶ the profile's service
+ core: authenticate (gatekeeper) ─▶ Passport<Identified> ─▶ guest cache ─▶ the profile's service
  passport service: route ─▶ authorize ─▶ Passport<Cleared> ─▶ reply ─▶ Exit
- web service (web-net): Handoff ─▶ site, url, route, 405 ─▶ authorize (core's access gate) ─▶ handler ─▶ serve-net's reply
+ web service (web-net): Handoff ─▶ site, url, route, 405 ─▶ authorize (gatekeeper) ─▶ handler ─▶ serve-net's reply
  customs export ─▶ last checkpoint ─▶ encode ─▶ passport wiped and returned ─▶ net-io write (bouncer egress)
 ```
 
@@ -32,16 +32,29 @@ cargo run -p wasp
 
 It reads `wasp.conf` from the working directory (or the file named by `WASP_CONFIG`) and listens on `127.0.0.1:8080` by default. Ctrl+C (or SIGTERM) closes the door first, drains, then stops the core and the kernel.
 
+To sign in, name a boot account and give its password in the environment (never in the configuration):
+
+```toml
+[auth]
+admin = "admin@example.com"
+```
+
+```bash
+WASP_ADMIN_PASSWORD='a long password' cargo run -p wasp
+```
+
+Accounts and sessions are in memory: a restart signs everyone out. The gates' master secret is `<data folder>/gate.key`, made on the first run.
+
 ```bash
 curl -i http://127.0.0.1:8080/
 curl -i http://127.0.0.1:8080/posts/hello-world
 curl -i http://127.0.0.1:8080/account
 ```
 
-The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in`), `/sign-in`, `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
 
 ```text
-themes/default/pages/    base, home, post, page   (view: page)
+themes/default/pages/    base, home, post, page, sign-in, account   (view: page)
 themes/default/errors/   error, error/404         (view: error)
 themes/default/static/   site.css                 (served under /theme/)
 ```
@@ -70,6 +83,9 @@ themes/default/static/   site.css                 (served under /theme/)
 | `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
 | `content.store` | `memory` | where content is kept: `memory` (lost at exit) or `bison` (a bison-db file); an empty store is given the sample content |
 | `content.path` | `<data folder>/content.bison` | the bison-db file, with `content.store = "bison"` |
+| `auth.admin` | none | an account made at boot; its password from `WASP_ADMIN_PASSWORD` |
+| `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
+| `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`) |

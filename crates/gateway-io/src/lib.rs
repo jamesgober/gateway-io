@@ -21,6 +21,8 @@
 pub mod bouncer;
 pub mod control;
 pub mod events;
+#[cfg(feature = "gatekeeper")]
+pub mod gatekeeper;
 pub mod gateway;
 pub mod observe;
 pub mod pipeline;

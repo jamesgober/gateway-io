@@ -2,12 +2,15 @@
 //! profile uses which, the theme, and the web site attached to the gateway.
 //! `main` boots it; the tests open the same wiring on a loopback port.
 
+pub mod auth;
 pub mod content;
 pub mod site;
 pub mod theme;
 
 use std::sync::Arc;
 
+use gateway_io::gatekeeper::GatekeeperAuth;
+use gateway_io::gatekeeper::gatekeeper_io::Gatekeeper;
 use wasp_core::Core;
 use wasp_core::stub::Hello;
 use wasp_core::suite::config::Config;
@@ -18,6 +21,8 @@ pub struct Wiring {
     pub core: Arc<Core>,
     /// The web site, attached to the core's external service `web`.
     pub site: site::SiteApp,
+    /// The gates: the core's authentication and the site's authorization.
+    pub gatekeeper: Arc<Gatekeeper>,
     /// The theme watcher (a kernel subsystem; start it before the gateway).
     pub theme: theme::ThemeWatcher,
     /// Stage timing (`gateway.stage_timing`), shared by the gateway and the
@@ -31,13 +36,26 @@ impl std::fmt::Debug for Wiring {
     }
 }
 
-/// Phases 1 to 3 from configuration, with the data folder `.` (a memory
-/// content store needs none; see [`wire_in`]).
+/// Phases 1 to 3 from configuration, for tests and tools: a bison content
+/// store defaults to `./content.bison`, the gates' master secret lasts for
+/// this run only (unless `auth.secret` names a file), and no boot account is
+/// made from the environment.
 pub fn wire(config: &Config) -> Result<Wiring, String> {
-    wire_in(config, std::path::Path::new("."))
+    wire_with(config, std::path::Path::new("."), None, None)
+}
+
+/// Phases 1 to 3 for the process: the data folder holds the content store
+/// and the gates' master secret, and the boot account's password comes from
+/// `WASP_ADMIN_PASSWORD`.
+pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, String> {
+    let password = std::env::var(auth::ADMIN_PASSWORD_ENV).ok();
+    wire_with(config, data_dir, Some(data_dir), password.as_deref())
 }
 
 /// Phases 1 to 3 from configuration.
+///
+/// Gates: one gatekeeper (`[auth]`, see [`auth`]) authenticates in the core
+/// and authorizes in the site; accounts and sessions are in memory.
 ///
 /// Providers: the content store (`[content] store`: `memory`, the default,
 /// or `bison`, a bison-db file at `[content] path`, default
@@ -50,7 +68,12 @@ pub fn wire(config: &Config) -> Result<Wiring, String> {
 /// `hello.slow_route` is on, for drain tests). `[site] service` picks the one
 /// the `site` profile uses; the default is `web`. The theme is compiled here,
 /// so a broken theme refuses to start.
-pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, String> {
+fn wire_with(
+    config: &Config,
+    data_dir: &std::path::Path,
+    secret_dir: Option<&std::path::Path>,
+    admin_password: Option<&str>,
+) -> Result<Wiring, String> {
     let e = |e: wasp_core::suite::Error| e.to_string();
     let store_kind: String = config
         .get_or("content.store", "memory".to_owned())
@@ -87,7 +110,11 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
             "site.service must be `web` or `hello`, not `{service}`"
         ));
     }
+    let settings = site::SiteSettings::from_config(config)?;
+    let auth_settings = auth::AuthSettings::from_config(config, secret_dir, &settings.hosts)?;
+    let gatekeeper = auth::gatekeeper(&auth_settings, admin_password)?;
     let core = Core::builder()
+        .authenticator(GatekeeperAuth(gatekeeper.clone()))
         .provider(store.clone())
         .jobs(Arc::new(jobs))
         .external("web")
@@ -102,7 +129,6 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
         .load()
         .map_err(|e| e.0)?;
     let core = Arc::new(core);
-    let settings = site::SiteSettings::from_config(config)?;
     let theme = theme::load(&settings.theme).map_err(|e| e.0)?;
     let watcher =
         theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll);
@@ -112,11 +138,11 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
     let stages = Arc::new(gateway_io::StageTimes::new(timing));
     let manifest = content::Manifest::open(store, &settings.base, true).map_err(|e| e.0)?;
     let engine = theme::Timed::new(theme, stages.clone());
-    let site = site::build(core.access().clone(), manifest, engine, &settings)
-        .map_err(|e| format!("site: {e}"))?;
+    let site = site::build(gatekeeper.clone(), manifest, engine, &settings)?;
     Ok(Wiring {
         core,
         site,
+        gatekeeper,
         theme: watcher,
         stages,
     })

@@ -22,6 +22,9 @@ system-suite = { version = "0.8", default-features = false, features = ["kernel"
 web-net = { version = "0.9", default-features = false }
 luminess = { version = "0.9.2", features = ["web-net"] }
 bison-db = { version = "1.0", default-features = false, features = ["std"] }
+gatekeeper-io = "0.5"
+key-vault = { version = "1.1", features = ["fetcher-file"] }
+crypt-io = "1.5"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
 
 [workspace.lints.rust]
@@ -30,6 +33,14 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Password hashing (Argon2id) at full speed in debug and test builds: a
+# sign-in in a test takes a tenth of a second, not seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

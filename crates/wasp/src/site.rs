@@ -1,13 +1,15 @@
-//! The site: web-net on the gateway, content from the in-memory manifest,
-//! pages and error pages rendered by the theme (build-path step 5).
+//! The site: web-net on the gateway, content from the content store, pages
+//! and error pages rendered by the theme (build-path step 5), behind the
+//! gatekeeper (step 7).
 //!
 //! | Path | Rule | Template | What |
 //! |---|---|---|---|
 //! | `/` | public | `home` | the post listing, newest first |
 //! | `/posts/:slug` | public | `post` | a post; 404 (themed) when there is none |
 //! | `/about` | public | `page` | the `about` page from the manifest |
-//! | `/account` | signed in | `page` | guests are sent to `/sign-in` (303) |
-//! | `/sign-in` | public | `page` | a placeholder until sign-in exists (step 7) |
+//! | `/account` | `account.read` | `account` | who is signed in, and the sign-out button; guests are sent to `/sign-in` (303) |
+//! | `/sign-in` | public | `sign-in` | the sign-in form (`GET`); signs in (`POST`, the gatekeeper's own token) |
+//! | `/sign-out` | signed in | none | signs out (`POST`, the session-bound token), 303 to `/` |
 //! | `/health` | none | none | liveness, answered before the gate |
 //! | `/theme/...` | none | none | the theme's static files (the stylesheet) |
 //!
@@ -24,25 +26,59 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway_io::{WaspGate, Who};
+use gateway_io::gatekeeper::gatekeeper_io::{Gatekeeper, Login, LoginForm, Refusal, Rule};
+use gateway_io::gatekeeper::{GatekeeperGate, Session, cookie_lines, visit};
 use wasp_core::suite::config::Config;
-use wasp_core::{Access, PermSet, Rule};
-use web_net::{App, Assets, BuildError, Cx, Route, get};
+use web_net::form_net::{self, Secret};
+use web_net::{App, Assets, Cx, Route, get, post};
 
+use crate::auth::ACCOUNT_READ;
 use crate::content::{Kind, Manifest};
-use crate::theme::{Page, SiteEngine, SiteInfo};
-
-/// The permission the account page needs (any signed-in account holds it).
-pub const MEMBER: PermSet = PermSet(1);
+use crate::theme::{Form, Page, SiteEngine, SiteInfo};
 
 /// A handler's context on this site.
-pub type SiteCx<'a> = Cx<'a, Who, SiteEngine>;
+pub type SiteCx<'a> = Cx<'a, Session, SiteEngine>;
 
 /// The site's app type.
-pub type SiteApp = App<WaspGate, SiteEngine>;
+pub type SiteApp = App<GatekeeperGate, SiteEngine>;
 
 /// A route on this site.
-pub type SiteRoute = Route<Who, Rule, SiteEngine>;
+pub type SiteRoute = Route<Session, Rule, SiteEngine>;
+
+form_net::form! {
+    /// The sign-in form.
+    struct SignIn {
+        email: String,
+        password: Secret,
+        csrf: String,
+    }
+}
+
+form_net::form! {
+    /// The sign-out button.
+    struct SignOut {
+        csrf: String,
+    }
+}
+
+/// The handler error for a gate refusal: its status, a stable code.
+fn refused(r: &Refusal) -> web_net::Error {
+    web_net::Error::new(r.status(), "gate.refused")
+}
+
+/// `s` as a query value: everything but unreserved characters and `/`
+/// percent-encoded.
+fn query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
 
 /// Where the site lives and what it serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,13 +126,13 @@ impl SiteSettings {
     }
 }
 
-/// Builds the site over the core's access gate, rendering with `engine`.
+/// Builds the site behind `gatekeeper`, rendering with `engine`.
 pub fn build(
-    access: Access,
+    gatekeeper: Arc<Gatekeeper>,
     manifest: Manifest,
     engine: SiteEngine,
     settings: &SiteSettings,
-) -> Result<SiteApp, BuildError> {
+) -> Result<SiteApp, String> {
     let base = settings.base.trim_end_matches('/').to_owned();
     let site = Arc::new(SiteInfo {
         name: settings.name.clone(),
@@ -109,16 +145,20 @@ pub fn build(
     let page = {
         let site = site.clone();
         let manifest = manifest.clone();
-        move |title: &str, entry, message: &str| Page {
+        move |title: &str, entry, message: &str, form: Option<Form>| Page {
             site: site.clone(),
             title: title.to_owned(),
             entry,
             posts: manifest.posts(),
             message: message.to_owned(),
+            form: form.map(Arc::new),
         }
     };
+    let members = Rule::signed_in()
+        .needs(gatekeeper.schema(), &[ACCOUNT_READ])
+        .map_err(|e| format!("site rule: {e}"))?;
 
-    let mut builder = App::with(WaspGate::new(access), engine);
+    let mut builder = App::with(GatekeeperGate(gatekeeper.clone()), engine);
     if settings.hosts.is_empty() {
         builder = builder.development();
     }
@@ -135,7 +175,7 @@ pub fn build(
 
     let p = page.clone();
     let home: SiteRoute = get("/", move |cx: &mut SiteCx<'_>| {
-        cx.render(&p("Home", None, ""))
+        cx.render(&p("Home", None, "", None))
     })
     .public()
     .template("home")
@@ -143,12 +183,12 @@ pub fn build(
 
     let p = page.clone();
     let m = manifest.clone();
-    let post: SiteRoute = get("/posts/:slug", move |cx: &mut SiteCx<'_>| {
+    let post_page: SiteRoute = get("/posts/:slug", move |cx: &mut SiteCx<'_>| {
         let slug = cx.param("slug").map(|s| s.into_owned()).unwrap_or_default();
         let Some(entry) = m.get(Kind::Post, &slug) else {
             return Err(web_net::Error::not_found("post.unknown"));
         };
-        let view = p(&entry.title, Some(entry.clone()), "");
+        let view = p(&entry.title, Some(entry.clone()), "", None);
         cx.render(&view)
     })
     .public()
@@ -159,39 +199,154 @@ pub fn build(
     let m = manifest.clone();
     let about: SiteRoute = get("/about", move |cx: &mut SiteCx<'_>| {
         let entry = m.get(Kind::Page, "about");
-        cx.render(&p("About", entry, "Nothing here yet."))
+        cx.render(&p("About", entry, "Nothing here yet.", None))
     })
     .public()
     .template("page")
     .name("about");
 
     let p = page.clone();
+    let gk = gatekeeper.clone();
     let account: SiteRoute = get("/account", move |cx: &mut SiteCx<'_>| {
-        cx.render(&p("Account", None, "Signed in."))
+        let cleared = gk
+            .authorize(cx.identity().identified().clone(), &Rule::signed_in())
+            .map_err(|r| refused(&r))?;
+        let csrf = gk.csrf_token(&cleared).map_err(|r| refused(&r))?;
+        let user = cleared.user().map(|u| u.to_string()).unwrap_or_default();
+        let form = Form {
+            action: cx.url("/sign-out"),
+            csrf,
+            user,
+            ..Form::default()
+        };
+        cx.render(&p("Account", None, "", Some(form)))
     })
-    .allow(Rule::needs(2, MEMBER))
-    .template("page")
+    .allow(members)
+    .template("account")
     .name("account");
 
-    let p = page;
+    // The sign-in form: a token bound to the visitor's pre-session cookie.
+    let sign_in_form = {
+        let gk = gatekeeper.clone();
+        let p = page.clone();
+        move |cx: &mut SiteCx<'_>, error: &str, email: &str| -> web_net::Result {
+            let lines = cookie_lines(cx.request());
+            let v = visit(cx.request(), &lines);
+            let cleared = gk
+                .authorize(cx.identity().identified().clone(), &Rule::guest_only())
+                .map_err(|r| refused(&r))?;
+            let token = gk.login_form(&cleared, &v).map_err(|r| refused(&r))?;
+            let next = cx.next_path()?;
+            let mut action = cx.url("/sign-in");
+            if let Some(next) = next {
+                action.push_str("?next=");
+                action.push_str(&query_value(&cx.url(&next)));
+            }
+            if let Some(c) = token.set_cookie() {
+                cx.set_header("set-cookie", c);
+            }
+            let form = Form {
+                action,
+                csrf: token.token().to_owned(),
+                error: error.to_owned(),
+                email: email.to_owned(),
+                ..Form::default()
+            };
+            cx.render(&p("Sign in", None, "", Some(form)))
+        }
+    };
+
+    let show = sign_in_form.clone();
     let sign_in: SiteRoute = get("/sign-in", move |cx: &mut SiteCx<'_>| {
-        cx.render(&p(
-            "Sign in",
-            None,
-            "Sign-in arrives with the gates (step 7).",
-        ))
+        if !cx.identity().identified().is_guest() {
+            let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
+            return cx.see_other(&next);
+        }
+        show(cx, "", "")
     })
     .public()
-    .template("page")
+    .template("sign-in")
     .name("sign-in");
+
+    let show = sign_in_form;
+    let gk = gatekeeper.clone();
+    let sign_in_post: SiteRoute = post("/sign-in", move |cx: &mut SiteCx<'_>| {
+        let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
+        if !cx.identity().identified().is_guest() {
+            return cx.see_other(&next);
+        }
+        let form: SignIn = cx.form()?;
+        let lines = cookie_lines(cx.request());
+        let v = visit(cx.request(), &lines);
+        let cleared = gk
+            .authorize(cx.identity().identified().clone(), &Rule::guest_only())
+            .map_err(|r| refused(&r))?;
+        // Argon2id runs here, on this worker (see the step 7 limits).
+        let login = gk.login(
+            &cleared,
+            &v,
+            LoginForm {
+                identifier: &form.email,
+                password: form.password.expose(),
+                csrf: form.csrf.as_bytes(),
+            },
+        );
+        match login {
+            Login::SignedIn(signed_in) => {
+                for c in signed_in.set_cookies() {
+                    cx.set_header("set-cookie", c);
+                }
+                cx.see_other(&next)
+            }
+            Login::SecondFactor(_) => {
+                cx.status(501);
+                show(
+                    cx,
+                    "This account asks for a second factor, which this site does not offer yet.",
+                    &form.email,
+                )
+            }
+            Login::Failed(failed) => {
+                cx.status(401);
+                show(cx, failed.message(), &form.email)
+            }
+        }
+    })
+    .public()
+    .csrf_exempt("the gatekeeper checks its sign-in token and the origin itself")
+    .template("sign-in")
+    .name("sign-in-post");
+
+    let gk = gatekeeper;
+    let sign_out: SiteRoute = post("/sign-out", move |cx: &mut SiteCx<'_>| {
+        let form: SignOut = cx.form()?;
+        let lines = cookie_lines(cx.request());
+        let v = visit(cx.request(), &lines);
+        let cleared = gk
+            .authorize(cx.identity().identified().clone(), &Rule::signed_in())
+            .map_err(|r| refused(&r))?;
+        let out = gk
+            .logout(cleared, &v, form.csrf.as_bytes())
+            .map_err(|r| refused(&r))?;
+        if let Some(c) = out.set_cookie() {
+            cx.set_header("set-cookie", c);
+        }
+        cx.see_other("/")
+    })
+    .allow(Rule::signed_in())
+    .csrf_exempt("the gatekeeper checks the session-bound token and the origin itself")
+    .name("sign-out");
 
     builder
         .sign_in("/sign-in")
         .health("/health")
         .route(home)
-        .route(post)
+        .route(post_page)
         .route(about)
         .route(account)
         .route(sign_in)
+        .route(sign_in_post)
+        .route(sign_out)
         .build()
+        .map_err(|e| format!("site: {e}"))
 }

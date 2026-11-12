@@ -99,6 +99,15 @@ impl Handoff {
         self.p.trip()
     }
 
+    /// A `Set-Cookie` value authentication asked the response to carry (a
+    /// dead session's cookie cleared). The caller writes it before the
+    /// service's own fields, so a cookie of the same name the service sets
+    /// (a new session) comes later and wins.
+    #[must_use]
+    pub fn auth_cookie(&self) -> Option<&[u8]> {
+        self.p.auth_cookie()
+    }
+
     /// The service answered on the protocol's own reply: the passport goes to
     /// the response pipeline with no reply of its own (its authentication
     /// cookie still rides on the response).

@@ -240,6 +240,12 @@ impl Passport<Identified> {
         self.slot.gate_token.as_deref()?.downcast_ref::<T>()
     }
 
+    /// A `Set-Cookie` value authentication asked the response to carry.
+    #[must_use]
+    pub fn auth_cookie(&self) -> Option<&[u8]> {
+        (!self.slot.auth_cookie.is_empty()).then_some(&self.slot.auth_cookie[..])
+    }
+
     /// The token as kept, whatever its type.
     #[must_use]
     pub fn token_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {

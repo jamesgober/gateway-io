@@ -8,13 +8,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gateway_io::{Door, Gateway, Settings, WaspGate, WebServices};
-use wasp::site::{SiteCx, SiteRoute};
 use wasp::theme::{self, Page, SiteInfo};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
 use wasp_core::suite::{Member, System};
 use wasp_core::{Core, CoreSubsystem};
 use web_net::{App, get};
+
+/// A page on a site behind the core's own access gate.
+type SiteCx<'a> = web_net::Cx<'a, gateway_io::Who, theme::SiteEngine>;
+type SiteRoute = web_net::Route<gateway_io::Who, wasp_core::Rule, theme::SiteEngine>;
 
 fn default_theme() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default")
@@ -213,6 +216,7 @@ fn error_pages_for_404_405_and_500() {
             entry: None,
             posts: Arc::new(Vec::new()),
             message: "fine".into(),
+            form: None,
         })
     })
     .public()

@@ -1,0 +1,13 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.title }}</h1>
+{% if page.form.error %}<p class="error" role="alert">{{ page.form.error }}</p>{% endif %}
+<form class="stack" method="post" action="{{ page.form.action }}">
+<input type="hidden" name="csrf" value="{{ page.form.csrf }}">
+<label>Email <input type="email" name="email" value="{{ page.form.email }}" autocomplete="username" required></label>
+<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+<button type="submit">Sign in</button>
+</form>
+</article>
+{% endblock %}

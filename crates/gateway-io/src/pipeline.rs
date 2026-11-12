@@ -208,6 +208,11 @@ impl Pipeline {
             Routed::Exit(exit) => Flow::Exit(exit),
             Routed::Handoff(h) => match self.web.get(h.service()) {
                 Some(web) => {
+                    // The gate's cookie first: a cookie of the same name the
+                    // service sets (a new session) comes later and wins.
+                    if let Some(cookie) = h.auth_cookie() {
+                        reply.header("set-cookie", cookie);
+                    }
                     let caller = Caller::new(h.identity(), h.token_any());
                     let outcome = web.respond(req, env, &caller, reply);
                     if let Some(m) = marks {
@@ -237,14 +242,12 @@ impl Pipeline {
         if close { Outcome::Close } else { Outcome::Done }
     }
 
-    /// The response pipeline for a web service's reply: the authentication
-    /// cookie, then the passport back to the pool. A revocation from here on
-    /// is serve-net's `BeforeReply` checkpoint, which replaces the reply whole.
+    /// The response pipeline for a web service's reply: the passport back to
+    /// the pool (the authentication cookie went on the reply before the
+    /// service ran). A revocation from here on is serve-net's `BeforeReply`
+    /// checkpoint, which replaces the reply whole.
     #[inline]
-    fn respond_web(&self, exit: Exit, outcome: Outcome, reply: &mut HttpReply) -> Outcome {
-        if let Some(cookie) = exit.auth_cookie() {
-            reply.header("set-cookie", cookie);
-        }
+    fn respond_web(&self, exit: Exit, outcome: Outcome) -> Outcome {
         self.pool.give_back(exit);
         outcome
     }
@@ -302,7 +305,7 @@ impl HttpService for Pipeline {
         let mut marks = self.stages.enabled().then(Stamps::start);
         let outcome = match self.request(req, env, tag, reply, &mut marks) {
             Flow::Exit(exit) => self.respond(exit, tag, reply),
-            Flow::Web(exit, outcome) => self.respond_web(exit, outcome, reply),
+            Flow::Web(exit, outcome) => self.respond_web(exit, outcome),
             Flow::NoPassport => {
                 reply
                     .text(503, wasp_core::refusal_text(503))
