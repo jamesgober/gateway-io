@@ -59,7 +59,9 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
 ///
 /// Providers: the content store (`[content] store`: `memory`, the default,
 /// or `bison`, a bison-db file at `[content] path`, default
-/// `<data_dir>/content.bison`), owned by the core and flushed at shutdown.
+/// `<data_dir>/content.bison`, only with the `bison` feature, held back until
+/// bison-db's review fixes are released), owned by the core and flushed at
+/// shutdown.
 /// Jobs: an in-process runner (`[jobs] threads`, default 2; `[jobs] queue`,
 /// default 1024).
 ///
@@ -80,11 +82,17 @@ fn wire_with(
         .map_err(e)?;
     let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
         "memory" => Arc::new(content::MemoryStore::new()),
+        #[cfg(feature = "bison")]
         "bison" => {
             let path: std::path::PathBuf = config
                 .get_or("content.path", data_dir.join("content.bison"))
                 .map_err(e)?;
             Arc::new(content::BisonStore::open(&path).map_err(|e| e.0)?)
+        }
+        #[cfg(not(feature = "bison"))]
+        "bison" => {
+            let _ = data_dir;
+            return Err("content.store = \"bison\" is held back until bison-db's review fixes are released (feature `bison`)".to_owned());
         }
         other => {
             return Err(format!(

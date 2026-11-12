@@ -51,7 +51,7 @@ curl -i http://127.0.0.1:8080/posts/hello-world
 curl -i http://127.0.0.1:8080/account
 ```
 
-The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory; a durable store plugs in behind the same trait), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
 
 ```text
 themes/default/pages/    base, home, post, page, sign-in, account   (view: page)
@@ -81,7 +81,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
 | `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
-| `content.store` | `memory` | where content is kept: `memory` (lost at exit) or `bison` (a bison-db file); an empty store is given the sample content |
+| `content.store` | `memory` | where content is kept: `memory` (lost at exit) or `bison` (a bison-db file, only in a build with the `bison` feature: held back until bison-db's review fixes are released); an empty store is given the sample content |
 | `content.path` | `<data folder>/content.bison` | the bison-db file, with `content.store = "bison"` |
 | `auth.admin` | none | an account made at boot; its password from `WASP_ADMIN_PASSWORD` |
 | `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |

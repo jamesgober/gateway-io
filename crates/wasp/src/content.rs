@@ -8,10 +8,8 @@
 //! `Arc<Vec<Arc<Entry>>>`, so rendering a page copies no content.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
-use bison_db::{Db, DbOptions, Document, SyncPolicy, Value};
 use wasp_core::{Provider, ProviderError};
 
 /// What kind of entry: it picks the default template.
@@ -187,140 +185,156 @@ impl ContentStore for MemoryStore {
     }
 }
 
-/// Content in a bison-db file: one document per entry, keyed by slug. Every
-/// write is synced to disk (content is written rarely and must survive a
-/// crash); the slug index is declared at open (bison-db keeps indexes in
-/// memory).
-pub struct BisonStore {
-    db: RwLock<Db>,
-    path: PathBuf,
-}
+#[cfg(feature = "bison")]
+pub use crate::content::bison_store::BisonStore;
 
-const FIELDS: [&str; 6] = ["kind", "slug", "title", "summary", "body", "date"];
+/// The bison-db store (feature `bison`, off by default): held back until
+/// bison-db's review fixes are released.
+#[cfg(feature = "bison")]
+mod bison_store {
+    use std::path::{Path, PathBuf};
+    use std::sync::RwLock;
 
-fn bison(e: bison_db::Error) -> StoreError {
-    StoreError(format!("content store: {e}"))
-}
+    use bison_db::{Db, DbOptions, Document, SyncPolicy, Value};
+    use wasp_core::{Provider, ProviderError};
 
-impl BisonStore {
-    /// Opens (or creates) the store at `path`, creating its folder.
-    pub fn open(path: impl AsRef<Path>) -> Result<BisonStore, StoreError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| StoreError(format!("content store {}: {e}", dir.display())))?;
-        }
-        let mut db = DbOptions::new()
-            .sync(SyncPolicy::Always)
-            .open(&path)
-            .map_err(bison)?;
-        db.create_index("slug").map_err(bison)?;
-        Ok(BisonStore {
-            db: RwLock::new(db),
-            path,
-        })
+    use super::{ContentStore, StoreError, Stored};
+
+    /// Content in a bison-db file: one document per entry, keyed by slug. Every
+    /// write is synced to disk (content is written rarely and must survive a
+    /// crash); the slug index is declared at open (bison-db keeps indexes in
+    /// memory).
+    pub struct BisonStore {
+        db: RwLock<Db>,
+        path: PathBuf,
     }
 
-    /// The store's file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
+    const FIELDS: [&str; 6] = ["kind", "slug", "title", "summary", "body", "date"];
 
-impl std::fmt::Debug for BisonStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BisonStore")
-            .field("path", &self.path)
-            .finish()
-    }
-}
-
-impl Provider for BisonStore {
-    fn name(&self) -> &str {
-        "content-bison"
-    }
-    fn flush(&self) -> Result<(), ProviderError> {
-        let mut db = self
-            .db
-            .write()
-            .map_err(|_| ProviderError("content store lock poisoned".into()))?;
-        db.flush()
-            .map_err(|e| ProviderError(format!("content store: {e}")))
-    }
-}
-
-impl ContentStore for BisonStore {
-    fn load(&self) -> Result<Vec<Stored>, StoreError> {
-        let db = self
-            .db
-            .read()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
-        let mut out = Vec::with_capacity(db.len());
-        for id in db.ids() {
-            let Some(doc) = db.get(id).map_err(bison)? else {
-                continue;
-            };
-            let text = |name: &str| {
-                doc.get(name)
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned()
-            };
-            out.push(Stored {
-                kind: text("kind"),
-                slug: text("slug"),
-                title: text("title"),
-                summary: text("summary"),
-                body: text("body"),
-                date: text("date"),
-            });
-        }
-        Ok(out)
+    fn bison(e: bison_db::Error) -> StoreError {
+        StoreError(format!("content store: {e}"))
     }
 
-    fn put(&self, entry: &Stored) -> Result<(), StoreError> {
-        let mut doc = Document::new();
-        let values = [
-            &entry.kind,
-            &entry.slug,
-            &entry.title,
-            &entry.summary,
-            &entry.body,
-            &entry.date,
-        ];
-        for (name, value) in FIELDS.iter().zip(values) {
-            doc.set(*name, value.as_str());
-        }
-        let mut db = self
-            .db
-            .write()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
-        let existing = db
-            .find("slug", &Value::from(entry.slug.as_str()))
-            .map_err(bison)?;
-        match existing.first() {
-            Some(id) => {
-                db.update(*id, doc).map_err(bison)?;
+    impl BisonStore {
+        /// Opens (or creates) the store at `path`, creating its folder.
+        pub fn open(path: impl AsRef<Path>) -> Result<BisonStore, StoreError> {
+            let path = path.as_ref().to_path_buf();
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| StoreError(format!("content store {}: {e}", dir.display())))?;
             }
-            None => {
-                db.insert(doc).map_err(bison)?;
-            }
+            let mut db = DbOptions::new()
+                .sync(SyncPolicy::Always)
+                .open(&path)
+                .map_err(bison)?;
+            db.create_index("slug").map_err(bison)?;
+            Ok(BisonStore {
+                db: RwLock::new(db),
+                path,
+            })
         }
-        Ok(())
+
+        /// The store's file.
+        #[must_use]
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
     }
 
-    fn remove(&self, slug: &str) -> Result<bool, StoreError> {
-        let mut db = self
-            .db
-            .write()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
-        let ids = db.find("slug", &Value::from(slug)).map_err(bison)?;
-        let mut any = false;
-        for id in ids {
-            any |= db.delete(id).map_err(bison)?;
+    impl std::fmt::Debug for BisonStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BisonStore")
+                .field("path", &self.path)
+                .finish()
         }
-        Ok(any)
+    }
+
+    impl Provider for BisonStore {
+        fn name(&self) -> &str {
+            "content-bison"
+        }
+        fn flush(&self) -> Result<(), ProviderError> {
+            let mut db = self
+                .db
+                .write()
+                .map_err(|_| ProviderError("content store lock poisoned".into()))?;
+            db.flush()
+                .map_err(|e| ProviderError(format!("content store: {e}")))
+        }
+    }
+
+    impl ContentStore for BisonStore {
+        fn load(&self) -> Result<Vec<Stored>, StoreError> {
+            let db = self
+                .db
+                .read()
+                .map_err(|_| StoreError("store lock poisoned".into()))?;
+            let mut out = Vec::with_capacity(db.len());
+            for id in db.ids() {
+                let Some(doc) = db.get(id).map_err(bison)? else {
+                    continue;
+                };
+                let text = |name: &str| {
+                    doc.get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                out.push(Stored {
+                    kind: text("kind"),
+                    slug: text("slug"),
+                    title: text("title"),
+                    summary: text("summary"),
+                    body: text("body"),
+                    date: text("date"),
+                });
+            }
+            Ok(out)
+        }
+
+        fn put(&self, entry: &Stored) -> Result<(), StoreError> {
+            let mut doc = Document::new();
+            let values = [
+                &entry.kind,
+                &entry.slug,
+                &entry.title,
+                &entry.summary,
+                &entry.body,
+                &entry.date,
+            ];
+            for (name, value) in FIELDS.iter().zip(values) {
+                doc.set(*name, value.as_str());
+            }
+            let mut db = self
+                .db
+                .write()
+                .map_err(|_| StoreError("store lock poisoned".into()))?;
+            let existing = db
+                .find("slug", &Value::from(entry.slug.as_str()))
+                .map_err(bison)?;
+            match existing.first() {
+                Some(id) => {
+                    db.update(*id, doc).map_err(bison)?;
+                }
+                None => {
+                    db.insert(doc).map_err(bison)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn remove(&self, slug: &str) -> Result<bool, StoreError> {
+            let mut db = self
+                .db
+                .write()
+                .map_err(|_| StoreError("store lock poisoned".into()))?;
+            let ids = db.find("slug", &Value::from(slug)).map_err(bison)?;
+            let mut any = false;
+            for id in ids {
+                any |= db.delete(id).map_err(bison)?;
+            }
+            Ok(any)
+        }
     }
 }
 
@@ -600,6 +614,7 @@ mod tests {
         assert!(m.get(Kind::Post, "about").is_none(), "a page is not a post");
     }
 
+    #[cfg(feature = "bison")]
     #[test]
     fn content_survives_a_restart_in_bison_db() {
         let dir = std::env::temp_dir().join(format!("wasp-content-{}", std::process::id()));

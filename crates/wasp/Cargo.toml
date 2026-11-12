@@ -22,7 +22,13 @@ web-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
 luminess = { workspace = true }
 # The first durable content store (embedded, first-party).
-bison-db = { workspace = true }
+bison-db = { workspace = true, optional = true }
+
+[features]
+default = []
+# The bison-db content store: held back until bison-db's review fixes are
+# released.
+bison = ["dep:bison-db"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
