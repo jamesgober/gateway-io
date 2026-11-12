@@ -440,3 +440,26 @@ fn the_blocking_driver_serves_every_connection_it_admits() {
     drop(conns);
     let _ = door.close(Duration::from_secs(2));
 }
+
+#[test]
+fn a_closed_door_lets_go_of_the_core() {
+    // The bouncer's ejector held the transport, whose service held the core:
+    // nothing was ever freed, and a store's file lock stayed taken.
+    let core = core();
+    let weak = Arc::downgrade(&core);
+    let door = Door::open(
+        core,
+        &settings(1, 4),
+        UrgentLine::detached(),
+        gateway_io::WebServices::new(),
+    )
+    .expect("opens");
+    let addr = door.local_addr().expect("addr");
+    assert_eq!(get(addr, "/").map(|g| g.status), Some(200));
+    let _ = door.close(Duration::from_secs(2));
+    let until = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(weak.upgrade().is_none(), "the core is freed after close");
+}

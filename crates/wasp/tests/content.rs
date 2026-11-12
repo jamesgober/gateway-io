@@ -1,6 +1,7 @@
 //! The content store through the process's own wiring: the core owns the
-//! store and the job runner; with the `bison` feature, what is stored in
-//! bison-db is served after a restart.
+//! store and the job runner; what is stored in bison-db is served after a
+//! restart, one process holds the file, and a damaged file is refused until
+//! the operator asks for a salvage.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,18 +32,19 @@ fn forward(p: &std::path::Path) -> String {
 }
 
 fn config(store: &str, data: &std::path::Path) -> Config {
+    Config::from_text(&config_text(store, data)).expect("config")
+}
+
+fn config_text(store: &str, data: &std::path::Path) -> String {
     let theme = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
-    Config::from_text(&format!(
+    format!(
         "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[content]\nstore = \"{store}\"\npath = \"{}\"\n",
         forward(&theme),
         forward(&data.join("content.bison"))
-    ))
-    .expect("config")
+    )
 }
 
-/// The bison-db store (feature `bison`, held back until its review fixes
-/// are released).
-#[cfg(feature = "bison")]
+/// The bison-db store through the wiring.
 mod bison {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -53,7 +55,7 @@ mod bison {
     use wasp_core::suite::config::Config;
     use wasp_core::suite::kernel::UrgentLine;
 
-    use super::{config, temp_dir};
+    use super::{config, config_text, temp_dir};
 
     fn open(config: &Config) -> (Door, SocketAddr) {
         let wiring = wasp::wire(config).expect("wiring");
@@ -100,7 +102,7 @@ mod bison {
 
         // Between runs, something else writes to the store (later: the editor).
         {
-            let store = BisonStore::open(dir.0.join("content.bison")).expect("reopen");
+            let store = reopen(&dir.0.join("content.bison"));
             assert_eq!(store.load().expect("load").len(), 4, "seeded once");
             store
                 .put(&Stored {
@@ -121,8 +123,85 @@ mod bison {
         assert!(body.contains("Kept across a restart"), "{body}");
         assert!(body.contains("<p>Still here.</p>"), "{body}");
         door.close(Duration::from_secs(5));
-        let store = BisonStore::open(dir.0.join("content.bison")).expect("reopen");
+        let store = reopen(&dir.0.join("content.bison"));
         assert_eq!(store.load().expect("load").len(), 5);
+    }
+
+    /// Opens the store a closed door held: the transport's threads let go
+    /// of it a moment after the door closed (a process exit is immediate).
+    fn reopen(path: &std::path::Path) -> BisonStore {
+        let t = std::time::Instant::now();
+        loop {
+            match BisonStore::open(path) {
+                Ok(s) => return s,
+                Err(_) if t.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("reopen: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_instance_on_the_same_store_is_refused() {
+        let dir = temp_dir("content-second");
+        let conf = config("bison", &dir.0);
+        let first = wasp::wire(&conf).expect("the first instance");
+        let err = wasp::wire(&conf).expect_err("the second instance");
+        assert!(err.contains("another instance"), "{err}");
+        drop(first);
+        wasp::wire(&conf).expect("free again once the first is gone");
+    }
+
+    #[test]
+    fn a_damaged_store_is_refused_then_salvaged_on_request() {
+        let dir = temp_dir("content-damaged");
+        let path = dir.0.join("content.bison");
+        {
+            let store = BisonStore::open(&path).expect("open");
+            for i in 0..8 {
+                store
+                    .put(&Stored {
+                        kind: "post".into(),
+                        slug: format!("p{i}"),
+                        title: format!("Post {i}"),
+                        summary: String::new(),
+                        body: "x".repeat(200),
+                        date: "2026-11-12".into(),
+                    })
+                    .expect("put");
+            }
+        }
+        // One flipped byte in an early record: damage before the end.
+        let mut bytes = std::fs::read(&path).expect("read");
+        let at = bytes.len() / 4;
+        bytes[at] ^= 0x5a;
+        std::fs::write(&path, &bytes).expect("write");
+
+        let err = wasp::wire(&config("bison", &dir.0)).expect_err("strict refuses");
+        assert!(err.contains("salvage"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            bytes,
+            "nothing changed"
+        );
+
+        let salvage = Config::from_text(
+            &config_text("bison", &dir.0)
+                .replace("[content]\n", "[content]\nrecovery = \"salvage\"\n"),
+        )
+        .expect("config");
+        let wiring = wasp::wire(&salvage).expect("salvaged");
+        assert!(
+            wiring.notices.iter().any(|n| n.contains("discarded")),
+            "{:?}",
+            wiring.notices
+        );
+        let damaged = std::fs::read_dir(&dir.0)
+            .expect("dir")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".damaged"));
+        assert!(damaged, "a copy of the damaged file is kept");
     }
 }
 
@@ -164,12 +243,4 @@ theme_poll = \"0s\"
     assert_eq!(names, ["content-memory"]);
     let err = wasp::wire(&config("disk", &dir.0)).expect_err("refused");
     assert!(err.contains("content.store"), "{err}");
-}
-
-#[cfg(not(feature = "bison"))]
-#[test]
-fn the_bison_store_is_held_back() {
-    let dir = temp_dir("content-held");
-    let err = wasp::wire(&config("bison", &dir.0)).expect_err("refused");
-    assert!(err.contains("held back"), "{err}");
 }

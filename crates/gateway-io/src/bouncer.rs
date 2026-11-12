@@ -2,13 +2,14 @@
 //! checkpoint between stages, and the egress check before every write.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bouncer_io::{
-    Actor, AllowList, BanSpec, Bouncer, BouncerError, Cidr, EventSink, LiftSpec, NetIoEjector,
-    Reason, TicketTag,
+    Actor, AllowList, BanSpec, Bouncer, BouncerError, Cidr, CloseKind, ConnId, EJECTED, Ejector,
+    EventSink, LiftSpec, Reason, TicketTag,
 };
+use net_io::{ConnectionId, ServerHandle};
 use serve_net::{Checkpoint, CheckpointAt, Envelope, Verdict};
 
 use crate::settings::Settings;
@@ -53,14 +54,59 @@ pub fn lift(bouncer: &Bouncer, addr: IpAddr) -> Result<(), BouncerError> {
     }
 }
 
+/// Closes connections the bouncer ejects, on the transport it is attached
+/// to. Unlike bouncer-io's own ejector it can be detached: the bouncer holds
+/// the ejector, the transport's service holds the bouncer, so an attached
+/// handle would keep the transport (and the core, and its stores) alive
+/// after the door closed. The door detaches it when it closes.
+#[derive(Default)]
+pub struct DoorEjector {
+    server: Mutex<Option<ServerHandle>>,
+}
+
+impl DoorEjector {
+    /// Attaches the transport.
+    pub fn attach(&self, server: ServerHandle) {
+        if let Ok(mut s) = self.server.lock() {
+            *s = Some(server);
+        }
+    }
+
+    /// Detaches it: later ejections do nothing.
+    pub fn detach(&self) {
+        if let Ok(mut s) = self.server.lock() {
+            s.take();
+        }
+    }
+}
+
+impl Ejector for DoorEjector {
+    fn eject(&self, conn: ConnId, _kind: CloseKind) {
+        if let (Ok(server), Some(id)) = (self.server.lock(), ConnectionId::new(conn.0))
+            && let Some(server) = server.as_ref()
+        {
+            let _ = server.kill(id, EJECTED);
+        }
+    }
+}
+
+impl std::fmt::Debug for DoorEjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let attached = self.server.lock().map(|s| s.is_some()).unwrap_or(false);
+        f.debug_struct("DoorEjector")
+            .field("attached", &attached)
+            .finish()
+    }
+}
+
 /// Builds the process's bouncer from the settings: bans from configuration,
 /// the exempt list, a maintainer thread, an ejector the gateway attaches to
 /// the transport once it is bound, and the event sink (the log).
 pub fn build(
     settings: &Settings,
     events: Option<Arc<dyn EventSink>>,
-) -> Result<(Bouncer, Arc<NetIoEjector>), BouncerError> {
-    let ejector = Arc::new(NetIoEjector::new());
+) -> Result<(Bouncer, Arc<DoorEjector>), BouncerError> {
+    let ejector = Arc::new(DoorEjector::default());
     let mut builder = Bouncer::builder().maintainer(true).ejector(ejector.clone());
     if !settings.exempt.is_empty() {
         builder = builder.allow(allow_list(&settings.exempt)?);

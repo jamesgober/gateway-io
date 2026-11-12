@@ -185,17 +185,15 @@ impl ContentStore for MemoryStore {
     }
 }
 
-#[cfg(feature = "bison")]
-pub use crate::content::bison_store::BisonStore;
+pub use crate::content::bison_store::{BisonStore, Recovery};
 
-/// The bison-db store (feature `bison`, off by default): held back until
-/// bison-db's review fixes are released.
-#[cfg(feature = "bison")]
+/// The bison-db store.
 mod bison_store {
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use bison_db::{Db, DbOptions, Document, SyncPolicy, Value};
+    use bison_db::{Db, DbOptions, Document, RecoveryMode, SyncPolicy, Value};
     use wasp_core::{Provider, ProviderError};
 
     use super::{ContentStore, StoreError, Stored};
@@ -204,9 +202,31 @@ mod bison_store {
     /// write is synced to disk (content is written rarely and must survive a
     /// crash); the slug index is declared at open (bison-db keeps indexes in
     /// memory).
+    ///
+    /// One process holds the file: a second open (another instance on the
+    /// same data folder) is refused at boot. A file damaged anywhere but a
+    /// torn last record is refused too, and left as it was; the operator
+    /// backs it up and starts once with `content.recovery = "salvage"`,
+    /// which keeps every record that still verifies (bison-db saves the
+    /// damaged file beside it as `<path>.damaged` first).
     pub struct BisonStore {
         db: RwLock<Db>,
         path: PathBuf,
+        discarded: u64,
+        /// A write failed: bison-db refuses writes until the store is
+        /// reopened, so the provider reports itself unhealthy.
+        failed: AtomicBool,
+    }
+
+    /// How a damaged store file is opened.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Recovery {
+        /// Refuse a file damaged before its end (the default).
+        #[default]
+        Strict,
+        /// Keep every record that still verifies; the damaged file is copied
+        /// beside the store first.
+        Salvage,
     }
 
     const FIELDS: [&str; 6] = ["kind", "slug", "title", "summary", "body", "date"];
@@ -218,20 +238,59 @@ mod bison_store {
     impl BisonStore {
         /// Opens (or creates) the store at `path`, creating its folder.
         pub fn open(path: impl AsRef<Path>) -> Result<BisonStore, StoreError> {
+            BisonStore::open_with(path, Recovery::Strict)
+        }
+
+        /// [`open`](Self::open), with the recovery mode for a damaged file.
+        pub fn open_with(
+            path: impl AsRef<Path>,
+            recovery: Recovery,
+        ) -> Result<BisonStore, StoreError> {
             let path = path.as_ref().to_path_buf();
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir)
                     .map_err(|e| StoreError(format!("content store {}: {e}", dir.display())))?;
             }
+            let shown = path.display().to_string();
             let mut db = DbOptions::new()
                 .sync(SyncPolicy::Always)
+                .recovery(match recovery {
+                    Recovery::Strict => RecoveryMode::Strict,
+                    Recovery::Salvage => RecoveryMode::Salvage,
+                })
                 .open(&path)
-                .map_err(bison)?;
+                .map_err(|e| match e {
+                    bison_db::Error::Locked => StoreError(format!(
+                        "content store {shown} is open in another process: is another instance running on this data folder?"
+                    )),
+                    bison_db::Error::Corrupt(what) => StoreError(format!(
+                        "content store {shown} is damaged before its end ({what}); nothing was changed. Back the file up, then start once with content.recovery = \"salvage\" to keep every record that still verifies"
+                    )),
+                    other => StoreError(format!("content store {shown}: {other}")),
+                })?;
             db.create_index("slug").map_err(bison)?;
+            let discarded = db.discarded_bytes();
             Ok(BisonStore {
                 db: RwLock::new(db),
                 path,
+                discarded,
+                failed: AtomicBool::new(false),
             })
+        }
+
+        /// Bytes the open removed: a torn last record after a crash, or the
+        /// damaged regions a salvage skipped. Logged at boot when not zero.
+        #[must_use]
+        pub fn discarded(&self) -> u64 {
+            self.discarded
+        }
+
+        /// Notes a failed write: the provider is unhealthy until reopened.
+        fn failing<T>(&self, r: Result<T, StoreError>) -> Result<T, StoreError> {
+            if r.is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
+            r
         }
 
         /// The store's file.
@@ -252,6 +311,9 @@ mod bison_store {
     impl Provider for BisonStore {
         fn name(&self) -> &str {
             "content-bison"
+        }
+        fn healthy(&self) -> bool {
+            !self.failed.load(Ordering::Acquire)
         }
         fn flush(&self) -> Result<(), ProviderError> {
             let mut db = self
@@ -305,35 +367,39 @@ mod bison_store {
             for (name, value) in FIELDS.iter().zip(values) {
                 doc.set(*name, value.as_str());
             }
-            let mut db = self
-                .db
-                .write()
-                .map_err(|_| StoreError("store lock poisoned".into()))?;
-            let existing = db
-                .find("slug", &Value::from(entry.slug.as_str()))
-                .map_err(bison)?;
-            match existing.first() {
-                Some(id) => {
-                    db.update(*id, doc).map_err(bison)?;
+            self.failing((|| {
+                let mut db = self
+                    .db
+                    .write()
+                    .map_err(|_| StoreError("store lock poisoned".into()))?;
+                let existing = db
+                    .find("slug", &Value::from(entry.slug.as_str()))
+                    .map_err(bison)?;
+                match existing.first() {
+                    Some(id) => {
+                        db.update(*id, doc).map_err(bison)?;
+                    }
+                    None => {
+                        db.insert(doc).map_err(bison)?;
+                    }
                 }
-                None => {
-                    db.insert(doc).map_err(bison)?;
-                }
-            }
-            Ok(())
+                Ok(())
+            })())
         }
 
         fn remove(&self, slug: &str) -> Result<bool, StoreError> {
-            let mut db = self
-                .db
-                .write()
-                .map_err(|_| StoreError("store lock poisoned".into()))?;
-            let ids = db.find("slug", &Value::from(slug)).map_err(bison)?;
-            let mut any = false;
-            for id in ids {
-                any |= db.delete(id).map_err(bison)?;
-            }
-            Ok(any)
+            self.failing((|| {
+                let mut db = self
+                    .db
+                    .write()
+                    .map_err(|_| StoreError("store lock poisoned".into()))?;
+                let ids = db.find("slug", &Value::from(slug)).map_err(bison)?;
+                let mut any = false;
+                for id in ids {
+                    any |= db.delete(id).map_err(bison)?;
+                }
+                Ok(any)
+            })())
         }
     }
 }
@@ -614,7 +680,6 @@ mod tests {
         assert!(m.get(Kind::Post, "about").is_none(), "a page is not a post");
     }
 
-    #[cfg(feature = "bison")]
     #[test]
     fn content_survives_a_restart_in_bison_db() {
         let dir = std::env::temp_dir().join(format!("wasp-content-{}", std::process::id()));

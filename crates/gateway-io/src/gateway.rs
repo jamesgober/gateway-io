@@ -60,6 +60,7 @@ pub struct Door {
     pool: Arc<PassportPool>,
     bouncer: Bouncer,
     time: Arc<ServerTime>,
+    ejector: Arc<bouncer::DoorEjector>,
 }
 
 impl Door {
@@ -179,6 +180,7 @@ impl Door {
             pool,
             bouncer,
             time,
+            ejector,
         })
     }
 
@@ -228,6 +230,10 @@ impl Door {
     /// until `deadline`; whatever is left is closed.
     pub fn close(self, deadline: Duration) -> DrainReport {
         self.running.close_door();
+        // The bouncer's ejector holds the transport; detached here, nothing
+        // keeps the transport (and the core and its stores) alive once the
+        // drain ends.
+        self.ejector.detach();
         self.running.drain(deadline)
     }
 }

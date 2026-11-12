@@ -38,6 +38,13 @@ fn main() -> ExitCode {
             return ExitCode::from(78);
         }
     };
+    for notice in &wiring.notices {
+        log::warn!(
+            boot.foundation().log(),
+            "boot notice",
+            notice = notice.as_str()
+        );
+    }
     if let Err(error) = boot.start(CoreSubsystem::new(wiring.core.clone())) {
         return error.report();
     }

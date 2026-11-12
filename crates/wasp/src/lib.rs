@@ -28,6 +28,9 @@ pub struct Wiring {
     /// Stage timing (`gateway.stage_timing`), shared by the gateway and the
     /// render engine.
     pub stages: Arc<gateway_io::StageTimes>,
+    /// Things the operator should know about the boot (written to the log
+    /// as warnings).
+    pub notices: Vec<String>,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -59,8 +62,8 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
 ///
 /// Providers: the content store (`[content] store`: `memory`, the default,
 /// or `bison`, a bison-db file at `[content] path`, default
-/// `<data_dir>/content.bison`, only with the `bison` feature, held back until
-/// bison-db's review fixes are released), owned by the core and flushed at
+/// `<data_dir>/content.bison`; one process at a time; `[content] recovery =
+/// "salvage"` opens a damaged file), owned by the core and flushed at
 /// shutdown.
 /// Jobs: an in-process runner (`[jobs] threads`, default 2; `[jobs] queue`,
 /// default 1024).
@@ -77,22 +80,37 @@ fn wire_with(
     admin_password: Option<&str>,
 ) -> Result<Wiring, String> {
     let e = |e: wasp_core::suite::Error| e.to_string();
+    let mut notices = Vec::new();
     let store_kind: String = config
         .get_or("content.store", "memory".to_owned())
         .map_err(e)?;
     let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
         "memory" => Arc::new(content::MemoryStore::new()),
-        #[cfg(feature = "bison")]
         "bison" => {
             let path: std::path::PathBuf = config
                 .get_or("content.path", data_dir.join("content.bison"))
                 .map_err(e)?;
-            Arc::new(content::BisonStore::open(&path).map_err(|e| e.0)?)
-        }
-        #[cfg(not(feature = "bison"))]
-        "bison" => {
-            let _ = data_dir;
-            return Err("content.store = \"bison\" is held back until bison-db's review fixes are released (feature `bison`)".to_owned());
+            let recovery: String = config
+                .get_or("content.recovery", "strict".to_owned())
+                .map_err(e)?;
+            let recovery = match recovery.as_str() {
+                "strict" => content::Recovery::Strict,
+                "salvage" => content::Recovery::Salvage,
+                other => {
+                    return Err(format!(
+                        "content.recovery must be `strict` or `salvage`, not `{other}`"
+                    ));
+                }
+            };
+            let store = content::BisonStore::open_with(&path, recovery).map_err(|e| e.0)?;
+            if store.discarded() > 0 {
+                notices.push(format!(
+                    "content store {}: {} bytes discarded at open (a torn last record, or what a salvage skipped); check the content",
+                    path.display(),
+                    store.discarded()
+                ));
+            }
+            Arc::new(store)
         }
         other => {
             return Err(format!(
@@ -169,5 +187,6 @@ fn wire_with(
         gatekeeper,
         theme: watcher,
         stages,
+        notices,
     })
 }

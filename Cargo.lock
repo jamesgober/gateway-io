@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "bison-db"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19755079572457ab4a296429fdda5343617727b3625f124d44792926fbb7b979"
+checksum = "c3ea7ef29e4d6e2ba718dae6011a8bc96b303ba9855874e76f5639872cfe95ac"
 
 [[package]]
 name = "bitflags"
