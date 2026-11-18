@@ -1,6 +1,9 @@
 //! Content import end to end: files into the bison store, then served by the
 //! site after a boot.
 
+// A site needs a sign-in store: the gatekeeper or nex-db.
+#![cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};

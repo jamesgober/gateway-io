@@ -1,6 +1,7 @@
 //! Step 7 end to end over loopback: the gatekeeper authenticates in the
 //! core, authorizes in the site, and signs in and out with its own CSRF
 //! tokens.
+#![cfg(feature = "gatekeeper")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -27,6 +28,8 @@ fn open() -> (Door, SocketAddr) {
     let wiring = wasp::wire(&config).expect("wiring");
     wiring
         .gatekeeper
+        .as_ref()
+        .expect("the gatekeeper")
         .create_account(EMAIL, PASSWORD, Standing::Active, &["member"])
         .expect("account");
     let mut web = WebServices::new();
@@ -78,9 +81,9 @@ impl Got {
     fn csrf(&self) -> String {
         let at = self
             .body
-            .find("name=\"csrf\" value=\"")
+            .find("name=\"csrf_token\" value=\"")
             .expect("csrf field")
-            + 19;
+            + 25;
         let rest = &self.body[at..];
         rest[..rest.find('"').expect("end")].to_owned()
     }
@@ -153,7 +156,7 @@ fn encode(s: &str) -> String {
 
 fn sign_in_body(email: &str, password: &str, csrf: &str) -> String {
     format!(
-        "email={}&password={}&csrf={}",
+        "email={}&password={}&csrf_token={}",
         encode(email),
         encode(password),
         encode(csrf)
@@ -234,7 +237,7 @@ fn sign_in_account_and_sign_out() {
         "/sign-out",
         &[&sid],
         "cross-site",
-        &format!("csrf={}", encode(&csrf)),
+        &format!("csrf_token={}", encode(&csrf)),
     );
     assert_eq!(forged.status, 403, "{forged:?}");
     assert_eq!(get(addr, "/account", &[&sid]).status, 200);
@@ -245,7 +248,7 @@ fn sign_in_account_and_sign_out() {
         "/sign-out",
         &[&sid],
         "same-origin",
-        &format!("csrf={}", encode(&csrf)),
+        &format!("csrf_token={}", encode(&csrf)),
     );
     assert_eq!(out.status, 303, "{out:?}");
     assert_eq!(out.field("location"), Some("/"));
@@ -338,7 +341,7 @@ fn signing_in_over_a_dead_session_keeps_the_new_one() {
         "/sign-out",
         &[&old],
         "same-origin",
-        &format!("csrf={}", encode(&page.csrf())),
+        &format!("csrf_token={}", encode(&page.csrf())),
     );
     assert_eq!(out.status, 303);
 

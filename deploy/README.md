@@ -8,9 +8,10 @@ A static Linux binary, so the host's C library does not matter:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
-sudo apt-get install musl-tools          # a C compiler for musl (the crypto library needs one)
-CC_x86_64_unknown_linux_musl=musl-gcc   cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp
+cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex
 ```
+
+`--no-default-features --features store-nex` builds the site on nex-db alone (accounts with `auth.store = "nex"`, content with `content.store = "nex"`) and with no C dependency, so it needs no C toolchain. The default build has the in-memory gatekeeper instead, whose crypto library needs a C compiler for musl (`musl-tools`).
 
 CI builds the same binary (the `musl` job) and keeps it as an artifact.
 
@@ -37,9 +38,14 @@ store = "bison"
 path = "data/content.bison"
 
 [auth]
+store = "nex"
 admin = "you@example.com"
-secret = "data/gate.key"
+
+[nex]
+path = "data/nex"
 ```
+
+With nex-db, accounts and sessions survive restarts; the content can live there too (`content.store = "nex"`).
 
 Set `WASP_ADMIN_PASSWORD` in the application's environment, never in the file.
 

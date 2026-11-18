@@ -36,8 +36,14 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Clippy (gateway-io alone)
         run: cargo clippy --locked -p gateway-io --all-targets -- -D warnings
+      - name: Clippy (wasp on nex-db only)
+        run: cargo clippy --locked -p wasp --all-targets --no-default-features --features store-nex -- -D warnings
+      - name: Clippy (wasp with no store features)
+        run: cargo clippy --locked -p wasp --all-targets --no-default-features -- -D warnings
       - name: Test
         run: cargo test --locked --workspace --all-features
+      - name: Test (wasp on nex-db only)
+        run: cargo test --locked -p wasp --no-default-features --features store-nex
       - name: Doc
         run: cargo doc --locked --workspace --no-deps --all-features
         env:
@@ -63,13 +69,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-      - name: musl C toolchain (for aws-lc-sys)
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Build (nex-db only, no C toolchain)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex
       - name: Statically linked
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/wasp

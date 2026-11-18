@@ -1,5 +1,8 @@
 //! The web site through the whole path over loopback: gateway, core, web-net.
 
+// A site needs a sign-in store: the gatekeeper or nex-db.
+#![cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -339,9 +342,16 @@ fn a_revocation_during_a_web_request_replaces_the_whole_reply() {
 
 #[test]
 fn the_authentication_cookie_goes_out_once_on_web_replies() {
-    // A session cookie the gatekeeper can never accept: it clears it, once.
+    // A session cookie the gates can never accept: they clear it, once.
     let (door, addr) = open_site("");
-    let dead = "__Host-sid=v1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (dead, cleared) = if cfg!(feature = "gatekeeper") {
+        (
+            "__Host-sid=v1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "__Host-sid=;",
+        )
+    } else {
+        ("__Host-nex=not-a-token", "__Host-nex=;")
+    };
     for (target, status) in [("/", 200), ("/nope", 404), ("/account", 303)] {
         let got = send(
             addr,
@@ -354,7 +364,7 @@ fn the_authentication_cookie_goes_out_once_on_web_replies() {
         assert_eq!(got.count("set-cookie"), 1, "{target}: {}", got.head);
         assert!(
             got.field("set-cookie")
-                .is_some_and(|c| c.starts_with("__Host-sid=;")),
+                .is_some_and(|c| c.starts_with(cleared)),
             "{target}: {}",
             got.head
         );

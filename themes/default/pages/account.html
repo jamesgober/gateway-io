@@ -4,7 +4,7 @@
 <h1>{{ page.title }}</h1>
 <p>Signed in as <strong>{{ page.form.user }}</strong>.</p>
 <form method="post" action="{{ page.form.action }}">
-<input type="hidden" name="csrf" value="{{ page.form.csrf }}">
+<input type="hidden" name="csrf_token" value="{{ page.form.csrf }}">
 <button type="submit">Sign out</button>
 </form>
 </article>

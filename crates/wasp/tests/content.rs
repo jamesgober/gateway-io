@@ -3,6 +3,9 @@
 //! restart, one process holds the file, and a damaged file is refused until
 //! the operator asks for a salvage.
 
+// A site needs a sign-in store: the gatekeeper or nex-db.
+#![cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,12 +208,23 @@ mod bison {
     }
 }
 
+/// The content stores among the core's providers (a nex-db build also holds
+/// the database for its accounts).
+fn content_providers(wiring: &wasp::Wiring) -> Vec<String> {
+    wiring
+        .core
+        .providers()
+        .iter()
+        .map(|p| p.name().to_owned())
+        .filter(|n| n.starts_with("content-"))
+        .collect()
+}
+
 #[test]
 fn the_core_owns_the_store_and_runs_jobs() {
     let dir = temp_dir("content-owned");
     let wiring = wasp::wire(&config("memory", &dir.0)).expect("wiring");
-    let names: Vec<&str> = wiring.core.providers().iter().map(|p| p.name()).collect();
-    assert_eq!(names, ["content-memory"]);
+    assert_eq!(content_providers(&wiring), ["content-memory"]);
     assert!(wiring.core.providers().iter().all(|p| p.flush().is_ok()));
 
     let ran = Arc::new(AtomicUsize::new(0));
@@ -239,8 +253,7 @@ theme_poll = \"0s\"
     ))
     .expect("config");
     let w = wasp::wire(&plain).expect("wiring");
-    let names: Vec<&str> = w.core.providers().iter().map(|p| p.name()).collect();
-    assert_eq!(names, ["content-memory"]);
+    assert_eq!(content_providers(&w), ["content-memory"]);
     let err = wasp::wire(&config("disk", &dir.0)).expect_err("refused");
     assert!(err.contains("content.store"), "{err}");
 }

@@ -113,13 +113,83 @@ pub struct Stored {
     pub date: String,
 }
 
-/// Why the store failed.
+/// What kind of failure a store reports, whatever the backend: a file, an
+/// embedded database, or one across the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StoreErrorKind {
+    /// The store cannot answer now (down, unreachable, locked by another
+    /// process, out of a bounded resource). Retry later.
+    Unavailable,
+    /// The store did not answer in time. The call may or may not have taken
+    /// effect; retry later.
+    Timeout,
+    /// The write lost to another writer, or a unique value is taken. Read
+    /// again and retry.
+    Conflict,
+    /// The input was refused. Retrying the same input fails the same way.
+    Invalid,
+    /// Anything else: damaged data, a bug. Needs a person.
+    Other,
+}
+
+/// Why the store failed: its kind, and a message for the log.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoreError(pub String);
+pub struct StoreError {
+    kind: StoreErrorKind,
+    message: String,
+}
+
+impl StoreError {
+    /// A failure of `kind`.
+    pub fn new(kind: StoreErrorKind, message: impl Into<String>) -> StoreError {
+        StoreError {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The store cannot answer now.
+    pub fn unavailable(message: impl Into<String>) -> StoreError {
+        StoreError::new(StoreErrorKind::Unavailable, message)
+    }
+
+    /// The input was refused.
+    pub fn invalid(message: impl Into<String>) -> StoreError {
+        StoreError::new(StoreErrorKind::Invalid, message)
+    }
+
+    /// Any other failure.
+    pub fn other(message: impl Into<String>) -> StoreError {
+        StoreError::new(StoreErrorKind::Other, message)
+    }
+
+    /// What kind of failure.
+    #[must_use]
+    pub fn kind(&self) -> StoreErrorKind {
+        self.kind
+    }
+
+    /// The message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Whether the same call may succeed later (unavailable, timeout,
+    /// conflict).
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            StoreErrorKind::Unavailable | StoreErrorKind::Timeout | StoreErrorKind::Conflict
+        )
+    }
+}
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -128,6 +198,19 @@ impl std::error::Error for StoreError {}
 /// Where the content lives between restarts: the provider seam for content.
 /// Writes happen when content is saved, never per request; the site reads
 /// everything at boot.
+///
+/// The seam fits any backend, local or remote:
+///
+/// - every call can fail, with a [`StoreErrorKind`] that says whether to
+///   retry;
+/// - values cross by copy: nothing returned borrows from the store, and
+///   nothing is held between calls;
+/// - an entry is found by its slug alone, an opaque key the store never
+///   interprets;
+/// - no handle to a shared database appears in the signatures, so one
+///   process, several, or a cluster can sit behind it;
+/// - health is the store's own ([`Provider::healthy`]), reported per
+///   backend.
 pub trait ContentStore: Provider {
     /// Every stored entry, in no particular order.
     fn load(&self) -> Result<Vec<Stored>, StoreError>;
@@ -165,14 +248,14 @@ impl ContentStore for MemoryStore {
         let entries = self
             .entries
             .lock()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
+            .map_err(|_| StoreError::other("store lock poisoned"))?;
         Ok(entries.values().cloned().collect())
     }
     fn put(&self, entry: &Stored) -> Result<(), StoreError> {
         let mut entries = self
             .entries
             .lock()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
+            .map_err(|_| StoreError::other("store lock poisoned"))?;
         entries.insert(entry.slug.clone(), entry.clone());
         Ok(())
     }
@@ -180,7 +263,7 @@ impl ContentStore for MemoryStore {
         let mut entries = self
             .entries
             .lock()
-            .map_err(|_| StoreError("store lock poisoned".into()))?;
+            .map_err(|_| StoreError::other("store lock poisoned"))?;
         Ok(entries.remove(slug).is_some())
     }
 }
@@ -196,7 +279,7 @@ mod bison_store {
     use bison_db::{Db, DbOptions, Document, RecoveryMode, SyncPolicy, Value};
     use wasp_core::{Provider, ProviderError};
 
-    use super::{ContentStore, StoreError, Stored};
+    use super::{ContentStore, StoreError, StoreErrorKind, Stored};
 
     /// Content in a bison-db file: one document per entry, keyed by slug. Every
     /// write is synced to disk (content is written rarely and must survive a
@@ -232,7 +315,12 @@ mod bison_store {
     const FIELDS: [&str; 6] = ["kind", "slug", "title", "summary", "body", "date"];
 
     fn bison(e: bison_db::Error) -> StoreError {
-        StoreError(format!("content store: {e}"))
+        let kind = match e {
+            bison_db::Error::Locked | bison_db::Error::Io(_) => StoreErrorKind::Unavailable,
+            bison_db::Error::ValueTooLarge => StoreErrorKind::Invalid,
+            _ => StoreErrorKind::Other,
+        };
+        StoreError::new(kind, format!("content store: {e}"))
     }
 
     impl BisonStore {
@@ -248,8 +336,9 @@ mod bison_store {
         ) -> Result<BisonStore, StoreError> {
             let path = path.as_ref().to_path_buf();
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| StoreError(format!("content store {}: {e}", dir.display())))?;
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    StoreError::other(format!("content store {}: {e}", dir.display()))
+                })?;
             }
             let shown = path.display().to_string();
             let mut db = DbOptions::new()
@@ -260,13 +349,13 @@ mod bison_store {
                 })
                 .open(&path)
                 .map_err(|e| match e {
-                    bison_db::Error::Locked => StoreError(format!(
+                    bison_db::Error::Locked => StoreError::unavailable(format!(
                         "content store {shown} is open in another process: is another instance running on this data folder?"
                     )),
-                    bison_db::Error::Corrupt(what) => StoreError(format!(
+                    bison_db::Error::Corrupt(what) => StoreError::other(format!(
                         "content store {shown} is damaged before its end ({what}); nothing was changed. Back the file up, then start once with content.recovery = \"salvage\" to keep every record that still verifies"
                     )),
-                    other => StoreError(format!("content store {shown}: {other}")),
+                    other => StoreError::other(format!("content store {shown}: {other}")),
                 })?;
             db.create_index("slug").map_err(bison)?;
             let discarded = db.discarded_bytes();
@@ -330,7 +419,7 @@ mod bison_store {
             let db = self
                 .db
                 .read()
-                .map_err(|_| StoreError("store lock poisoned".into()))?;
+                .map_err(|_| StoreError::other("store lock poisoned"))?;
             let mut out = Vec::with_capacity(db.len());
             for id in db.ids() {
                 let Some(doc) = db.get(id).map_err(bison)? else {
@@ -371,7 +460,7 @@ mod bison_store {
                 let mut db = self
                     .db
                     .write()
-                    .map_err(|_| StoreError("store lock poisoned".into()))?;
+                    .map_err(|_| StoreError::other("store lock poisoned"))?;
                 let existing = db
                     .find("slug", &Value::from(entry.slug.as_str()))
                     .map_err(bison)?;
@@ -392,7 +481,7 @@ mod bison_store {
                 let mut db = self
                     .db
                     .write()
-                    .map_err(|_| StoreError("store lock poisoned".into()))?;
+                    .map_err(|_| StoreError::other("store lock poisoned"))?;
                 let ids = db.find("slug", &Value::from(slug)).map_err(bison)?;
                 let mut any = false;
                 for id in ids {
@@ -452,7 +541,7 @@ impl Manifest {
                     body: draft.body.to_owned(),
                     date: entry.date.clone(),
                 })
-                .map_err(|e| Invalid(e.0))?;
+                .map_err(|e| Invalid(e.to_string()))?;
         }
         self.entries.insert(entry.slug.clone(), entry);
         self.rebuild_posts();
@@ -547,7 +636,10 @@ impl Manifest {
                 "post" => Kind::Post,
                 "page" => Kind::Page,
                 other => {
-                    return Err(StoreError(format!("`{}`: unknown kind `{other}`", s.slug)));
+                    return Err(StoreError::other(format!(
+                        "`{}`: unknown kind `{other}`",
+                        s.slug
+                    )));
                 }
             };
             let draft = Draft {
@@ -558,7 +650,7 @@ impl Manifest {
                 body: &s.body,
                 date: &s.date,
             };
-            m.validate(&draft).map_err(|e| StoreError(e.0))?;
+            m.validate(&draft).map_err(|e| StoreError::invalid(e.0))?;
             let entry = Arc::new(m.prepare(&draft));
             m.entries.insert(entry.slug.clone(), entry);
         }
@@ -567,7 +659,7 @@ impl Manifest {
         m.store = Some(store);
         if stored.is_empty() && seed {
             for d in &sample_drafts() {
-                m.save(d).map_err(|e| StoreError(e.0))?;
+                m.save(d).map_err(|e| StoreError::invalid(e.0))?;
             }
         }
         Ok(m)

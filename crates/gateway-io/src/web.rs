@@ -185,6 +185,27 @@ impl<G: WebGate, E: web_net::Render> WebService for web_net::App<G, E> {
     }
 }
 
+impl WebService for Box<dyn WebService> {
+    #[inline]
+    fn respond(
+        &self,
+        req: &HttpRequest<'_>,
+        env: &Envelope,
+        caller: &Caller<'_>,
+        reply: &mut HttpReply,
+    ) -> Outcome {
+        (**self).respond(req, env, caller, reply)
+    }
+
+    fn classify(&self, head: &HttpHead<'_>) -> WorkClass {
+        (**self).classify(head)
+    }
+
+    fn done(&self, env: &Envelope, finished: &Finished) {
+        (**self).done(env, finished);
+    }
+}
+
 /// The web services attached to the gateway, by the core's service tag.
 #[derive(Default)]
 pub struct WebServices {

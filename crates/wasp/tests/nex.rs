@@ -1,6 +1,8 @@
 //! nex-db as the durable store: content through the wiring, the core's
 //! authenticator over nex-db sessions, one database per data folder.
 
+#![cfg(feature = "store-nex")]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,7 +14,7 @@ use wasp::content::{ContentStore, Stored};
 use wasp::nex::{NexAuth, NexDb, NexStore, SESSION_COOKIE};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
-use wasp_core::{Core, Exit, Identified, Passport, PermSet, Rule, Service, ServiceCtx, Subject};
+use wasp_core::{Core, Exit, Identified, Passport, Rule, Service, ServiceCtx, Subject};
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -37,7 +39,7 @@ fn slash(p: &Path) -> String {
 fn config(data: &Path) -> Config {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     Config::from_text(&format!(
-        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[content]\nstore = \"nex\"\npath = \"{}\"\n",
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n",
         slash(&theme),
         slash(&data.join("nex"))
     ))
@@ -177,12 +179,21 @@ impl Service for WhoAmI {
 fn the_core_authenticates_nex_db_sessions() {
     let data = temp_dir("auth");
     let db = NexDb::open(&data.0.join("nex")).expect("open");
-    let account = db
-        .db()
-        .auth()
-        .sign_up("ann@example.com", "correct horse battery staple")
-        .expect("account");
-    let auth = NexAuth::new(db.clone());
+    let auth = NexAuth::with_roles(db.clone(), &[("member", 1), ("editor", 4)]);
+    let user = auth
+        .ensure_account(
+            "ann@example.com",
+            "correct horse battery staple",
+            &["member", "editor"],
+        )
+        .expect("account")
+        .expect("new");
+    assert_eq!(
+        auth.ensure_account("ann@example.com", "another password", &["member"])
+            .expect("again"),
+        None,
+        "an existing account is left as it is"
+    );
     let core = Arc::new(
         Core::builder()
             .authenticator(auth.clone())
@@ -205,17 +216,13 @@ fn the_core_authenticates_nex_db_sessions() {
     assert!(body.ends_with("guest"), "{body}");
 
     assert!(
-        auth.sign_in("ann@example.com", "wrong", PermSet(1))
+        auth.sign_in("ann@example.com", "wrong")
             .expect("sign in")
             .is_none(),
         "a wrong password"
     );
     let set = auth
-        .sign_in(
-            "ann@example.com",
-            "correct horse battery staple",
-            PermSet(0b101),
-        )
+        .sign_in("ann@example.com", "correct horse battery staple")
         .expect("sign in")
         .expect("signed in");
     assert!(set.contains("Secure") && set.contains("HttpOnly"), "{set}");
@@ -227,10 +234,7 @@ fn the_core_authenticates_nex_db_sessions() {
 
     let (status, body) = send(addr, "/", Some(&cookie));
     assert_eq!(status, 200);
-    let want = format!(
-        "user {:032x} perms 5",
-        u128::from_be_bytes(*account.as_bytes())
-    );
+    let want = format!("user {:032x} perms 5", user.0);
     assert!(body.ends_with(&want), "{body}");
 
     // Signed out: the session is gone, and its cookie is cleared.
@@ -245,19 +249,12 @@ fn the_core_authenticates_nex_db_sessions() {
 
     // A ban ends every session at once.
     let again = auth
-        .sign_in(
-            "ann@example.com",
-            "correct horse battery staple",
-            PermSet(1),
-        )
+        .sign_in("ann@example.com", "correct horse battery staple")
         .expect("sign in")
         .expect("signed in");
     let again = again.split(';').next().expect("pair").to_owned();
-    assert!(send(addr, "/", Some(&again)).1.contains("perms 1"));
-    db.db()
-        .auth()
-        .set_standing(account, nex_db::Standing::Banned { reason: 1 }, None)
-        .expect("ban");
+    assert!(send(addr, "/", Some(&again)).1.contains("perms 5"));
+    auth.ban(user).expect("ban");
     let (_, body) = send(addr, "/", Some(&again));
     assert!(body.ends_with("guest"), "{body}");
 

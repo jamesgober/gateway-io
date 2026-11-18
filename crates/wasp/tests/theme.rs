@@ -1,6 +1,9 @@
 //! The theme through the whole path: themed pages, error pages, a theme
 //! reloaded while the site serves, and escaping in a real page.
 
+// A site needs a sign-in store: the gatekeeper or nex-db.
+#![cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

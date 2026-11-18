@@ -1,6 +1,9 @@
 //! A configuration reload through the kernel, end to end: the door's bans
 //! and allow list change while the gateway keeps serving.
 
+// A site needs a sign-in store: the gatekeeper or nex-db.
+#![cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

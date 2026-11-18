@@ -53,6 +53,14 @@ WASP_ADMIN_PASSWORD='a long password' cargo run -p wasp
 
 Accounts and sessions are in memory: a restart signs everyone out. The gates' master secret is `<data folder>/gate.key`, made on the first run.
 
+The stores are cargo features of `wasp`: `gatekeeper` (on by default) and `store-nex` (off). A site on nex-db alone, with durable accounts and no C dependency:
+
+```bash
+cargo run -p wasp --no-default-features --features store-nex
+```
+
+A build asked for a store it was built without refuses to boot and names the feature.
+
 ```bash
 curl -i http://127.0.0.1:8080/
 curl -i http://127.0.0.1:8080/posts/hello-world
@@ -107,10 +115,12 @@ themes/default/static/   site.css                 (served under /theme/)
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
 | `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
-| `content.store` | `memory` | where content is kept: `memory` (lost at exit), `bison` (a bison-db file), or `nex` (a nex-db database: one entity per entry, published at its route); the durable stores allow one process at a time (a second instance refuses to boot); an empty store is given the sample content |
+| `content.store` | `memory` | where content is kept: `memory` (lost at exit), `bison` (a bison-db file), or `nex` (a nex-db database, feature `store-nex`: one entity per entry, published at its route); the durable stores allow one process at a time (a second instance refuses to boot); an empty store is given the sample content |
 | `content.recovery` | `strict` | a bison-db file damaged before its end refuses to boot and is left as it was; after backing it up, start once with `salvage` to keep every record that still verifies (bison-db keeps a copy as `<path>.damaged`) |
-| `content.path` | `<data folder>/content.bison`, or `<data folder>/nex` | the bison-db file, or the nex-db folder |
-| `auth.admin` | none | an account made at boot; its password from `WASP_ADMIN_PASSWORD` |
+| `content.path` | `<data folder>/content.bison` | the bison-db file |
+| `auth.store` | `gatekeeper` (`nex` in a build without it) | the site's accounts and sessions: `gatekeeper` (feature `gatekeeper`, on by default; in memory: a restart signs everyone out) or `nex` (feature `store-nex`; nex-db: durable) |
+| `nex.path` | `<data folder>/nex` | the nex-db database, shared by `auth.store = "nex"` and `content.store = "nex"`; one process at a time |
+| `auth.admin` | none | an account made at boot (given the `member` role with nex-db); its password from `WASP_ADMIN_PASSWORD` |
 | `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |

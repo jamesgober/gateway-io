@@ -25,8 +25,7 @@ use gateway_io::gatekeeper::gatekeeper_io::{
 use key_vault::{FetchContext, FileFetch, KeyFetch, KeyVaultBuilder, RawKey};
 use wasp_core::suite::config::Config;
 
-/// The environment variable that holds the boot account's password.
-pub const ADMIN_PASSWORD_ENV: &str = "WASP_ADMIN_PASSWORD";
+pub use crate::ADMIN_PASSWORD_ENV;
 
 /// The permission the account page needs.
 pub const ACCOUNT_READ: &str = "account.read";

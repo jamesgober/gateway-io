@@ -339,8 +339,9 @@ fn drain_deadline_kills_what_is_left() {
     assert!(got.as_ref().is_none_or(|g| g.status != 200), "{got:?}");
 }
 
-/// An authenticator that clears a dead session cookie and refuses a request
-/// carrying `x-banned`, as a real auth gate would.
+/// An authenticator that clears a dead session cookie, refuses a request
+/// carrying `x-banned`, and cannot reach its store for one carrying
+/// `x-store-down`, as a real auth gate would.
 struct DeadSession;
 
 impl wasp_core::Authenticator for DeadSession {
@@ -355,6 +356,8 @@ impl wasp_core::Authenticator for DeadSession {
         }
         if request.head().header("x-banned").is_some() {
             wasp_core::Authentication::Refused(wasp_core::Refusal::status(403))
+        } else if request.head().header("x-store-down").is_some() {
+            wasp_core::Authentication::Unavailable
         } else {
             wasp_core::Authentication::Identified(wasp_core::Identity::guest())
         }
@@ -396,6 +399,15 @@ fn authentication_cookie_rides_on_answers_and_refusals() {
     .expect("a response");
     assert_eq!(got.status, 403);
     assert!(has_field(&got, "set-cookie", cleared), "{}", got.head);
+
+    // The credential store cannot answer: 503 with Retry-After, never a guest.
+    let got = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: a\r\nX-Store-Down: 1\r\nConnection: close\r\n\r\n",
+    )
+    .expect("a response");
+    assert_eq!(got.status, 503, "{}", got.head);
+    assert!(has_field(&got, "retry-after", "5"), "{}", got.head);
 
     // A request without a cookie gets none: the buffer was wiped with the passport.
     let got = get(addr, "/").expect("a response");

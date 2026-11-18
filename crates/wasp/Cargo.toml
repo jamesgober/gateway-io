@@ -10,21 +10,31 @@ publish.workspace = true
 
 [dependencies]
 wasp-core = { path = "../wasp-core" }
-gateway-io = { path = "../gateway-io", features = ["gatekeeper"] }
+gateway-io = { path = "../gateway-io" }
 # The gates: accounts, sessions in memory, rules, sign-in and sign-out, CSRF.
-gatekeeper-io = { workspace = true }
+gatekeeper-io = { workspace = true, optional = true }
 # The gates' master secret: read from its file, held page-locked.
-key-vault = { workspace = true }
-# A new master secret on first run.
-crypt-io = { workspace = true }
-# The durable store for content (and, later, accounts): one database.
-nex-db = { workspace = true }
+key-vault = { workspace = true, optional = true }
+# Random secrets (a new master secret, the CSRF key) and session digests.
+crypt-io = { workspace = true, optional = true }
+# nex-db: one embedded database for content and accounts (`store-nex`).
+nex-db = { workspace = true, optional = true }
 # The web site: site, url, router, handlers.
 web-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
 luminess = { workspace = true }
 # The first durable content store (embedded, first-party).
 bison-db = { workspace = true }
+
+[features]
+default = ["gatekeeper"]
+# The gatekeeper (accounts and sessions in memory) as the site's gates. It
+# brings the only C dependency: a build without it links a static musl
+# binary without a C toolchain.
+gatekeeper = ["gateway-io/gatekeeper", "dep:gatekeeper-io", "dep:key-vault", "dep:crypt-io"]
+# nex-db as a store: `content.store = "nex"` and `auth.store = "nex"`.
+# Optional: no part of the process outside its adapter depends on it.
+store-nex = ["dep:nex-db", "dep:crypt-io"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }

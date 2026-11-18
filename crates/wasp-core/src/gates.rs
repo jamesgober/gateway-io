@@ -28,6 +28,10 @@ pub enum Authentication {
     Identified(Identity),
     /// Banned (timed or permanent): refused here, before any service code.
     Refused(Refusal),
+    /// The credential's store cannot answer now (down, unreachable, timed
+    /// out): the request is refused with 503 and `Retry-After`, never
+    /// treated as a guest's or a signed-in caller's.
+    Unavailable,
 }
 
 /// The gate's own identity token, kept in the passport for services that
@@ -101,8 +105,13 @@ impl AuthOut {
 pub trait Authenticator: Send + Sync + 'static {
     /// Reads the credential where `profile.locator` says it is and decides.
     /// A `Set-Cookie` the response must carry, and the gate's own identity
-    /// token, go into `out`. Must not block on the network: a remote store
-    /// answers from local state when it is unreachable.
+    /// token, go into `out`. Must not block on the network for long: a
+    /// remote store answers from local state, or returns
+    /// [`Authentication::Unavailable`] when it cannot decide.
+    ///
+    /// The trait holds no handle to a shared database: an implementation
+    /// owns what it needs, so the credential store can be in this process,
+    /// another one, or a cluster.
     fn authenticate(
         &self,
         request: RequestView<'_>,

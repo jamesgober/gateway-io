@@ -18,11 +18,14 @@ use crate::passport::{Exit, Passport};
 use crate::profile::Profile;
 use crate::provider::Provider;
 use crate::service::{Service, ServiceCtx};
-use crate::slot::Trip;
 use crate::slot::{ProfileId, ServiceTag};
+use crate::slot::{Refusal, Trip};
 use crate::stage::{Identified, Inspected};
 use crate::suite::lifecycle::{Deadline, Failure, Link, Subsystem};
 use crate::suite::log;
+
+/// `Retry-After` when the credential store cannot answer.
+const AUTH_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why the core refused to load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +360,10 @@ impl Core {
         let p = match decided {
             Authentication::Identified(identity) => p.identify(identity),
             Authentication::Refused(refusal) => return Routed::Exit(p.refuse_with(refusal)),
+            Authentication::Unavailable => {
+                let refusal = Refusal::status(503).retry_after(AUTH_RETRY_AFTER);
+                return Routed::Exit(p.refuse_with(refusal));
+            }
         };
         let p = match self.cache.guest_hit(p) {
             Ok(hit) => return Routed::Exit(hit),
