@@ -1,5 +1,6 @@
 //! The site signing in and out through nex-db (`auth.store = "nex"`):
-//! web-net's CSRF engine on every form, sessions that survive a restart.
+//! web-net's CSRF engine on every form, sessions that survive a restart, and
+//! the content editor.
 
 #![cfg(feature = "store-nex")]
 
@@ -9,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gateway_io::{Door, Settings, WebServices};
-use wasp::nex::{MEMBER_ROLE, NexAuth};
+use wasp::nex::{EDITOR_ROLE, MEMBER_ROLE, NexAuth};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
 
 const EMAIL: &str = "ann@example.com";
 const PASSWORD: &str = "correct horse battery staple";
+const EDITOR: &str = "ed@example.com";
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -39,7 +41,7 @@ fn slash(p: &Path) -> String {
 fn config(data: &Path) -> Config {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     Config::from_text(&format!(
-        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[auth]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n",
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[auth]\nstore = \"nex\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n",
         slash(&theme),
         slash(&data.join("nex"))
     ))
@@ -59,9 +61,11 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
             Err(e) => panic!("wiring: {e}"),
         }
     };
-    NexAuth::new(wiring.nex.clone().expect("nex-db"))
-        .ensure_account(EMAIL, PASSWORD, &[MEMBER_ROLE])
+    let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
+    auth.ensure_account(EMAIL, PASSWORD, &[MEMBER_ROLE])
         .expect("account");
+    auth.ensure_account(EDITOR, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
+        .expect("editor");
     let mut web = WebServices::new();
     web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
     let settings = Settings {
@@ -197,13 +201,17 @@ fn form(addr: SocketAddr) -> (String, String) {
 }
 
 fn sign_in(addr: SocketAddr) -> String {
+    sign_in_as(addr, EMAIL)
+}
+
+fn sign_in_as(addr: SocketAddr, email: &str) -> String {
     let (pre, csrf) = form(addr);
     let done = post(
         addr,
         "/sign-in",
         &[&pre],
         "same-origin",
-        &sign_in_body(EMAIL, PASSWORD, &csrf),
+        &sign_in_body(email, PASSWORD, &csrf),
     );
     assert_eq!(done.status, 303, "{done:?}");
     done.cookie("__Host-nex").expect("session")
@@ -300,5 +308,155 @@ fn a_nex_db_session_survives_a_restart() {
         page.status, 200,
         "still signed in after a restart: {page:?}"
     );
+    let _ = door.close(Duration::from_secs(2));
+}
+
+fn entry_body(kind: &str, slug: &str, was: &str, title: &str, body: &str, csrf: &str) -> String {
+    format!(
+        "kind={kind}&slug={}&was={}&title={}&summary=&date=2026-11-18&body={}&csrf_token={}",
+        encode(slug),
+        encode(was),
+        encode(title),
+        encode(body),
+        encode(csrf)
+    )
+}
+
+#[test]
+fn the_editor_writes_renames_and_removes_content() {
+    let data = temp_dir("editor");
+    let conf = config(&data.0);
+    let (door, addr) = open(&conf);
+
+    // Guests are sent to sign in; a member without the editor role is refused.
+    assert_eq!(get(addr, "/admin", &[]).status, 303);
+    let member = sign_in(addr);
+    assert_eq!(get(addr, "/admin", &[&member]).status, 403);
+    let account = get(addr, "/account", &[&member]);
+    assert!(
+        !account.body.contains("Edit the content"),
+        "{}",
+        account.body
+    );
+
+    let ed = sign_in_as(addr, EDITOR);
+    let account = get(addr, "/account", &[&ed]);
+    assert!(
+        account.body.contains("Edit the content"),
+        "{}",
+        account.body
+    );
+    let list = get(addr, "/admin", &[&ed]);
+    assert_eq!(list.status, 200, "{list:?}");
+    assert_eq!(list.field("cache-control"), Some("no-store"));
+    assert!(list.body.contains("The passport"), "{}", list.body);
+
+    // A new page: saved, then served at its own path, escaped.
+    let blank = get(addr, "/admin/new/page", &[&ed]);
+    assert_eq!(blank.status, 200, "{blank:?}");
+    let csrf = blank.csrf();
+    let saved = post(
+        addr,
+        "/admin/save",
+        &[&ed],
+        "same-origin",
+        &entry_body(
+            "page",
+            "contact",
+            "",
+            "Contact",
+            "Write <b>to</b> us.\n\nSecond.",
+            &csrf,
+        ),
+    );
+    assert_eq!(saved.status, 303, "{saved:?}");
+    assert_eq!(saved.field("location"), Some("/contact"));
+    let page = get(addr, "/contact", &[]);
+    assert_eq!(page.status, 200, "{page:?}");
+    assert!(
+        page.body
+            .contains("<p>Write &lt;b&gt;to&lt;/b&gt; us.</p><p>Second.</p>"),
+        "{}",
+        page.body
+    );
+
+    // Refused with the form again: a bad slug, a slug another entry has, a
+    // post from another site.
+    let bad = post(
+        addr,
+        "/admin/save",
+        &[&ed],
+        "same-origin",
+        &entry_body("page", "Not A Slug", "", "Bad", "x", &csrf),
+    );
+    assert_eq!(bad.status, 422, "{bad:?}");
+    assert!(bad.body.contains("lowercase letters"), "{}", bad.body);
+    assert!(
+        bad.body.contains("value=\"Not A Slug\""),
+        "kept: {}",
+        bad.body
+    );
+    let taken = post(
+        addr,
+        "/admin/save",
+        &[&ed],
+        "same-origin",
+        &entry_body("page", "about", "", "About again", "x", &csrf),
+    );
+    assert_eq!(taken.status, 422, "{taken:?}");
+    let forged = post(
+        addr,
+        "/admin/save",
+        &[&ed],
+        "cross-site",
+        &entry_body("page", "evil", "", "Evil", "x", &csrf),
+    );
+    assert_eq!(forged.status, 403, "{forged:?}");
+    let by_member = post(
+        addr,
+        "/admin/save",
+        &[&member],
+        "same-origin",
+        &entry_body("page", "evil", "", "Evil", "x", &csrf),
+    );
+    assert_ne!(by_member.status, 303, "{by_member:?}");
+    assert_eq!(get(addr, "/evil", &[]).status, 404);
+
+    // Edited and renamed: the old path is gone.
+    let form = get(addr, "/admin/edit/contact", &[&ed]);
+    assert_eq!(form.status, 200, "{form:?}");
+    assert!(
+        form.body.contains("Write &lt;b&gt;to&lt;/b&gt; us."),
+        "{}",
+        form.body
+    );
+    let csrf = form.csrf();
+    let renamed = post(
+        addr,
+        "/admin/save",
+        &[&ed],
+        "same-origin",
+        &entry_body("page", "write-to-us", "contact", "Contact", "Here.", &csrf),
+    );
+    assert_eq!(renamed.status, 303, "{renamed:?}");
+    assert_eq!(get(addr, "/contact", &[]).status, 404);
+    assert_eq!(get(addr, "/write-to-us", &[]).status, 200);
+    let _ = door.close(Duration::from_secs(2));
+
+    // Kept across a restart, then removed.
+    let (door, addr) = open(&conf);
+    assert_eq!(get(addr, "/write-to-us", &[]).status, 200);
+    let form = get(addr, "/admin/edit/write-to-us", &[&ed]);
+    assert_eq!(form.status, 200, "{form:?}");
+    let gone = post(
+        addr,
+        "/admin/delete",
+        &[&ed],
+        "same-origin",
+        &format!("slug=write-to-us&csrf_token={}", encode(&form.csrf())),
+    );
+    assert_eq!(gone.status, 303, "{gone:?}");
+    assert_eq!(gone.field("location"), Some("/admin"));
+    assert_eq!(get(addr, "/write-to-us", &[]).status, 404);
     let _ = door.close(Duration::from_secs(2));
 }

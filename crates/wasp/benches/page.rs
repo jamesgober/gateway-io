@@ -40,6 +40,7 @@ fn main() {
         home: "/".into(),
         about: "/about".into(),
         account: "/account".into(),
+        admin: "/admin".into(),
         css: "/theme/site.css".into(),
     });
     let post = theme.template("post").expect("post");
@@ -55,6 +56,7 @@ fn main() {
             posts: manifest.posts(),
             message: String::new(),
             form: None,
+            editor: None,
         });
     });
     let page = Page {
@@ -64,6 +66,7 @@ fn main() {
         posts: manifest.posts(),
         message: String::new(),
         form: None,
+        editor: None,
     };
     let post_cost = measure(|| {
         buf.clear();

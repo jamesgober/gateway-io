@@ -2,7 +2,7 @@
 //! watcher that reloads them while the site serves.
 //!
 //! ```text
-//!  <theme>/pages/*.html    page templates (`base`, `home`, `post`, `page`), view `page`
+//!  <theme>/pages/*.html    page templates (`base`, `home`, `post`, `page`, `sign-in`, `account`, `admin`, `edit`), view `page`
 //!  <theme>/errors/*.html   error pages (`error`, `error/404`, ...), view `error`
 //!  <theme>/static/         files served under /theme/ (the stylesheet)
 //! ```
@@ -29,7 +29,9 @@ use wasp_core::suite::log;
 use crate::content::Entry;
 
 /// The templates every theme must have (the routes name them).
-pub const REQUIRED: &[&str] = &["home", "post", "page", "sign-in", "account"];
+pub const REQUIRED: &[&str] = &[
+    "home", "post", "page", "sign-in", "account", "admin", "edit",
+];
 
 // The view schemas: every Luminess name the site uses is in this module, so
 // a Luminess upgrade changes this file and nothing else.
@@ -54,11 +56,13 @@ pub struct SiteInfo {
     pub about: String,
     /// The account page URL.
     pub account: String,
+    /// The content editor's URL.
+    pub admin: String,
     /// The stylesheet URL.
     pub css: String,
 }
 
-luminess::view!(SiteInfo as "site" { name: text, home: text, about: text, account: text, css: text });
+luminess::view!(SiteInfo as "site" { name: text, home: text, about: text, account: text, admin: text, css: text });
 
 /// A form on a page (`page.form`): the sign-in form, the sign-out button.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,9 +77,65 @@ pub struct Form {
     pub email: String,
     /// Who is signed in, or empty.
     pub user: String,
+    /// Whether the visitor may edit the content (a link to the editor).
+    pub editor: bool,
 }
 
-luminess::view!(Form as "form" { action: text, csrf: text, error: text, email: text, user: text });
+luminess::view!(Form as "form" { action: text, csrf: text, error: text, email: text, user: text, editor: bool });
+
+/// The content editor (`page.editor`): every entry, and the entry form with
+/// what the editor typed (kept after a refusal).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Editor {
+    /// Every entry: posts newest first, then pages.
+    pub entries: Arc<Vec<Arc<Entry>>>,
+    /// Where the entry form posts.
+    pub save: String,
+    /// Where the delete button posts.
+    pub delete: String,
+    /// The new-post form's URL.
+    pub new_post: String,
+    /// The new-page form's URL.
+    pub new_page: String,
+    /// The CSRF token, for the hidden `csrf_token` fields.
+    pub csrf: String,
+    /// Why the last save was refused, or empty.
+    pub error: String,
+    /// Whether the form edits an existing entry (it can be deleted).
+    pub existing: bool,
+    /// `post` or `page`.
+    pub kind: String,
+    /// The slug in the form.
+    pub slug: String,
+    /// The slug the editor opened (empty for a new entry).
+    pub was: String,
+    /// The title.
+    pub title: String,
+    /// The summary.
+    pub summary: String,
+    /// The date (`YYYY-MM-DD`).
+    pub date: String,
+    /// The body as the author writes it.
+    pub body: String,
+}
+
+luminess::view!(Editor as "editor" {
+    entries: list(object(Entry)),
+    save: text,
+    delete: text,
+    new_post: text,
+    new_page: text,
+    csrf: text,
+    error: text,
+    existing: bool,
+    kind: text,
+    slug: text,
+    was: text,
+    title: text,
+    summary: text,
+    date: text,
+    body: text,
+});
 
 /// What a page template reads, as `page`. Content is shared, not copied:
 /// `entry` and `posts` point into the manifest.
@@ -93,6 +153,8 @@ pub struct Page {
     pub message: String,
     /// The page's form, if it has one.
     pub form: Option<Arc<Form>>,
+    /// The content editor, on the editor's pages.
+    pub editor: Option<Arc<Editor>>,
 }
 
 luminess::view!(Page as "page" {
@@ -102,6 +164,7 @@ luminess::view!(Page as "page" {
     posts: list(object(Entry)),
     message: text,
     form: object(Form),
+    editor: object(Editor),
 });
 
 /// The theme: what the watcher reloads.

@@ -1,0 +1,32 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.title }}</h1>
+<p><a href="{{ page.site.admin }}">All content</a></p>
+{% if page.editor.error %}<p class="error" role="alert">{{ page.editor.error }}</p>{% endif %}
+<form class="stack wide" method="post" action="{{ page.editor.save }}">
+<input type="hidden" name="csrf_token" value="{{ page.editor.csrf }}">
+<input type="hidden" name="was" value="{{ page.editor.was }}">
+<label>Kind <select name="kind">
+{%- if page.editor.kind == "page" %}
+<option value="post">Post</option><option value="page" selected>Page</option>
+{%- else %}
+<option value="post" selected>Post</option><option value="page">Page</option>
+{%- endif %}
+</select></label>
+<label>Slug <input name="slug" value="{{ page.editor.slug }}" pattern="[a-z0-9-]+" required></label>
+<label>Title <input name="title" value="{{ page.editor.title }}" required></label>
+<label>Summary <input name="summary" value="{{ page.editor.summary }}"></label>
+<label>Date <input type="date" name="date" value="{{ page.editor.date }}"></label>
+<label>Body <textarea name="body" rows="18">{{ page.editor.body }}</textarea></label>
+<button type="submit">Save</button>
+</form>
+{% if page.editor.existing %}
+<form method="post" action="{{ page.editor.delete }}">
+<input type="hidden" name="csrf_token" value="{{ page.editor.csrf }}">
+<input type="hidden" name="slug" value="{{ page.editor.was }}">
+<button class="danger" type="submit">Delete</button>
+</form>
+{% endif %}
+</article>
+{% endblock %}

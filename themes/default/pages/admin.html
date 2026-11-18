@@ -1,0 +1,17 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.title }}</h1>
+<p><a href="{{ page.editor.new_post }}">New post</a> <a href="{{ page.editor.new_page }}">New page</a></p>
+<table class="entries">
+<thead><tr><th>Title</th><th>Kind</th><th>Date</th><th></th></tr></thead>
+<tbody>
+{%- for e in page.editor.entries %}
+<tr><td><a href="{{ page.site.admin }}/edit/{{ e.slug }}">{{ e.title }}</a></td><td>{{ e.kind }}</td><td>{{ e.date }}</td><td><a href="{{ e.url }}">View</a></td></tr>
+{%- else %}
+<tr><td colspan="4">Nothing yet.</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+</article>
+{% endblock %}

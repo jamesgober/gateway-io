@@ -210,6 +210,7 @@ fn error_pages_for_404_405_and_500() {
         home: "/".into(),
         about: "/about".into(),
         account: "/account".into(),
+        admin: "/admin".into(),
         css: "/theme/site.css".into(),
     });
     let ok: SiteRoute = get("/ok", move |cx: &mut SiteCx<'_>| {
@@ -220,6 +221,7 @@ fn error_pages_for_404_405_and_500() {
             posts: Arc::new(Vec::new()),
             message: "fine".into(),
             form: None,
+            editor: None,
         })
     })
     .public()

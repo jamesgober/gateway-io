@@ -8,7 +8,7 @@
 //! `Arc<Vec<Arc<Entry>>>`, so rendering a page copies no content.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use wasp_core::{Provider, ProviderError};
 
@@ -48,6 +48,8 @@ pub struct Entry {
     pub body: String,
     /// The date (`2026-11-09`), for posts.
     pub date: String,
+    /// The body as the author wrote it (plain text), for the editor.
+    pub text: String,
 }
 
 /// What an editor saves.
@@ -78,6 +80,32 @@ impl std::fmt::Display for Invalid {
 }
 
 impl std::error::Error for Invalid {}
+
+/// Why a save failed: the draft was refused, or the store could not take it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveError {
+    /// The draft breaks a rule; the editor fixes it.
+    Invalid(Invalid),
+    /// The store failed; its kind says whether to retry.
+    Store(StoreError),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Invalid(e) => e.fmt(f),
+            SaveError::Store(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl From<Invalid> for SaveError {
+    fn from(e: Invalid) -> SaveError {
+        SaveError::Invalid(e)
+    }
+}
 
 /// The content, in memory until a content store exists (build-path step 8).
 #[derive(Clone, Debug, Default)]
@@ -526,7 +554,7 @@ impl Manifest {
 
     /// Validates and prepares a draft, then stores it (replacing an entry with
     /// the same slug) and rebuilds the post listing, newest first.
-    pub fn save(&mut self, draft: &Draft<'_>) -> Result<(), Invalid> {
+    pub fn save(&mut self, draft: &Draft<'_>) -> Result<(), SaveError> {
         self.validate(draft)?;
         let entry = Arc::new(self.prepare(draft));
         if let Some(store) = &self.store {
@@ -541,7 +569,7 @@ impl Manifest {
                     body: draft.body.to_owned(),
                     date: entry.date.clone(),
                 })
-                .map_err(|e| Invalid(e.to_string()))?;
+                .map_err(SaveError::Store)?;
         }
         self.entries.insert(entry.slug.clone(), entry);
         self.rebuild_posts();
@@ -579,11 +607,7 @@ impl Manifest {
         let mut body = String::with_capacity(draft.body.len() + 32);
         for para in draft
             .body
-            .split(
-                "
-
-",
-            )
+            .split("\n\n")
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
@@ -603,6 +627,7 @@ impl Manifest {
             summary: draft.summary.to_owned(),
             body,
             date: draft.date.to_owned(),
+            text: draft.body.to_owned(),
         }
     }
 
@@ -659,7 +684,10 @@ impl Manifest {
         m.store = Some(store);
         if stored.is_empty() && seed {
             for d in &sample_drafts() {
-                m.save(d).map_err(|e| StoreError::invalid(e.0))?;
+                m.save(d).map_err(|e| match e {
+                    SaveError::Store(e) => e,
+                    SaveError::Invalid(e) => StoreError::invalid(e.0),
+                })?;
             }
         }
         Ok(m)
@@ -692,6 +720,26 @@ impl Manifest {
             .cloned()
     }
 
+    /// The entry with this slug, of either kind.
+    #[must_use]
+    pub fn find(&self, slug: &str) -> Option<Arc<Entry>> {
+        self.entries.get(slug).cloned()
+    }
+
+    /// Whether an entry of either kind has this slug (one slug, one entry).
+    #[must_use]
+    pub fn contains(&self, slug: &str) -> bool {
+        self.entries.contains_key(slug)
+    }
+
+    /// Every entry: posts newest first, then pages by slug.
+    #[must_use]
+    pub fn all(&self) -> Vec<Arc<Entry>> {
+        let mut all: Vec<Arc<Entry>> = self.posts.iter().cloned().collect();
+        all.extend(self.entries.values().filter(|e| e.kind == "page").cloned());
+        all
+    }
+
     /// The posts, newest first (shared, not copied).
     #[must_use]
     pub fn posts(&self) -> Arc<Vec<Arc<Entry>>> {
@@ -714,6 +762,100 @@ impl Manifest {
             let _ = m.save(d);
         }
         m
+    }
+}
+
+/// Today's date in UTC (`YYYY-MM-DD`), the default for a new post.
+#[must_use]
+pub fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    date_of(i64::try_from(secs / 86_400).unwrap_or(0))
+}
+
+/// The civil date `days` after 1970-01-01.
+fn date_of(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The content the site serves, shared by every request and the editor.
+///
+/// A request takes a snapshot (one `Arc`, no lock held while it renders). A
+/// save prepares the next manifest beside the live one, writes through the
+/// store, and swaps it in; saves run one at a time, and readers only ever
+/// wait for the swap of a pointer, never for the store.
+#[derive(Debug)]
+pub struct Content {
+    live: RwLock<Arc<Manifest>>,
+    writer: Mutex<()>,
+}
+
+impl Content {
+    /// The content of `manifest`.
+    #[must_use]
+    pub fn new(manifest: Manifest) -> Content {
+        Content {
+            live: RwLock::new(Arc::new(manifest)),
+            writer: Mutex::new(()),
+        }
+    }
+
+    /// The content as it is now.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Manifest> {
+        self.live
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish(&self, next: Manifest) {
+        *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(next);
+    }
+
+    /// Saves `draft`. `replaces` is the slug the editor opened (`None` for
+    /// a new entry): a slug that another entry already has is refused, and
+    /// a renamed entry's old slug is removed.
+    pub fn save(&self, draft: &Draft<'_>, replaces: Option<&str>) -> Result<(), SaveError> {
+        let _one = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = (*self.snapshot()).clone();
+        let renamed = replaces.filter(|old| *old != draft.slug && next.contains(old));
+        if replaces != Some(draft.slug) && next.contains(draft.slug) {
+            return Err(SaveError::Invalid(Invalid(format!(
+                "slug `{}` is taken: another page or post has it",
+                draft.slug
+            ))));
+        }
+        next.save(draft)?;
+        let removed = match renamed {
+            Some(old) => next.remove(old).map(|_| ()),
+            None => Ok(()),
+        };
+        // What the store took is live, even when removing the old slug
+        // failed (both entries are then in the store and in memory).
+        self.publish(next);
+        removed.map_err(SaveError::Store)
+    }
+
+    /// Removes the entry with this slug; `false` when there was none.
+    pub fn remove(&self, slug: &str) -> Result<bool, StoreError> {
+        let _one = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = (*self.snapshot()).clone();
+        let gone = next.remove(slug)?;
+        if gone {
+            self.publish(next);
+        }
+        Ok(gone)
     }
 }
 
@@ -812,6 +954,51 @@ mod tests {
         );
         assert_eq!(m.posts().len(), 3, "not seeded again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dates_are_civil_dates() {
+        assert_eq!(super::date_of(0), "1970-01-01");
+        assert_eq!(super::date_of(11_016), "2000-02-29");
+        assert_eq!(super::date_of(19_723), "2024-01-01");
+        assert_eq!(super::today().len(), 10);
+    }
+
+    #[test]
+    fn content_saves_renames_and_refuses_a_taken_slug() {
+        let content = Content::new(Manifest::sample());
+        let before = content.snapshot();
+        let draft = Draft {
+            kind: Kind::Page,
+            slug: "contact",
+            title: "Contact",
+            summary: "",
+            body: "Write to us.",
+            date: "",
+        };
+        content.save(&draft, None).expect("new");
+        assert!(before.find("contact").is_none(), "a snapshot never changes");
+        assert_eq!(
+            content.snapshot().find("contact").map(|e| e.text.clone()),
+            Some("Write to us.".to_owned())
+        );
+        let taken = content.save(
+            &Draft {
+                slug: "about",
+                ..draft.clone()
+            },
+            None,
+        );
+        assert!(matches!(taken, Err(SaveError::Invalid(_))), "{taken:?}");
+        let renamed = Draft {
+            slug: "write-to-us",
+            ..draft.clone()
+        };
+        content.save(&renamed, Some("contact")).expect("renamed");
+        let now = content.snapshot();
+        assert!(now.find("contact").is_none() && now.find("write-to-us").is_some());
+        assert!(content.remove("write-to-us").expect("removed"));
+        assert!(!content.remove("write-to-us").expect("gone"));
     }
 
     #[test]

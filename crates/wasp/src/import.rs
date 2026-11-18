@@ -152,7 +152,7 @@ pub fn import_into(manifest: &mut Manifest, from: &Path) -> Result<Report, Strin
             };
             match manifest.save(&draft) {
                 Ok(()) => report.saved.push(slug),
-                Err(e) => report.refused.push((shown, e.0)),
+                Err(e) => report.refused.push((shown, e.to_string())),
             }
         }
     }

@@ -43,6 +43,9 @@ pub const PRE_COOKIE: &str = "__Host-nexpre";
 /// The role every account that may use the site holds.
 pub const MEMBER_ROLE: &str = "member";
 
+/// The role that may edit the content.
+pub const EDITOR_ROLE: &str = "editor";
+
 /// What the authenticator keeps for the web service: the value CSRF tokens
 /// are bound to (the session's id, or a guest's pre-session cookie; empty
 /// when there is neither).
@@ -332,10 +335,10 @@ pub struct NexAuth {
 
 impl NexAuth {
     /// The authenticator over `db`, with `member` granting permission bit 0
-    /// (the site's account page).
+    /// (the site's account page) and `editor` bit 1 (the content editor).
     #[must_use]
     pub fn new(db: NexDb) -> NexAuth {
-        NexAuth::with_roles(db, &[(MEMBER_ROLE, 1)])
+        NexAuth::with_roles(db, &[(MEMBER_ROLE, 1), (EDITOR_ROLE, 2)])
     }
 
     /// The authenticator over `db`, with a role-to-permission-bits table.

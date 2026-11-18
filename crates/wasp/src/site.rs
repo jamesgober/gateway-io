@@ -30,8 +30,8 @@ use std::time::Duration;
 use wasp_core::suite::config::Config;
 use web_net::{Assets, Context, Route, get};
 
-use crate::content::{Entry, Kind, Manifest};
-use crate::theme::{Form, Page, SiteEngine, SiteInfo};
+use crate::content::{Content, Entry, Kind, Manifest};
+use crate::theme::{Editor, Form, Page, SiteEngine, SiteInfo};
 
 #[cfg(feature = "gatekeeper")]
 pub use gatekeeper_site::{SiteApp, SiteCx, SiteRoute, build};
@@ -119,7 +119,7 @@ impl SiteSettings {
 #[derive(Clone)]
 pub(crate) struct Pages {
     site: Arc<SiteInfo>,
-    manifest: Arc<Manifest>,
+    pub(crate) content: Arc<Content>,
 }
 
 impl Pages {
@@ -131,9 +131,10 @@ impl Pages {
                 home: format!("{base}/"),
                 about: format!("{base}/about"),
                 account: format!("{base}/account"),
+                admin: format!("{base}/admin"),
                 css: format!("{base}/theme/site.css"),
             }),
-            manifest: Arc::new(manifest),
+            content: Arc::new(Content::new(manifest)),
         }
     }
 
@@ -149,9 +150,19 @@ impl Pages {
             site: self.site.clone(),
             title: title.to_owned(),
             entry,
-            posts: self.manifest.posts(),
+            posts: self.content.snapshot().posts(),
             message: message.to_owned(),
             form: form.map(Arc::new),
+            editor: None,
+        }
+    }
+
+    /// An editor's page view.
+    #[cfg_attr(not(feature = "store-nex"), allow(dead_code))]
+    pub(crate) fn editor_page(&self, title: &str, editor: Editor) -> Page {
+        Page {
+            editor: Some(Arc::new(editor)),
+            ..self.page(title, None, "", None)
         }
     }
 }
@@ -183,10 +194,11 @@ pub(crate) fn configure<G: web_net::Gate>(
         .ready("/ready", ready)
 }
 
-/// The public content routes (home, posts, about), for any gate.
+/// The public content routes (home, posts, about, other pages), for any
+/// gate.
 pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
     pages: &Pages,
-) -> [Route<I, R, SiteEngine>; 3] {
+) -> [Route<I, R, SiteEngine>; 4] {
     let p = pages.clone();
     let home = get("/", move |cx: &mut Context<'_, I, SiteEngine>| {
         cx.render(&p.page("Home", None, "", None))
@@ -200,7 +212,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
         "/posts/:slug",
         move |cx: &mut Context<'_, I, SiteEngine>| {
             let slug = cx.param("slug")?.into_owned();
-            let Some(entry) = p.manifest.get(Kind::Post, &slug) else {
+            let Some(entry) = p.content.snapshot().get(Kind::Post, &slug) else {
                 return Err(web_net::Error::not_found("post.unknown"));
             };
             let view = p.page(&entry.title, Some(entry.clone()), "", None);
@@ -213,13 +225,27 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
 
     let p = pages.clone();
     let about = get("/about", move |cx: &mut Context<'_, I, SiteEngine>| {
-        let entry = p.manifest.get(Kind::Page, "about");
+        let entry = p.content.snapshot().get(Kind::Page, "about");
         cx.render(&p.page("About", entry, "Nothing here yet.", None))
     })
     .public()
     .template("page")
     .name("about");
-    [home, post_page, about]
+
+    // Every other page at its own path; the site's own paths are tried first.
+    let p = pages.clone();
+    let page = get("/:slug", move |cx: &mut Context<'_, I, SiteEngine>| {
+        let slug = cx.param("slug")?.into_owned();
+        let Some(entry) = p.content.snapshot().get(Kind::Page, &slug) else {
+            return Err(web_net::Error::not_found("page.unknown"));
+        };
+        let view = p.page(&entry.title, Some(entry.clone()), "", None);
+        cx.render(&view)
+    })
+    .public()
+    .template("page")
+    .name("page");
+    [home, post_page, about, page]
 }
 
 /// The site behind the gatekeeper (accounts and sessions in memory).
@@ -417,11 +443,12 @@ mod gatekeeper_site {
         .csrf_exempt("the gatekeeper checks the session-bound token and the origin itself")
         .name("sign-out");
 
-        let [home, post_page, about] = content_routes::<Session, Rule>(&pages);
+        let [home, post_page, about, page] = content_routes::<Session, Rule>(&pages);
         builder
             .route(home)
             .route(post_page)
             .route(about)
+            .route(page)
             .route(account)
             .route(sign_in)
             .route(sign_in_post)

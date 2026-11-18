@@ -67,7 +67,13 @@ curl -i http://127.0.0.1:8080/posts/hello-world
 curl -i http://127.0.0.1:8080/account
 ```
 
-The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/ready` (503 while a store cannot serve), `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+The site: `/`, `/posts/:slug`, `/about` and every other page at `/:slug` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/admin` (the content editor, below), `/health`, `/ready` (503 while a store cannot serve), `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+
+## Edit content
+
+On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member` and `editor` roles. The editor's pages are never cached, and every form carries a CSRF token.
+
+Saves go through the content store, so use a durable one (`content.store = "nex"` or `"bison"`) or the edits end with the process.
 
 ## Import content
 
@@ -85,7 +91,7 @@ cargo run -p wasp -- import ./content
 Each file is validated and escaped like any save (the body is plain text, blank lines between paragraphs); a file that does not pass is reported and skipped, and a slug already in the store is replaced.
 
 ```text
-themes/default/pages/    base, home, post, page, sign-in, account   (view: page)
+themes/default/pages/    base, home, post, page, sign-in, account, admin, edit   (view: page)
 themes/default/errors/   error, error/404         (view: error)
 themes/default/static/   site.css                 (served under /theme/)
 ```
@@ -120,7 +126,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `content.path` | `<data folder>/content.bison` | the bison-db file |
 | `auth.store` | `gatekeeper` (`nex` in a build without it) | the site's accounts and sessions: `gatekeeper` (feature `gatekeeper`, on by default; in memory: a restart signs everyone out) or `nex` (feature `store-nex`; nex-db: durable) |
 | `nex.path` | `<data folder>/nex` | the nex-db database, shared by `auth.store = "nex"` and `content.store = "nex"`; one process at a time |
-| `auth.admin` | none | an account made at boot (given the `member` role with nex-db); its password from `WASP_ADMIN_PASSWORD` |
+| `auth.admin` | none | an account made at boot (given the `member` and `editor` roles with nex-db); its password from `WASP_ADMIN_PASSWORD` |
 | `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |

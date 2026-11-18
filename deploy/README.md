@@ -60,7 +60,9 @@ Requests must come through Apache, which sends `X-Forwarded-For`. A request stra
 
 ## Content
 
-The content store allows one process at a time. To import posts and pages, stop the app, then:
+Sign in with the boot account (`auth.admin`) and open `/admin` to write and edit posts and pages in the browser; with `content.store = "nex"` they are kept in the same database as the accounts.
+
+The content store allows one process at a time. To import many posts and pages from files instead, stop the app, then:
 
 ```bash
 WASP_CONFIG=wasp.conf ./wasp import ./content

@@ -20,3 +20,8 @@ footer { color: var(--muted); font-size: 0.875rem; border-top: 1px solid var(--l
 input { font: inherit; padding: 0.4rem 0.5rem; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--ink); }
 button { font: inherit; padding: 0.4rem 1rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: #fff; cursor: pointer; justify-self: start; }
 p.error { color: var(--danger); }
+.stack.wide { max-width: none; }
+textarea, select { font: inherit; padding: 0.4rem 0.5rem; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--ink); }
+.entries { width: 100%; border-collapse: collapse; }
+.entries th, .entries td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); }
+button.danger { background: var(--danger); border-color: var(--danger); margin-top: 1rem; }

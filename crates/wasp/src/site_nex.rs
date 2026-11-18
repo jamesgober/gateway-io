@@ -6,19 +6,40 @@
 //! A guest's first visit to the sign-in page sets a pre-session cookie and
 //! comes back to it, so the sign-in form's token is bound to that visitor;
 //! a signed-in visitor's tokens are bound to the session.
+//!
+//! The content editor is here too, for accounts with the `editor` role:
+//!
+//! | Path | What |
+//! |---|---|
+//! | `GET /admin` | every entry, with links to edit it and to write a new one |
+//! | `GET /admin/new/post`, `/admin/new/page` | an empty entry form (a post is dated today) |
+//! | `GET /admin/edit/:slug` | the entry form, filled in |
+//! | `POST /admin/save` | saves (422 with the form again when a rule is broken), then 303 to the entry |
+//! | `POST /admin/delete` | removes the entry, then 303 to `/admin` |
+//!
+//! Every form carries web-net's CSRF token; the editor's pages are never
+//! cached (`Cache-Control: no-store`).
+
+use std::sync::Arc;
 
 use gateway_io::{Caller, WebGate};
 use wasp_core::{Access, Decision, Identity, PermSet, Rule};
 use web_net::form_net::{self, Secret};
 use web_net::{App, Context, Denial, Gate, Request, Route, get, post};
 
-use crate::content::Manifest;
+use crate::content::{Draft, Entry, Kind, Manifest, SaveError, StoreError};
 use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
-use crate::theme::{Form, SiteEngine};
+use crate::theme::{Editor, Form, SiteEngine};
 
 /// The permission the account page needs (the `member` role's bit).
 pub const MEMBER: PermSet = PermSet(1);
+
+/// The permission the content editor needs (the `editor` role's bit).
+pub const EDITOR: PermSet = PermSet(2);
+
+/// The editor's rule.
+const EDITING: Rule = Rule::needs(4, EDITOR);
 
 /// Who a request is from, as web-net sees it on this site.
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +118,176 @@ form_net::form! {
     ignore = ["csrf_token"];
 }
 
+form_net::form! {
+    /// The entry form (web-net checked its `csrf_token` before the handler).
+    struct EntryForm {
+        kind: String,
+        slug: String,
+        was: String,
+        title: String,
+        summary: String,
+        date: String,
+        body: String,
+    }
+    ignore = ["csrf_token"];
+}
+
+form_net::form! {
+    /// The delete button.
+    struct DeleteForm {
+        slug: String,
+    }
+    ignore = ["csrf_token"];
+}
+
+/// The editor's view for this request: every entry, the form's addresses,
+/// and the token; the entry fields empty.
+fn editor(cx: &mut NexCx<'_>, pages: &Pages) -> Result<Editor, web_net::Error> {
+    // Never kept by a browser or a cache in front of the site.
+    cx.set_header("cache-control", "no-store");
+    Ok(Editor {
+        entries: Arc::new(pages.content.snapshot().all()),
+        save: cx.url("/admin/save")?,
+        delete: cx.url("/admin/delete")?,
+        new_post: cx.url("/admin/new/post")?,
+        new_page: cx.url("/admin/new/page")?,
+        csrf: cx.csrf_token()?,
+        ..Editor::default()
+    })
+}
+
+/// The editor's form filled in from a stored entry.
+fn filled(editor: Editor, entry: &Entry) -> Editor {
+    Editor {
+        existing: true,
+        kind: entry.kind.clone(),
+        slug: entry.slug.clone(),
+        was: entry.slug.clone(),
+        title: entry.title.clone(),
+        summary: entry.summary.clone(),
+        date: entry.date.clone(),
+        body: entry.text.clone(),
+        ..editor
+    }
+}
+
+/// A store failure as the editor sees it: 503 when it may pass, else 500.
+fn store_failed(e: &StoreError) -> web_net::Error {
+    if e.is_retryable() {
+        web_net::Error::unavailable("content.unavailable")
+    } else {
+        web_net::Error::internal("content.store")
+    }
+}
+
+/// The site path of an entry, for the redirect after a save.
+fn path_of(kind: Kind, slug: &str) -> String {
+    match kind {
+        Kind::Post => format!("/posts/{slug}"),
+        Kind::Page => format!("/{slug}"),
+    }
+}
+
+/// The content editor's routes.
+fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
+    let p = pages.clone();
+    let list: NexRoute = get("/admin", move |cx: &mut NexCx<'_>| {
+        let view = editor(cx, &p)?;
+        cx.render(&p.editor_page("Content", view))
+    })
+    .allow(EDITING)
+    .template("admin")
+    .name("admin");
+
+    let p = pages.clone();
+    let new_entry: NexRoute = get("/admin/new/:kind", move |cx: &mut NexCx<'_>| {
+        let kind = cx.param("kind")?.into_owned();
+        let (title, date) = match kind.as_str() {
+            "post" => ("New post", crate::content::today()),
+            "page" => ("New page", String::new()),
+            _ => return Err(web_net::Error::not_found("admin.kind")),
+        };
+        let view = Editor {
+            kind,
+            date,
+            ..editor(cx, &p)?
+        };
+        cx.render(&p.editor_page(title, view))
+    })
+    .allow(EDITING)
+    .template("edit")
+    .name("admin-new");
+
+    let p = pages.clone();
+    let edit: NexRoute = get("/admin/edit/:slug", move |cx: &mut NexCx<'_>| {
+        let slug = cx.param("slug")?.into_owned();
+        let Some(entry) = p.content.snapshot().find(&slug) else {
+            return Err(web_net::Error::not_found("admin.unknown"));
+        };
+        let view = filled(editor(cx, &p)?, &entry);
+        cx.render(&p.editor_page(&format!("Edit {}", entry.title), view))
+    })
+    .allow(EDITING)
+    .template("edit")
+    .name("admin-edit");
+
+    let p = pages.clone();
+    let save: NexRoute = post("/admin/save", move |cx: &mut NexCx<'_>| {
+        let form: EntryForm = cx.form()?;
+        let kind = match form.kind.as_str() {
+            "post" => Kind::Post,
+            "page" => Kind::Page,
+            _ => return Err(web_net::Error::unprocessable("admin.kind")),
+        };
+        let draft = Draft {
+            kind,
+            slug: form.slug.trim(),
+            title: form.title.trim(),
+            summary: form.summary.trim(),
+            body: &form.body,
+            date: form.date.trim(),
+        };
+        let was = form.was.trim();
+        match p.content.save(&draft, (!was.is_empty()).then_some(was)) {
+            Ok(()) => cx.redirect(303, &path_of(kind, draft.slug)),
+            Err(SaveError::Invalid(why)) => {
+                // The form again, as it was typed, with the reason.
+                let view = Editor {
+                    error: why.0,
+                    existing: !was.is_empty(),
+                    kind: form.kind.clone(),
+                    slug: form.slug.clone(),
+                    was: form.was.clone(),
+                    title: form.title.clone(),
+                    summary: form.summary.clone(),
+                    date: form.date.clone(),
+                    body: form.body.clone(),
+                    ..editor(cx, &p)?
+                };
+                cx.status(422);
+                cx.render(&p.editor_page("Not saved", view))
+            }
+            Err(SaveError::Store(e)) => Err(store_failed(&e)),
+        }
+    })
+    .allow(EDITING)
+    .template("edit")
+    .name("admin-save");
+
+    let p = pages.clone();
+    let delete: NexRoute = post("/admin/delete", move |cx: &mut NexCx<'_>| {
+        let form: DeleteForm = cx.form()?;
+        p.content
+            .remove(form.slug.trim())
+            .map_err(|e| store_failed(&e))?;
+        cx.redirect(303, "/admin")
+    })
+    .allow(EDITING)
+    .name("admin-delete");
+
+    [list, new_entry, edit, save, delete]
+}
+
 fn random_hex() -> Result<String, web_net::Error> {
     let bytes = crypt_io::generate_key().map_err(|_| web_net::Error::internal("random"))?;
     Ok(bytes[..16].iter().map(|b| format!("{b:02x}")).collect())
@@ -132,6 +323,7 @@ pub fn build(
             action: cx.url("/sign-out")?,
             csrf: cx.csrf_token()?,
             user,
+            editor: cx.identity().identity.perms().contains(EDITOR),
             ..Form::default()
         };
         cx.render(&p.page("Account", None, "", Some(form)))
@@ -235,11 +427,18 @@ pub fn build(
     .allow(Rule::needs(3, PermSet::NONE))
     .name("sign-out");
 
-    let [home, post_page, about] = content_routes::<NexWho, Rule>(&pages);
+    let [home, post_page, about, page] = content_routes::<NexWho, Rule>(&pages);
+    let [list, new_entry, edit, save, delete] = editor_routes(&pages);
     builder
         .route(home)
         .route(post_page)
         .route(about)
+        .route(page)
+        .route(list)
+        .route(new_entry)
+        .route(edit)
+        .route(save)
+        .route(delete)
         .route(account)
         .route(sign_in)
         .route(sign_in_post)

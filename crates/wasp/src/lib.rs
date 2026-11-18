@@ -320,7 +320,7 @@ fn wire_with(
                 let password = admin_password.ok_or_else(|| {
                     format!("auth.admin is set: put its password in {ADMIN_PASSWORD_ENV}")
                 })?;
-                a.ensure_account(&admin, password, &[nex::MEMBER_ROLE])
+                a.ensure_account(&admin, password, &[nex::MEMBER_ROLE, nex::EDITOR_ROLE])
                     .map_err(|e| e.to_string())?;
             }
             (
