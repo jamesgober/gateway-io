@@ -672,9 +672,12 @@ dependencies = [
 
 [[package]]
 name = "luminess"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ccd8fbe871b49e07a17d8a6dd54e2ca8c643b921e3b0331e0310a3dbda53d86"
+checksum = "6f91355f9d24d9e13da4fc17868a9201614f72063598218c67b53e9a7d089771"
+dependencies = [
+ "web-net",
+]
 
 [[package]]
 name = "matchers"
