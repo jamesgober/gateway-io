@@ -61,6 +61,21 @@ curl -i http://127.0.0.1:8080/account
 
 The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
 
+## Import content
+
+With a durable store (`content.store = "bison"`), posts and pages come in from files. Stop the server first: the store allows one process at a time.
+
+```text
+<folder>/posts/<slug>.md     title, date (YYYY-MM-DD), summary; a blank line; the body
+<folder>/pages/<slug>.md     title, summary; a blank line; the body
+```
+
+```bash
+cargo run -p wasp -- import ./content
+```
+
+Each file is validated and escaped like any save (the body is plain text, blank lines between paragraphs); a file that does not pass is reported and skipped, and a slug already in the store is replaced.
+
 ```text
 themes/default/pages/    base, home, post, page, sign-in, account   (view: page)
 themes/default/errors/   error, error/404         (view: error)

@@ -25,6 +25,44 @@ fn main() -> ExitCode {
         Err(error) => return error.report(),
     };
 
+    // `wasp import <folder>`: content into the store, then exit.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("import") {
+        let Some(from) = args.get(1) else {
+            eprintln!("usage: wasp import <folder with posts/ and pages/>");
+            return ExitCode::from(64);
+        };
+        let data = boot.foundation().paths().data().to_path_buf();
+        return match wasp::import(
+            &boot.foundation().config(),
+            &data,
+            std::path::Path::new(from),
+        ) {
+            Ok(report) => {
+                for slug in &report.saved {
+                    println!("saved    {slug}");
+                }
+                for (file, why) in &report.refused {
+                    println!("refused  {file}: {why}");
+                }
+                println!(
+                    "{} saved, {} refused",
+                    report.saved.len(),
+                    report.refused.len()
+                );
+                if report.refused.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(65)
+                }
+            }
+            Err(reason) => {
+                eprintln!("import refused: {reason}");
+                ExitCode::from(78)
+            }
+        };
+    }
+
     // PHASES 1 to 3: the core, its services and profiles, the site.
     let data = boot.foundation().paths().data().to_path_buf();
     let wiring = match wasp::wire_in(&boot.foundation().config(), &data) {

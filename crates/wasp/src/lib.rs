@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod content;
+pub mod import;
 pub mod site;
 pub mod theme;
 
@@ -37,6 +38,80 @@ impl std::fmt::Debug for Wiring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Wiring").field("core", &self.core).finish()
     }
+}
+
+/// The content store `[content]` names, opened.
+fn open_store(
+    config: &Config,
+    data_dir: &std::path::Path,
+    notices: &mut Vec<String>,
+) -> Result<Arc<dyn content::ContentStore>, String> {
+    let e = |e: wasp_core::suite::Error| e.to_string();
+    let store_kind: String = config
+        .get_or("content.store", "memory".to_owned())
+        .map_err(e)?;
+    let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
+        "memory" => Arc::new(content::MemoryStore::new()),
+        "bison" => {
+            let path: std::path::PathBuf = config
+                .get_or("content.path", data_dir.join("content.bison"))
+                .map_err(e)?;
+            let recovery: String = config
+                .get_or("content.recovery", "strict".to_owned())
+                .map_err(e)?;
+            let recovery = match recovery.as_str() {
+                "strict" => content::Recovery::Strict,
+                "salvage" => content::Recovery::Salvage,
+                other => {
+                    return Err(format!(
+                        "content.recovery must be `strict` or `salvage`, not `{other}`"
+                    ));
+                }
+            };
+            let store = content::BisonStore::open_with(&path, recovery).map_err(|e| e.0)?;
+            if store.discarded() > 0 {
+                notices.push(format!(
+                    "content store {}: {} bytes discarded at open (a torn last record, or what a salvage skipped); check the content",
+                    path.display(),
+                    store.discarded()
+                ));
+            }
+            Arc::new(store)
+        }
+        other => {
+            return Err(format!(
+                "content.store must be `memory` or `bison`, not `{other}`"
+            ));
+        }
+    };
+    Ok(store)
+}
+
+/// Imports the posts and pages in `from` into the content store `[content]`
+/// names (see [the import module](mod@import)), with the data folder `data_dir`. The store must be
+/// durable, and no running instance may hold it (stop the server first).
+pub fn import(
+    config: &Config,
+    data_dir: &std::path::Path,
+    from: &std::path::Path,
+) -> Result<import::Report, String> {
+    let kind: String = config
+        .get_or("content.store", "memory".to_owned())
+        .map_err(|e| e.to_string())?;
+    if kind == "memory" {
+        return Err(
+            "content.store is `memory`: an import would be lost at exit; set content.store = \"bison\""
+                .to_owned(),
+        );
+    }
+    let mut notices = Vec::new();
+    let store = open_store(config, data_dir, &mut notices)?;
+    let settings = site::SiteSettings::from_config(config)?;
+    let mut manifest =
+        content::Manifest::open(store.clone(), &settings.base, false).map_err(|e| e.0)?;
+    let report = import::import_into(&mut manifest, from)?;
+    store.flush().map_err(|e| e.0)?;
+    Ok(report)
 }
 
 /// Phases 1 to 3 from configuration, for tests and tools: a bison content
@@ -81,43 +156,7 @@ fn wire_with(
 ) -> Result<Wiring, String> {
     let e = |e: wasp_core::suite::Error| e.to_string();
     let mut notices = Vec::new();
-    let store_kind: String = config
-        .get_or("content.store", "memory".to_owned())
-        .map_err(e)?;
-    let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
-        "memory" => Arc::new(content::MemoryStore::new()),
-        "bison" => {
-            let path: std::path::PathBuf = config
-                .get_or("content.path", data_dir.join("content.bison"))
-                .map_err(e)?;
-            let recovery: String = config
-                .get_or("content.recovery", "strict".to_owned())
-                .map_err(e)?;
-            let recovery = match recovery.as_str() {
-                "strict" => content::Recovery::Strict,
-                "salvage" => content::Recovery::Salvage,
-                other => {
-                    return Err(format!(
-                        "content.recovery must be `strict` or `salvage`, not `{other}`"
-                    ));
-                }
-            };
-            let store = content::BisonStore::open_with(&path, recovery).map_err(|e| e.0)?;
-            if store.discarded() > 0 {
-                notices.push(format!(
-                    "content store {}: {} bytes discarded at open (a torn last record, or what a salvage skipped); check the content",
-                    path.display(),
-                    store.discarded()
-                ));
-            }
-            Arc::new(store)
-        }
-        other => {
-            return Err(format!(
-                "content.store must be `memory` or `bison`, not `{other}`"
-            ));
-        }
-    };
+    let store = open_store(config, data_dir, &mut notices)?;
     let threads: u64 = config.get_or("jobs.threads", 2_u64).map_err(e)?;
     let queue: u64 = config.get_or("jobs.queue", 1024_u64).map_err(e)?;
     let jobs = wasp_core::InProcessJobs::new(
