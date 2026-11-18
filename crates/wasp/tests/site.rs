@@ -446,3 +446,25 @@ fn wrong_configuration_refuses_to_boot() {
     let config = Config::from_text(&with_theme("[site]\nbase = \"/blog\"\n")).expect("config");
     assert!(wasp::wire(&config).is_ok());
 }
+
+#[test]
+fn the_site_puts_health_admin_and_sign_in_in_their_lanes() {
+    use wasp_core::Lane;
+    let config = Config::from_text(&with_theme("[site]\nbase = \"/blog\"\n")).expect("config");
+    let wiring = wasp::wire(&config).expect("wiring");
+    let site = &wiring.core.profiles()[0];
+    for (method, path, lane) in [
+        ("GET", "/blog/health", Lane::CRITICAL),
+        ("GET", "/blog/ready", Lane::CRITICAL),
+        ("GET", "/blog/admin", Lane::ADMIN),
+        ("POST", "/blog/admin/save", Lane::ADMIN),
+        ("GET", "/blog/sign-in", Lane::AUTH),
+        ("POST", "/blog/sign-in", Lane::AUTH),
+        ("POST", "/blog/sign-out", Lane::AUTH),
+        ("GET", "/blog/", Lane::NORMAL),
+        ("GET", "/blog/posts/hello", Lane::NORMAL),
+        ("GET", "/health", Lane::NORMAL),
+    ] {
+        assert_eq!(site.lane_for(method, path), lane, "{method} {path}");
+    }
+}

@@ -25,13 +25,15 @@ use crate::stages::{StageTimes, Stamps};
 use crate::tickets::RequestTickets;
 use crate::web::{Caller, WebServices};
 
-/// Admission: a request is admitted only if its worker has a free passport.
-/// Runs once the head is complete and before any body byte is read, so a slow
-/// or half-sent request never holds a passport.
+/// Admission: a request is admitted only if its worker has a free passport
+/// for its lane (browsing cannot take the passports held back for the
+/// reserved lanes). Runs once the head is complete and before any body byte
+/// is read, so a slow or half-sent request never holds a passport. A refusal
+/// asks the client to come back in one to three seconds, spread by
+/// connection, so refused clients do not all return in the same second.
 #[derive(Clone)]
 pub struct PassportAdmit {
     pool: Arc<PassportPool>,
-    retry_after: Duration,
     prepared: Arc<AtomicU16>,
 }
 
@@ -41,7 +43,6 @@ impl PassportAdmit {
     pub fn new(pool: Arc<PassportPool>) -> PassportAdmit {
         PassportAdmit {
             pool,
-            retry_after: Duration::from_secs(1),
             prepared: Arc::new(AtomicU16::new(0)),
         }
     }
@@ -63,12 +64,12 @@ impl Admit for PassportAdmit {
     }
 
     #[inline]
-    fn admit(&self, worker: WorkerId, _env: &Envelope) -> Result<Admitted, Shed> {
-        if self.pool.admit(worker.get()) {
+    fn admit(&self, worker: WorkerId, env: &Envelope) -> Result<Admitted, Shed> {
+        if self.pool.admit_lane(worker.get(), Lane(env.lane().0)) {
             Ok(Admitted { token: 0 })
         } else {
             Err(Shed {
-                retry_after: Some(self.retry_after),
+                retry_after: Some(Duration::from_secs(1 + env.connection().get() % 3)),
                 close: false,
             })
         }
@@ -375,8 +376,16 @@ impl HttpService for Pipeline {
     /// The head is complete: the request's bouncer ticket, under the
     /// connection's, is taken and held until `done`. A connection the door
     /// never admitted, or one already revoked, is refused here.
-    fn head(&self, _head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
+    fn head(&self, head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
         let hook = self.stages.enabled().then(Instant::now);
+        // The profile's lane rules (health, admin, sign-in), before the
+        // urgent line and admission read the lane.
+        if let Some(profile) = self.core.profile(ProfileId(env.profile().0))
+            && !profile.lanes.is_empty()
+        {
+            let lane = profile.lane_for(head.method_str(), head.path());
+            env.set_lane(serve_net::Lane(lane.0));
+        }
         let id = bouncer_io::RequestId(
             u128::from(env.connection().get()) << 32 | u128::from(env.seq().get()),
         );

@@ -189,6 +189,22 @@ const DEFAULT_AUTH_STORE: &str = if cfg!(feature = "gatekeeper") {
     ""
 };
 
+/// The site's lanes: health and readiness first, then the content editor,
+/// then signing in and out; everything else is browsing. Under load the
+/// browsing lanes are refused first (`Shed`), and they cannot take the
+/// passports held back for these (`gateway.reserve`).
+fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
+    use wasp_core::{Lane, LaneRule};
+    let at = |path: &str| format!("{base}{path}");
+    vec![
+        LaneRule::exact(&at("/health"), Lane::CRITICAL),
+        LaneRule::exact(&at("/ready"), Lane::CRITICAL),
+        LaneRule::under(&at("/admin"), Lane::ADMIN),
+        LaneRule::exact(&at("/sign-in"), Lane::AUTH),
+        LaneRule::exact(&at("/sign-out"), Lane::AUTH).method("POST"),
+    ]
+}
+
 /// The gates the site signs in through.
 enum Gates {
     #[cfg(feature = "gatekeeper")]
@@ -359,7 +375,7 @@ fn wire_with(
                 Hello::new(ctx)
             }
         })
-        .profile("site", &service, |_| {})
+        .profile("site", &service, |p| p.lanes = site_lanes(&settings.base))
         .load()
         .map_err(|e| e.0)?;
     let core = Arc::new(core);

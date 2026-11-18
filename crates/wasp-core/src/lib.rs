@@ -46,7 +46,7 @@ pub use crate::identity::{Identity, PermSet, SessionId, Standing, Subject, Tenan
 pub use crate::jobs::{InProcessJobs, Job, JobRefused, JobStats, Jobs, NoJobs, Submitted};
 pub use crate::passport::{Exit, Passport, RequestView};
 pub use crate::pool::{PassportPool, PoolStats};
-pub use crate::profile::{CredentialLocator, Profile, SessionSettings};
+pub use crate::profile::{CredentialLocator, LaneRule, Profile, SessionSettings};
 pub use crate::provider::{Provider, ProviderError};
 pub use crate::service::{Service, ServiceCtx, Work};
 pub use crate::slot::{

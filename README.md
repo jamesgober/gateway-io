@@ -103,6 +103,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `gateway.listen` | `127.0.0.1:8080` | the listening address |
 | `gateway.workers` | logical CPUs, at most 64 | reactor workers (1 to 256); with `blocking`, the connections served at once |
 | `gateway.passports` | 256 | passports per worker (requests in flight) |
+| `gateway.reserve` | an eighth of `gateway.passports` | passports per worker held back for health checks, the content editor, and sign-in: browsing cannot take them, so a flood of page views never locks those out |
 | `gateway.drain` | `10s` | the longest a drain may take |
 | `gateway.head_timeout` | `10s` | the head deadline |
 | `gateway.max_body` | 1 MiB | the largest buffered body (at most 64 MiB) |

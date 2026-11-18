@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::passport::{Exit, Passport};
-use crate::slot::{Slot, SlotSizes};
+use crate::slot::{Lane, Slot, SlotSizes};
 use crate::stage::Arrived;
 
 /// One worker's slots. Cache-line aligned so two workers never share a line.
@@ -44,6 +44,7 @@ pub struct PoolStats {
 pub struct PassportPool {
     shelves: Box<[Shelf]>,
     per_worker: u32,
+    reserved: u32,
     retain: usize,
     sizes: SlotSizes,
     refused: AtomicU64,
@@ -70,6 +71,7 @@ impl PassportPool {
         PassportPool {
             shelves,
             per_worker,
+            reserved: 0,
             retain: sizes.retain,
             sizes,
             refused: AtomicU64::new(0),
@@ -89,17 +91,46 @@ impl PassportPool {
         self.per_worker
     }
 
-    /// Admission: reserves one of `worker`'s passports. `false` means the
-    /// worker is full (or unknown): refuse with 503 and take nothing.
+    /// The same pool, holding `passports` of each worker's back from
+    /// browsing for the reserved lanes ([`Lane::is_reserved`]: critical,
+    /// admin, auth). At most all but one: browsing always has a passport.
+    #[must_use]
+    pub fn with_reserve(mut self, passports: u32) -> PassportPool {
+        self.reserved = passports.min(self.per_worker - 1);
+        self
+    }
+
+    /// Each worker's passports held back for the reserved lanes.
+    #[must_use]
+    pub fn reserve(&self) -> u32 {
+        self.reserved
+    }
+
+    /// Admission for the default lane: reserves one of `worker`'s
+    /// passports. `false` means the worker is full (or unknown): refuse
+    /// with 503 and take nothing.
     #[inline]
     #[must_use]
     pub fn admit(&self, worker: u16) -> bool {
+        self.admit_lane(worker, Lane::NORMAL)
+    }
+
+    /// Admission for a request in `lane`: a reserved lane may take any free
+    /// passport, any other lane only those not held back.
+    #[inline]
+    #[must_use]
+    pub fn admit_lane(&self, worker: u16, lane: Lane) -> bool {
         let Some(shelf) = self.shelves.get(usize::from(worker)) else {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         };
+        let limit = if lane.is_reserved() {
+            self.per_worker
+        } else {
+            self.per_worker - self.reserved
+        };
         let before = shelf.in_use.fetch_add(1, Ordering::AcqRel);
-        if before >= self.per_worker {
+        if before >= limit {
             shelf.in_use.fetch_sub(1, Ordering::AcqRel);
             self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -221,10 +252,30 @@ impl std::fmt::Debug for PassportPool {
 mod tests {
     use super::*;
     use crate::customs::HeadRules;
-    use crate::slot::{Lane, ProfileId, RequestId, ServiceTag, Trip};
+    use crate::slot::{ProfileId, RequestId, ServiceTag, Trip};
 
     fn pool() -> PassportPool {
         PassportPool::new(2, 2, SlotSizes::default())
+    }
+
+    #[test]
+    fn reserved_passports_are_kept_for_the_reserved_lanes() {
+        let pool = PassportPool::new(1, 4, SlotSizes::default()).with_reserve(1);
+        assert_eq!(pool.reserve(), 1);
+        assert!((0..3).all(|_| pool.admit_lane(0, Lane::NORMAL)));
+        assert!(!pool.admit_lane(0, Lane::NORMAL), "browsing stops at 3");
+        assert!(!pool.admit_lane(0, Lane::WRITE), "writes are not reserved");
+        assert!(
+            pool.admit_lane(0, Lane::CRITICAL),
+            "health takes the reserve"
+        );
+        assert!(
+            !pool.admit_lane(0, Lane::AUTH),
+            "and then the worker is full"
+        );
+        assert_eq!(pool.stats().refused, 3);
+        let all = PassportPool::new(1, 2, SlotSizes::default()).with_reserve(9);
+        assert_eq!(all.reserve(), 1, "browsing always keeps one");
     }
 
     #[test]

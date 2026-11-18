@@ -112,14 +112,19 @@ impl Door {
             }
         };
         let tickets = Arc::new(RequestTickets::new(threads));
-        let pool = Arc::new(PassportPool::new(
-            threads,
-            per_worker,
-            SlotSizes {
-                body: 0,
-                ..SlotSizes::default()
-            },
-        ));
+        // Health checks, the administrator, and sign-in keep passports a
+        // flood of browsing cannot take.
+        let pool = Arc::new(
+            PassportPool::new(
+                threads,
+                per_worker,
+                SlotSizes {
+                    body: 0,
+                    ..SlotSizes::default()
+                },
+            )
+            .with_reserve(settings.reserve_for(per_worker)),
+        );
         let (bouncer, ejector) =
             bouncer::build(settings, events).map_err(|e| OpenError(format!("bouncer: {e}")))?;
 

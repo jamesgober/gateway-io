@@ -78,9 +78,32 @@ pub struct ServiceTag(pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Lane(pub u8);
 
+impl Lane {
+    /// Health checks and internal control.
+    pub const CRITICAL: Lane = Lane(0);
+    /// The administrator's pages.
+    pub const ADMIN: Lane = Lane(1);
+    /// Signing in and out.
+    pub const AUTH: Lane = Lane(2);
+    /// State-changing requests.
+    pub const WRITE: Lane = Lane(3);
+    /// Browsing: the default.
+    pub const NORMAL: Lane = Lane(4);
+    /// Exports, crawlers, large downloads: shed first.
+    pub const BULK: Lane = Lane(5);
+
+    /// Whether the lane may use the passports held back from browsing
+    /// (critical, admin, auth), so a flood of other traffic cannot lock out
+    /// health checks, the administrator, or sign-in.
+    #[must_use]
+    pub const fn is_reserved(self) -> bool {
+        self.0 <= Lane::AUTH.0
+    }
+}
+
 impl Default for Lane {
     fn default() -> Lane {
-        Lane(4)
+        Lane::NORMAL
     }
 }
 

@@ -16,10 +16,22 @@ fn core() -> Arc<Core> {
     Arc::new(
         Core::builder()
             .service("hello", Hello::with_slow_route)
-            .profile("site", "hello", |_| {})
+            .profile("site", "hello", |p| {
+                p.lanes = vec![wasp_core::LaneRule::exact(
+                    "/health",
+                    wasp_core::Lane::CRITICAL,
+                )];
+            })
             .load()
             .expect("core loads"),
     )
+}
+
+/// The `Retry-After` of a refusal: one to three seconds.
+fn retry_after_spread(got: &Got) -> bool {
+    ["1", "2", "3"]
+        .iter()
+        .any(|s| has_field(got, "retry-after", s))
 }
 
 fn settings(workers: u16, passports: u32) -> Settings {
@@ -206,7 +218,7 @@ fn a_full_worker_answers_503_without_a_passport() {
     let started = Instant::now();
     let got = get(addr, "/").expect("a response");
     assert_eq!(got.status, 503);
-    assert!(has_field(&got, "retry-after", "1"), "{}", got.head);
+    assert!(retry_after_spread(&got), "{}", got.head);
     assert!(
         started.elapsed() < Duration::from_millis(500),
         "refused at once"
@@ -262,6 +274,47 @@ fn a_revocation_during_a_request_denies_its_reply() {
     );
     thread::sleep(Duration::from_millis(100));
     assert_eq!(open.pool().stats().in_use, 0);
+    let _ = open.close(Duration::from_secs(1));
+}
+
+#[test]
+fn browsing_cannot_take_the_reserved_passports() {
+    // Four passports, one held back: three in use by browsing fill what
+    // browsing may take, and a health check still gets the fourth.
+    let (open, addr, _line) = open(&Settings {
+        reserve: Some(1),
+        ..settings(1, 4)
+    });
+    let held: Vec<_> = (0..3)
+        .map(|_| open.pool().admit_and_take(0).expect("a browsing passport"))
+        .collect();
+    assert!(open.pool().admit_and_take(0).is_none(), "browsing is full");
+    let got = get(addr, "/").expect("a response");
+    assert_eq!(got.status, 503, "{}", got.head);
+    assert!(retry_after_spread(&got), "{}", got.head);
+    assert_eq!(get(addr, "/health").map(|g| g.status), Some(200));
+    for p in held {
+        open.pool().give_back_and_release(p.refuse(500));
+    }
+    assert_eq!(get(addr, "/").map(|g| g.status), Some(200), "free again");
+    let _ = open.close(Duration::from_secs(1));
+}
+
+#[test]
+fn shed_keeps_the_reserved_lanes() {
+    let (open, addr, line) = open(&settings(1, 4));
+    line.set(Level::Shed, "test").expect("shed");
+    open.running().server_handle().wake_all();
+    thread::sleep(Duration::from_millis(50));
+    let got = get(addr, "/");
+    assert!(got.as_ref().is_none_or(|g| g.status == 503), "{got:?}");
+    assert_eq!(
+        get(addr, "/health").map(|g| g.status),
+        Some(200),
+        "health checks pass under shed"
+    );
+    line.shift(Level::Shed, Level::Normal, "test over")
+        .expect("normal");
     let _ = open.close(Duration::from_secs(1));
 }
 

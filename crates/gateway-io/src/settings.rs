@@ -30,6 +30,10 @@ pub struct Settings {
     /// Passports per worker: the worker's limit on requests in flight
     /// (`[gateway] passports`, default 256).
     pub passports: u32,
+    /// Passports per worker held back from browsing for health checks, the
+    /// administrator, and sign-in (`[gateway] reserve`; `None` for the
+    /// default, an eighth of `passports`, at least one when there are two).
+    pub reserve: Option<u32>,
     /// The longest a drain may take (`[gateway] drain`, default 10 s).
     pub drain: Duration,
     /// The head deadline (`[gateway] head_timeout`, default 10 s).
@@ -81,6 +85,7 @@ impl Default for Settings {
             listen: "127.0.0.1:8080".to_owned(),
             workers: u16::try_from(cpus.clamp(1, 64)).unwrap_or(4),
             passports: 256,
+            reserve: None,
             drain: Duration::from_secs(10),
             head_timeout: Duration::from_secs(10),
             max_body: 1024 * 1024,
@@ -107,6 +112,21 @@ impl std::fmt::Display for SettingsError {
 impl std::error::Error for SettingsError {}
 
 impl Settings {
+    /// The passports per worker held back for the reserved lanes: `reserve`,
+    /// or an eighth of `passports_per_worker` (at least one when there are
+    /// two or more, none with one).
+    #[must_use]
+    pub fn reserve_for(&self, passports_per_worker: u32) -> u32 {
+        let default = if passports_per_worker < 2 {
+            0
+        } else {
+            (passports_per_worker / 8).max(1)
+        };
+        self.reserve
+            .unwrap_or(default)
+            .min(passports_per_worker.saturating_sub(1))
+    }
+
     /// Reads the settings; every key is optional.
     pub fn from_config(config: &Config) -> Result<Settings, SettingsError> {
         let d = Settings::default();
@@ -123,6 +143,7 @@ impl Settings {
         let passports: u64 = config
             .get_or("gateway.passports", u64::from(d.passports))
             .map_err(err)?;
+        let reserve: Option<u64> = config.get("gateway.reserve").map_err(err)?;
         let driver: String = config
             .get_or("gateway.driver", "reactor".to_owned())
             .map_err(err)?;
@@ -145,6 +166,15 @@ impl Settings {
                 .ok()
                 .filter(|p| (1..=65_536).contains(p))
                 .ok_or_else(|| SettingsError("gateway.passports must be 1 to 65536".into()))?,
+            reserve: match reserve {
+                None => None,
+                Some(r) if r < passports => u32::try_from(r).ok(),
+                Some(_) => {
+                    return Err(SettingsError(
+                        "gateway.reserve must be less than gateway.passports".into(),
+                    ));
+                }
+            },
             drain: config.get_or("gateway.drain", d.drain).map_err(err)?,
             head_timeout: config
                 .get_or("gateway.head_timeout", d.head_timeout)
