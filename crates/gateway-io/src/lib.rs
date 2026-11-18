@@ -36,7 +36,7 @@ pub use crate::events::LogSink;
 pub use crate::gateway::{Door, Extras, Gateway, OpenError};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
-pub use crate::settings::{Driver, Settings, SettingsError};
+pub use crate::settings::{Driver, IngressMode, Settings, SettingsError};
 pub use crate::stages::StageTimes;
 pub use crate::tickets::RequestTickets;
 pub use crate::web::{Caller, WaspGate, WebGate, WebService, WebServices, Who};

@@ -49,6 +49,29 @@ pub struct Settings {
     /// Addresses exempt from the door's budgets, for local load tests
     /// (`[door] exempt`, default none).
     pub exempt: Vec<IpAddr>,
+    /// How clients reach the listener (`[gateway] ingress`, `direct` by
+    /// default, or `proxy` behind a reverse proxy).
+    pub ingress: IngressMode,
+}
+
+/// How clients reach the listener.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IngressMode {
+    /// Clients connect themselves; the TCP peer is the client.
+    #[default]
+    Direct,
+    /// Behind a reverse proxy (Apache, nginx): the client is the address the
+    /// proxy names in `X-Forwarded-For`, believed only from `trusted`
+    /// (`[gateway] trusted_proxies`, required). A request from a trusted
+    /// proxy without the header is refused. With `forwarded_proto`
+    /// (`[gateway] forwarded_proto`, default true) the scheme comes from
+    /// `X-Forwarded-Proto`, so a site behind an https proxy knows it is https.
+    Proxy {
+        /// The proxies' addresses or blocks (`127.0.0.1`, `10.0.0.0/8`).
+        trusted: Vec<String>,
+        /// Take the scheme from `X-Forwarded-Proto`.
+        forwarded_proto: bool,
+    },
 }
 
 impl Default for Settings {
@@ -66,6 +89,7 @@ impl Default for Settings {
             stage_timing: false,
             ban: Vec::new(),
             exempt: Vec::new(),
+            ingress: IngressMode::Direct,
         }
     }
 }
@@ -146,8 +170,57 @@ impl Settings {
                 .map_err(err)?,
             ban: addresses(config, "door.ban")?,
             exempt: addresses(config, "door.exempt")?,
+            ingress: ingress(config)?,
         };
         Ok(settings)
+    }
+}
+
+fn ingress(config: &Config) -> Result<IngressMode, SettingsError> {
+    let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());
+    let mode: String = config
+        .get_or("gateway.ingress", "direct".to_owned())
+        .map_err(err)?;
+    match mode.as_str() {
+        "direct" => Ok(IngressMode::Direct),
+        "proxy" => {
+            let trusted: Vec<String> = config
+                .get_or("gateway.trusted_proxies", Vec::new())
+                .map_err(err)?;
+            if trusted.is_empty() {
+                return Err(SettingsError(
+                    "gateway.ingress = \"proxy\" needs gateway.trusted_proxies (the proxies' addresses)"
+                        .into(),
+                ));
+            }
+            for t in &trusted {
+                net_io::Cidr::parse(t)
+                    .map_err(|e| SettingsError(format!("gateway.trusted_proxies: `{t}`: {e}")))?;
+            }
+            Ok(IngressMode::Proxy {
+                trusted,
+                forwarded_proto: config
+                    .get_or("gateway.forwarded_proto", true)
+                    .map_err(err)?,
+            })
+        }
+        other => Err(SettingsError(format!(
+            "gateway.ingress must be `direct` or `proxy`, not `{other}`"
+        ))),
+    }
+}
+
+impl IngressMode {
+    /// The trusted proxies as CIDR blocks (empty for direct ingress).
+    #[must_use]
+    pub fn trusted(&self) -> Vec<net_io::Cidr> {
+        match self {
+            IngressMode::Direct => Vec::new(),
+            IngressMode::Proxy { trusted, .. } => trusted
+                .iter()
+                .filter_map(|t| net_io::Cidr::parse(t).ok())
+                .collect(),
+        }
     }
 }
 

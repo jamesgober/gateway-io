@@ -80,6 +80,9 @@ themes/default/static/   site.css                 (served under /theme/)
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
 | `gateway.driver` | `reactor` | net-io's driver; `blocking` (one thread per connection: `workers` connections, plus a few threads that answer the ones over the cap) halves server time on a Windows development machine |
 | `gateway.stage_timing` | false | record where each request's server time goes; logged per stage when the gateway stops |
+| `gateway.ingress` | `direct` | `direct`, or `proxy` behind a reverse proxy: the client is the address in `X-Forwarded-For`, believed only from `gateway.trusted_proxies`, and the door bans and charges that client; a trusted proxy that sends no header is refused |
+| `gateway.trusted_proxies` | none | the proxies' addresses or blocks (`127.0.0.1`, `10.0.0.0/8`); required with `ingress = "proxy"` |
+| `gateway.forwarded_proto` | true | with `ingress = "proxy"`, take the scheme from `X-Forwarded-Proto` (an https proxy in front makes the site https) |
 | `door.ban` | none | addresses refused at the door; changes apply on reload |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |

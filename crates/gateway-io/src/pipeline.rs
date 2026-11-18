@@ -380,11 +380,21 @@ impl HttpService for Pipeline {
         let id = bouncer_io::RequestId(
             u128::from(env.connection().get()) << 32 | u128::from(env.seq().get()),
         );
-        let ticket = match self.bouncer.request(TicketTag::from(env.gate_tag()), id) {
+        let mut ticket = match self.bouncer.request(TicketTag::from(env.gate_tag()), id) {
             Ok(ticket) => ticket,
             Err(bouncer_io::BouncerError::Revoked) => return HeadAction::refuse(403),
             Err(_) => return HeadAction::refuse(503),
         };
+        // Behind a trusted proxy, serve-net names the real client from the
+        // forwarded header: the bouncer judges and charges that client (bans,
+        // budgets), not the proxy every visitor shares.
+        if env.client().ingress() == serve_net::IngressKind::Forwarded
+            && let Some(addr) = env.client().addr()
+            && let bouncer_io::Verdict::Deny(d) =
+                ticket.bind_client(addr, bouncer_io::Provenance::ForwardedHeader)
+        {
+            return HeadAction::refuse(d.code.http_status());
+        }
         match self.tickets.hold_at(env.worker().get(), ticket, hook) {
             Some(tag) => {
                 env.set_user_word(tag.get());

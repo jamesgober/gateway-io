@@ -17,7 +17,7 @@ use crate::control::UrgentControl;
 use crate::events::LogSink;
 use crate::observe::{ServerTime, TimeObserver};
 use crate::pipeline::{PassportAdmit, Pipeline};
-use crate::settings::{Driver, Settings};
+use crate::settings::{Driver, IngressMode, Settings};
 use crate::stages::StageTimes;
 use crate::tickets::RequestTickets;
 use crate::web::{WebService, WebServices};
@@ -124,9 +124,7 @@ impl Door {
             bouncer::build(settings, events).map_err(|e| OpenError(format!("bouncer: {e}")))?;
 
         let mut builder = Server::builder()
-            .listener(
-                ListenerSpec::tcp("web", settings.listen.as_str()).profile(serve_net::ProfileId(0)),
-            )
+            .listener(listener(settings)?)
             .limits(limits)
             .keep_alive(KeepAlive::new().max_requests(settings.keep_alive_requests))
             .workers(match settings.driver {
@@ -236,6 +234,23 @@ impl Door {
         self.ejector.detach();
         self.running.drain(deadline)
     }
+}
+
+/// The listener for the settings' address and ingress.
+fn listener(settings: &Settings) -> Result<ListenerSpec, OpenError> {
+    let spec = ListenerSpec::tcp("web", settings.listen.as_str()).profile(serve_net::ProfileId(0));
+    Ok(match &settings.ingress {
+        IngressMode::Direct => spec,
+        IngressMode::Proxy {
+            forwarded_proto, ..
+        } => {
+            let trusted = serve_net::TrustedProxies::new(&settings.ingress.trusted())
+                .map_err(|e| OpenError(format!("gateway.trusted_proxies: {e}")))?;
+            spec.ingress(serve_net::Ingress::Proxy(
+                serve_net::ProxySource::forwarded_for(trusted).trust_scheme(*forwarded_proto),
+            ))
+        }
+    })
 }
 
 /// The gateway as a kernel subsystem, at [`Position::LAST`]: it opens after
@@ -437,6 +452,9 @@ impl Subsystem for Gateway {
         if next.stage_timing != current.stage_timing {
             later.push("gateway.stage_timing");
         }
+        if next.ingress != current.ingress {
+            later.push("gateway.ingress");
+        }
         let bouncer = open.bouncer().clone();
         let applied = self.applied.clone();
         let foundation = link.foundation().clone();
@@ -491,6 +509,7 @@ impl Subsystem for Gateway {
                     keep_alive_requests: running.keep_alive_requests,
                     driver: running.driver,
                     stage_timing: running.stage_timing,
+                    ingress: running.ingress,
                     ban: applied_ban,
                     exempt: if exempt_applied {
                         next.exempt

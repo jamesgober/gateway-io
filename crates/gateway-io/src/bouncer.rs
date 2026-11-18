@@ -108,6 +108,17 @@ pub fn build(
 ) -> Result<(Bouncer, Arc<DoorEjector>), BouncerError> {
     let ejector = Arc::new(DoorEjector::default());
     let mut builder = Bouncer::builder().maintainer(true).ejector(ejector.clone());
+    let proxies: Vec<Cidr> = settings
+        .ingress
+        .trusted()
+        .into_iter()
+        .map(Cidr::from)
+        .collect();
+    if !proxies.is_empty() {
+        // The proxies are hops, not clients: the client each request names
+        // is judged and charged instead (bound in the head hook).
+        builder = builder.trusted_proxies(&proxies);
+    }
     if !settings.exempt.is_empty() {
         builder = builder.allow(allow_list(&settings.exempt)?);
     }
