@@ -107,3 +107,24 @@ fn proxy_ingress_needs_a_trust_list() {
     .expect("valid");
     assert_eq!(ok.ingress.trusted().len(), 2);
 }
+
+#[test]
+fn an_application_server_port_means_loopback_behind_its_front_end() {
+    let config = Config::from_text("[gateway]\nlisten = \"0.0.0.0:8080\"\n").expect("config");
+    let base = Settings::from_config(&config).expect("settings");
+    let s = base.clone().with_port(Some("3007"), false).expect("port");
+    assert_eq!(s.listen, "127.0.0.1:3007", "never a public address");
+    assert_eq!(
+        s.ingress.trusted().len(),
+        2,
+        "only the local front end is trusted"
+    );
+    let kept = base
+        .clone()
+        .with_port(Some("3007"), true)
+        .expect("explicit ingress stays");
+    assert_eq!(kept.ingress, IngressMode::Direct);
+    assert!(base.clone().with_port(Some("web"), false).is_err());
+    assert!(base.clone().with_port(Some("0"), false).is_err());
+    assert_eq!(base.clone().with_port(None, false).expect("none"), base);
+}

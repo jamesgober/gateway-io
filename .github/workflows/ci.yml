@@ -54,3 +54,28 @@ jobs:
           tool: cargo-audit
       - name: Audit
         run: cargo audit
+
+  musl:
+    name: Static Linux build (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: musl C toolchain (for aws-lc-sys)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Statically linked
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/wasp
+          file "$BIN"
+          file "$BIN" | grep -E "static(ally|-pie) linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasp-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/wasp

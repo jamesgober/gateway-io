@@ -172,7 +172,41 @@ impl Settings {
             exempt: addresses(config, "door.exempt")?,
             ingress: ingress(config)?,
         };
-        Ok(settings)
+        let explicit_ingress = config
+            .get::<String>("gateway.ingress")
+            .map_err(|e| SettingsError(e.to_string()))?
+            .is_some();
+        settings.with_port(std::env::var("PORT").ok().as_deref(), explicit_ingress)
+    }
+
+    /// The settings for a process an application server starts (Phusion
+    /// Passenger, cPanel's application setup): with `port` (the `PORT` it
+    /// sets), the gateway listens on `127.0.0.1:<port>` whatever
+    /// `gateway.listen` says, and, unless `gateway.ingress` was configured
+    /// (`explicit_ingress`), sits behind that local front end: proxy ingress
+    /// trusting only loopback. Without `port`, nothing changes.
+    pub fn with_port(
+        mut self,
+        port: Option<&str>,
+        explicit_ingress: bool,
+    ) -> Result<Settings, SettingsError> {
+        let Some(port) = port else {
+            return Ok(self);
+        };
+        let port: u16 = port
+            .trim()
+            .parse()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| SettingsError(format!("PORT must be a port number, not `{port}`")))?;
+        self.listen = format!("127.0.0.1:{port}");
+        if !explicit_ingress {
+            self.ingress = IngressMode::Proxy {
+                trusted: vec!["127.0.0.1".into(), "::1".into()],
+                forwarded_proto: true,
+            };
+        }
+        Ok(self)
     }
 }
 

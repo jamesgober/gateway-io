@@ -127,7 +127,15 @@ pub fn wire(config: &Config) -> Result<Wiring, String> {
 /// `WASP_ADMIN_PASSWORD`.
 pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, String> {
     let password = std::env::var(auth::ADMIN_PASSWORD_ENV).ok();
-    wire_with(config, data_dir, Some(data_dir), password.as_deref())
+    let mut wiring = wire_with(config, data_dir, Some(data_dir), password.as_deref())?;
+    if std::env::var_os("PORT").is_some()
+        && site::SiteSettings::from_config(config)?.hosts.is_empty()
+    {
+        wiring.notices.push(
+            "PORT is set (an application server starts this process) but site.hosts is empty: the site answers only localhost; set site.hosts to the site's name".to_owned(),
+        );
+    }
+    Ok(wiring)
 }
 
 /// Phases 1 to 3 from configuration.
