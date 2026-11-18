@@ -370,7 +370,13 @@ impl Core {
             Err(miss) => miss,
         };
         match self.services.get(usize::from(profile.service.0)) {
-            Some(Entry::Passport(service)) => Routed::Exit(service.handle(p)),
+            Some(Entry::Passport(service)) => {
+                let exit = service.handle(p);
+                if exit.reply().guest_ttl().is_some() {
+                    self.cache.offer(&exit);
+                }
+                Routed::Exit(exit)
+            }
             Some(Entry::External(_)) => Routed::Handoff(Handoff {
                 p,
                 service: profile.service,

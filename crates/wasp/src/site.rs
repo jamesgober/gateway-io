@@ -30,7 +30,7 @@ use std::time::Duration;
 use wasp_core::suite::config::Config;
 use web_net::{Assets, Context, Route, get};
 
-use crate::content::{Content, Entry, Kind, Manifest};
+use crate::content::{Content, Entry, Kind};
 use crate::theme::{Editor, Form, Page, SiteEngine, SiteInfo};
 
 #[cfg(feature = "gatekeeper")]
@@ -123,7 +123,7 @@ pub(crate) struct Pages {
 }
 
 impl Pages {
-    pub(crate) fn new(settings: &SiteSettings, manifest: Manifest) -> Pages {
+    pub(crate) fn new(settings: &SiteSettings, content: Content) -> Pages {
         let base = settings.base.trim_end_matches('/');
         Pages {
             site: Arc::new(SiteInfo {
@@ -134,7 +134,7 @@ impl Pages {
                 admin: format!("{base}/admin"),
                 css: format!("{base}/theme/site.css"),
             }),
-            content: Arc::new(Content::new(manifest)),
+            content: Arc::new(content),
         }
     }
 
@@ -260,7 +260,7 @@ mod gatekeeper_site {
 
     use super::{Pages, SiteSettings, configure, content_routes, query_value};
     use crate::auth::ACCOUNT_READ;
-    use crate::content::Manifest;
+    use crate::content::Content;
     use crate::theme::{Form, SiteEngine};
 
     /// A handler's context on this site.
@@ -296,12 +296,12 @@ mod gatekeeper_site {
     /// Builds the site behind `gatekeeper`, rendering with `engine`.
     pub fn build(
         gatekeeper: Arc<Gatekeeper>,
-        manifest: Manifest,
+        content: Content,
         engine: SiteEngine,
         settings: &SiteSettings,
         ready: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<SiteApp, String> {
-        let pages = Pages::new(settings, manifest);
+        let pages = Pages::new(settings, content);
         let members = Rule::signed_in()
             .needs(gatekeeper.schema(), &[ACCOUNT_READ])
             .map_err(|e| format!("site rule: {e}"))?;

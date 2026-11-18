@@ -35,7 +35,7 @@ pub mod stub;
 /// The foundation package.
 pub use system_suite as suite;
 
-pub use crate::cache::{GuestCache, NoCache};
+pub use crate::cache::{CacheLimits, CacheStats, GuestCache, GuestPages, NoCache};
 pub use crate::core::{Core, CoreBuilder, CoreSubsystem, Handoff, LoadError, Routed};
 pub use crate::customs::{Customs, HeadRules};
 pub use crate::gates::{

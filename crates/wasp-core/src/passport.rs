@@ -309,6 +309,16 @@ impl Passport<Identified> {
 
 static GUEST: Identity = Identity::guest();
 
+impl Passport<Identified> {
+    /// Answers from the core's guest cache: `write` fills the reply, which
+    /// is then marked as cached. Only the core can do this.
+    pub(crate) fn answer_cached(mut self, write: impl FnOnce(&mut Reply)) -> Exit {
+        write(&mut self.slot.reply);
+        self.slot.reply.mark_cached();
+        Exit { slot: self.slot }
+    }
+}
+
 impl Passport<Cleared> {
     /// The gate's own identity token, if authentication kept one of type `T`.
     #[must_use]
@@ -401,6 +411,12 @@ impl Exit {
         };
         self.slot.reply.refuse(Refusal { status, ..refusal });
         self
+    }
+
+    /// The request's head.
+    #[must_use]
+    pub fn head(&self) -> &Head {
+        &self.slot.head
     }
 
     pub(crate) fn into_slot(self) -> Box<Slot> {

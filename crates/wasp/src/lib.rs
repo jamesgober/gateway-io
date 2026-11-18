@@ -45,6 +45,8 @@ pub struct Wiring {
     pub nex: Option<nex::NexDb>,
     /// The theme watcher (a kernel subsystem; start it before the gateway).
     pub theme: theme::ThemeWatcher,
+    /// The core's guest output cache, purged whenever the content changes.
+    pub guest_pages: Arc<wasp_core::GuestPages>,
     /// Stage timing (`gateway.stage_timing`), shared by the gateway and the
     /// render engine.
     pub stages: Arc<gateway_io::StageTimes>,
@@ -364,7 +366,9 @@ fn wire_with(
             ));
         }
     };
+    let guest_pages = Arc::new(wasp_core::GuestPages::default());
     let core = builder
+        .guest_cache(guest_pages.clone())
         .provider(store.clone())
         .jobs(Arc::new(jobs))
         .external("web")
@@ -388,6 +392,8 @@ fn wire_with(
     let stages = Arc::new(gateway_io::StageTimes::new(timing));
     let manifest =
         content::Manifest::open(store, &settings.base, true).map_err(|e| e.to_string())?;
+    let purge = guest_pages.clone();
+    let manifest = content::Content::new(manifest).on_change(move || purge.purge());
     let engine = theme::Timed::new(theme, stages.clone());
     // `/ready`: 503 while any provider (the content store, the database)
     // cannot serve, for the front end and the supervisor.
@@ -420,6 +426,7 @@ fn wire_with(
         #[cfg(feature = "store-nex")]
         nex: shared.nex,
         theme: watcher,
+        guest_pages,
         stages,
         notices,
     })

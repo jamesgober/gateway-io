@@ -351,6 +351,7 @@ pub struct Reply {
     close: bool,
     retry_after: Option<Duration>,
     kind: ReplyKind,
+    guest_ttl: Option<Duration>,
 }
 
 impl Reply {
@@ -363,7 +364,28 @@ impl Reply {
             close: false,
             retry_after: None,
             kind: ReplyKind::Empty,
+            guest_ttl: None,
         }
+    }
+
+    /// Lets the core's guest cache keep this answer for `ttl` and serve it
+    /// to every guest who asks for the same target, without the service. Say
+    /// it only for a page that is the same for every guest; the core keeps
+    /// only a guest's `GET` with status 200 and no `Set-Cookie`.
+    pub fn cache_for_guests(&mut self, ttl: Duration) -> &mut Self {
+        self.guest_ttl = Some(ttl);
+        self
+    }
+
+    /// How long the guest cache may keep this answer, if at all.
+    #[must_use]
+    pub fn guest_ttl(&self) -> Option<Duration> {
+        self.guest_ttl
+    }
+
+    pub(crate) fn mark_cached(&mut self) {
+        self.kind = ReplyKind::Cached;
+        self.guest_ttl = None;
     }
 
     /// Sets the status (default 200).
@@ -475,6 +497,7 @@ impl Reply {
         self.close = false;
         self.retry_after = None;
         self.kind = ReplyKind::Empty;
+        self.guest_ttl = None;
     }
 }
 

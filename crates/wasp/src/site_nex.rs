@@ -27,7 +27,7 @@ use wasp_core::{Access, Decision, Identity, PermSet, Rule};
 use web_net::form_net::{self, Secret};
 use web_net::{App, Context, Denial, Gate, Request, Route, get, post};
 
-use crate::content::{Draft, Entry, Kind, Manifest, SaveError, StoreError};
+use crate::content::{Content, Draft, Entry, Kind, SaveError, StoreError};
 use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
 use crate::theme::{Editor, Form, SiteEngine};
@@ -297,12 +297,12 @@ fn random_hex() -> Result<String, web_net::Error> {
 pub fn build(
     auth: NexAuth,
     access: Access,
-    manifest: Manifest,
+    content: Content,
     engine: SiteEngine,
     settings: &SiteSettings,
     ready: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<NexApp, String> {
-    let pages = Pages::new(settings, manifest);
+    let pages = Pages::new(settings, content);
     // Tokens are keyed for this run of the process; a form rendered before a
     // restart is refused once and rendered again.
     let key = crypt_io::generate_key().map_err(|e| format!("csrf key: {e}"))?;

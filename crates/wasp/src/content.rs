@@ -794,10 +794,19 @@ fn date_of(days: i64) -> String {
 /// save prepares the next manifest beside the live one, writes through the
 /// store, and swaps it in; saves run one at a time, and readers only ever
 /// wait for the swap of a pointer, never for the store.
-#[derive(Debug)]
 pub struct Content {
     live: RwLock<Arc<Manifest>>,
     writer: Mutex<()>,
+    changed: Vec<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Content")
+            .field("live", &self.snapshot())
+            .field("listeners", &self.changed.len())
+            .finish()
+    }
 }
 
 impl Content {
@@ -807,7 +816,16 @@ impl Content {
         Content {
             live: RwLock::new(Arc::new(manifest)),
             writer: Mutex::new(()),
+            changed: Vec::new(),
         }
+    }
+
+    /// The same content, calling `f` after every change is live (to drop
+    /// cached pages).
+    #[must_use]
+    pub fn on_change(mut self, f: impl Fn() + Send + Sync + 'static) -> Content {
+        self.changed.push(Box::new(f));
+        self
     }
 
     /// The content as it is now.
@@ -821,6 +839,9 @@ impl Content {
 
     fn publish(&self, next: Manifest) {
         *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(next);
+        for f in &self.changed {
+            f();
+        }
     }
 
     /// Saves `draft`. `replaces` is the slug the editor opened (`None` for
@@ -966,7 +987,11 @@ mod tests {
 
     #[test]
     fn content_saves_renames_and_refuses_a_taken_slug() {
-        let content = Content::new(Manifest::sample());
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = changes.clone();
+        let content = Content::new(Manifest::sample()).on_change(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         let before = content.snapshot();
         let draft = Draft {
             kind: Kind::Page,
@@ -999,6 +1024,9 @@ mod tests {
         assert!(now.find("contact").is_none() && now.find("write-to-us").is_some());
         assert!(content.remove("write-to-us").expect("removed"));
         assert!(!content.remove("write-to-us").expect("gone"));
+        // A save, a rename, a removal: each told the listeners (the refused
+        // save and the removal of nothing did not).
+        assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]
