@@ -151,6 +151,7 @@ pub fn build(
     manifest: Manifest,
     engine: SiteEngine,
     settings: &SiteSettings,
+    ready: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<SiteApp, String> {
     let base = settings.base.trim_end_matches('/').to_owned();
     let site = Arc::new(SiteInfo {
@@ -359,6 +360,7 @@ pub fn build(
     builder
         .sign_in("/sign-in")
         .health("/health")
+        .ready("/ready", ready)
         .route(home)
         .route(post_page)
         .route(about)

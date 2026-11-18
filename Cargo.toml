@@ -23,6 +23,8 @@ web-net = { version = "0.10.1", default-features = false }
 luminess = { version = "0.10", features = ["web-net"] }
 bison-db = { version = "1.1", default-features = false, features = ["std"] }
 gatekeeper-io = "0.6"
+# nex-db is not on crates.io: its git tag, never a path.
+nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.8.1" }
 key-vault = { version = "1.1", features = ["fetcher-file"] }
 crypt-io = "1.6"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }

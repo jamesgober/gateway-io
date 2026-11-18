@@ -90,6 +90,9 @@ name = "audit-trail"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "444cfe20bfa9d52922da03be41d430bc09afe8ae58c8de61f5cd79ddbb0396b6"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "auth-gate"
@@ -454,6 +457,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "error-forge"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8a115883d21b08fb47a8cb8c7e927d6a4fe89ecb25029ff45d4058caa6eb0a2"
+dependencies = [
+ "error-forge-derive",
+]
+
+[[package]]
+name = "error-forge-derive"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4859e84508edb7c9a8431103d1632318e5b2d56eba1c3efce7acd2756a32045"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -671,6 +689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsm-db"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07111401cc799158bf26adca45397ba256fba154479d20c752d0c8e0fb18404e"
+dependencies = [
+ "error-forge",
+]
+
+[[package]]
 name = "luminess"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -705,6 +732,18 @@ name = "net-io"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99c8a40b13d0e64742474f7fc515085cb3b72e53676143b10ba80c7019c290b6"
+
+[[package]]
+name = "nex-db"
+version = "0.8.1"
+source = "git+https://github.com/jamesgober/nex-db?tag=v0.8.1#d0bf5c86751ed5fb768715413e4edefac3d4c298"
+dependencies = [
+ "audit-trail",
+ "crypt-io",
+ "id-forge",
+ "lsm-db",
+ "wal-db",
+]
 
 [[package]]
 name = "nu-ansi-term"
@@ -1158,6 +1197,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "wal-db"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7117ecc25dfff5b3866cbe2ad4fc7c7b4425ad70a8b645a89cdd6e9c2c8401b"
+dependencies = [
+ "error-forge",
+ "loom",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1174,6 +1223,7 @@ dependencies = [
  "gateway-io",
  "key-vault",
  "luminess",
+ "nex-db",
  "wasp-core",
  "web-net",
 ]

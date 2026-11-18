@@ -59,7 +59,7 @@ curl -i http://127.0.0.1:8080/posts/hello-world
 curl -i http://127.0.0.1:8080/account
 ```
 
-The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
+The site: `/`, `/posts/:slug` and `/about` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/health`, `/ready` (503 while a store cannot serve), `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
 
 ## Import content
 
@@ -107,9 +107,9 @@ themes/default/static/   site.css                 (served under /theme/)
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
 | `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
-| `content.store` | `memory` | where content is kept: `memory` (lost at exit) or `bison` (a bison-db file that survives restarts; one process at a time: a second instance on the same file refuses to boot); an empty store is given the sample content |
+| `content.store` | `memory` | where content is kept: `memory` (lost at exit), `bison` (a bison-db file), or `nex` (a nex-db database: one entity per entry, published at its route); the durable stores allow one process at a time (a second instance refuses to boot); an empty store is given the sample content |
 | `content.recovery` | `strict` | a bison-db file damaged before its end refuses to boot and is left as it was; after backing it up, start once with `salvage` to keep every record that still verifies (bison-db keeps a copy as `<path>.damaged`) |
-| `content.path` | `<data folder>/content.bison` | the bison-db file, with `content.store = "bison"` |
+| `content.path` | `<data folder>/content.bison`, or `<data folder>/nex` | the bison-db file, or the nex-db folder |
 | `auth.admin` | none | an account made at boot; its password from `WASP_ADMIN_PASSWORD` |
 | `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |

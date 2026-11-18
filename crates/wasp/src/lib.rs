@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod content;
 pub mod import;
+pub mod nex;
 pub mod site;
 pub mod theme;
 
@@ -52,6 +53,14 @@ fn open_store(
         .map_err(e)?;
     let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
         "memory" => Arc::new(content::MemoryStore::new()),
+        "nex" => {
+            let path: std::path::PathBuf = config
+                .get_or("content.path", data_dir.join("nex"))
+                .map_err(e)?;
+            Arc::new(nex::NexStore::new(
+                nex::NexDb::open(&path).map_err(|e| e.0)?,
+            ))
+        }
         "bison" => {
             let path: std::path::PathBuf = config
                 .get_or("content.path", data_dir.join("content.bison"))
@@ -80,7 +89,7 @@ fn open_store(
         }
         other => {
             return Err(format!(
-                "content.store must be `memory` or `bison`, not `{other}`"
+                "content.store must be `memory`, `bison`, or `nex`, not `{other}`"
             ));
         }
     };
@@ -227,7 +236,11 @@ fn wire_with(
     let stages = Arc::new(gateway_io::StageTimes::new(timing));
     let manifest = content::Manifest::open(store, &settings.base, true).map_err(|e| e.0)?;
     let engine = theme::Timed::new(theme, stages.clone());
-    let site = site::build(gatekeeper.clone(), manifest, engine, &settings)?;
+    // `/ready`: 503 while any provider (the content store, the database)
+    // cannot serve, for the front end and the supervisor.
+    let ready_core = core.clone();
+    let ready = move || ready_core.providers().iter().all(|p| p.healthy());
+    let site = site::build(gatekeeper.clone(), manifest, engine, &settings, ready)?;
     Ok(Wiring {
         core,
         site,

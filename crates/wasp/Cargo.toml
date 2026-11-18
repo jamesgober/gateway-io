@@ -17,6 +17,8 @@ gatekeeper-io = { workspace = true }
 key-vault = { workspace = true }
 # A new master secret on first run.
 crypt-io = { workspace = true }
+# The durable store for content (and, later, accounts): one database.
+nex-db = { workspace = true }
 # The web site: site, url, router, handlers.
 web-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
