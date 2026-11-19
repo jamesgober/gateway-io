@@ -2,6 +2,8 @@
 
 The site runs as one process on a loopback port. Apache terminates TLS and passes requests through Passenger; the process trusts only that local front end for client addresses.
 
+For the steps alone, in order, see [CPANEL.md](CPANEL.md).
+
 ## Build
 
 A static Linux binary, so the host's C library does not matter:
