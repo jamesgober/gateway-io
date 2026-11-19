@@ -967,9 +967,9 @@ dependencies = [
 
 [[package]]
 name = "serve-net"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "362f6649a7271098590e184db0a60b60cd82210481404bce6339a0d8ad93ee2e"
+checksum = "4e791899e51ef461c63d02a4679a74f4ce261fbf5e4478efa37f15c6e4f0c1f3"
 dependencies = [
  "http-net",
  "net-io",
