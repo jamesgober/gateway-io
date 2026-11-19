@@ -275,15 +275,20 @@ impl GuestCache for GuestPages {
             return;
         };
         // Only a guest's GET (a HEAD reply has no body to keep), a full 200
-        // answer, nothing personal in it, and a body every client can read
-        // (an encoded one was chosen for this visitor's Accept-Encoding).
+        // answer, nothing personal in it, a body every client can read (an
+        // encoded one was chosen for this visitor's Accept-Encoding), and one
+        // that is the same for every guest: the key is the path, so a reply
+        // that varies on anything but Accept-Encoding (a language, a cookie)
+        // is never kept.
         if ttl.is_zero()
             || !exit.identity().is_some_and(|i| i.is_guest())
             || exit.head().method() != "GET"
             || reply.status_code() != 200
             || reply.kind() != ReplyKind::Answer
-            || reply.fields().any(|(n, _)| {
-                n.eq_ignore_ascii_case(b"set-cookie") || n.eq_ignore_ascii_case(b"content-encoding")
+            || reply.fields().any(|(n, v)| {
+                n.eq_ignore_ascii_case(b"set-cookie")
+                    || n.eq_ignore_ascii_case(b"content-encoding")
+                    || (n.eq_ignore_ascii_case(b"vary") && !varies_on_encoding_only(v))
             })
         {
             return;
@@ -313,5 +318,30 @@ impl GuestCache for GuestPages {
                 size,
             },
         );
+    }
+}
+
+/// Whether a `Vary` value names only `Accept-Encoding` (any case, any
+/// spacing). Anything else, `*` included, makes the reply differ between
+/// guests on the same path.
+fn varies_on_encoding_only(value: &[u8]) -> bool {
+    value
+        .split(|b| *b == b',')
+        .map(<[u8]>::trim_ascii)
+        .filter(|item| !item.is_empty())
+        .all(|item| item.eq_ignore_ascii_case(b"accept-encoding"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::varies_on_encoding_only;
+
+    #[test]
+    fn only_accept_encoding_leaves_a_reply_the_same_for_every_guest() {
+        assert!(varies_on_encoding_only(b"Accept-Encoding"));
+        assert!(varies_on_encoding_only(b"accept-encoding, Accept-Encoding"));
+        assert!(!varies_on_encoding_only(b"Accept-Language"));
+        assert!(!varies_on_encoding_only(b"Accept-Encoding, Cookie"));
+        assert!(!varies_on_encoding_only(b"*"));
     }
 }

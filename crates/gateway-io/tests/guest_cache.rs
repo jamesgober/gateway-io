@@ -70,6 +70,21 @@ impl Service for Counting {
                     .header("content-encoding", "gzip")
                     .cache_for_guests(Duration::from_secs(60));
             }
+            "/vary-language" => {
+                reply
+                    .header("vary", "Accept-Language")
+                    .cache_for_guests(Duration::from_secs(60));
+            }
+            "/vary-cookie" => {
+                reply
+                    .header("vary", "accept-encoding, Cookie")
+                    .cache_for_guests(Duration::from_secs(60));
+            }
+            "/vary-encoding" => {
+                reply
+                    .header("vary", "accept-encoding")
+                    .cache_for_guests(Duration::from_secs(60));
+            }
             "/cookie" => {
                 reply
                     .header("set-cookie", "a=b; Path=/")
@@ -228,4 +243,22 @@ fn the_cache_keeps_to_its_limits() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     let _ = door.close(Duration::from_secs(1));
     let _ = door2.close(Duration::from_secs(1));
+}
+
+#[test]
+fn a_reply_that_varies_on_more_than_encoding_is_not_kept() {
+    let (door, addr, calls, _) = open();
+    // The key is the path: a page chosen by language or by cookie would be
+    // handed to the next guest whatever they asked for.
+    let fr = "Accept-Language: fr\r\n";
+    let de = "Accept-Language: de\r\n";
+    assert_eq!(get(addr, "/vary-language", fr).1, "call 1");
+    assert_eq!(get(addr, "/vary-language", de).1, "call 2");
+    assert_eq!(get(addr, "/vary-cookie", "").1, "call 3");
+    assert_eq!(get(addr, "/vary-cookie", "").1, "call 4");
+    // Varying on Accept-Encoding alone is fine: an encoded body is never kept.
+    assert_eq!(get(addr, "/vary-encoding", "").1, "call 5");
+    assert_eq!(get(addr, "/vary-encoding", "").1, "call 5", "kept");
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    let _ = door.close(Duration::from_secs(1));
 }
