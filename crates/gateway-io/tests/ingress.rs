@@ -174,16 +174,29 @@ fn an_application_server_port_means_loopback_behind_its_front_end() {
 #[test]
 fn unknown_keys_are_refused() {
     let read = |text: &str| Settings::from_config(&Config::from_text(text).expect("config"));
-    let err = read("[gateway]
+    let err = read(
+        "[gateway]
 acess_log = true
-").expect_err("a typo");
+",
+    )
+    .expect_err("a typo");
     assert!(err.0.contains("gateway.acess_log"), "{err}");
-    assert!(read("[door]
+    assert!(
+        read(
+            "[door]
 banned = []
-").is_err());
-    assert!(read("[gateway]
+"
+        )
+        .is_err()
+    );
+    assert!(
+        read(
+            "[gateway]
 access_log = true
 [door]
 ban = []
-").is_ok());
+"
+        )
+        .is_ok()
+    );
 }

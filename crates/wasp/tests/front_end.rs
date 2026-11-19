@@ -106,14 +106,20 @@ fn alive(pid: u32) -> bool {
 fn closing_standard_input_stops_it_cleanly_and_a_restart_overlapping_the_drain_comes_up() {
     let dir = folder("stdin");
     let port = free_port();
-    let mut old = wasp(&dir, port).stdin(Stdio::piped()).spawn().expect("spawn");
+    let mut old = wasp(&dir, port)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn");
     wait_ready(port, &mut old);
 
     // The front end lets go; a new process starts at once on the same data
     // folder (and a new port), while the old one is still stopping.
     drop(old.stdin.take());
     let port2 = free_port();
-    let mut new = wasp(&dir, port2).stdin(Stdio::piped()).spawn().expect("spawn");
+    let mut new = wasp(&dir, port2)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn");
 
     let status = wait_exit(&mut old, Duration::from_secs(20)).expect("the old process stops");
     assert!(status.success(), "a clean stop: {status}");
@@ -169,7 +175,10 @@ fn a_parent_that_dies_takes_it_down() {
     }
     // The lock went with it: a new start on the same data folder comes up.
     let port2 = free_port();
-    let mut next = wasp(&dir, port2).stdin(Stdio::piped()).spawn().expect("spawn");
+    let mut next = wasp(&dir, port2)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn");
     wait_ready(port2, &mut next);
     drop(next.stdin.take());
     assert!(wait_exit(&mut next, Duration::from_secs(20)).is_some());

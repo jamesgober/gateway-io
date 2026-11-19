@@ -1,0 +1,36 @@
+# wasp.conf for a site on a cPanel host (Passenger).
+# Copy this file to wasp.conf next to the wasp binary, then change the two
+# lines marked CHANGE. A key wasp does not know stops it at boot, with the
+# key's name in the log.
+
+[log]
+# Warnings and errors only. Passenger keeps this output in a log file that
+# it never rotates, so a busy log can fill the account's disk quota.
+level = "warn"
+file = false
+
+[site]
+# CHANGE: your domain names, the main one first.
+hosts = ["example.com", "www.example.com"]
+theme = "themes/default"
+
+[content]
+store = "nex"
+
+[auth]
+store = "nex"
+# CHANGE: the email you sign in with. Its password comes from the
+# WASP_ADMIN_PASSWORD environment variable, never from this file.
+admin = "you@example.com"
+
+[nex]
+# The database, inside the application folder's data folder.
+path = "data/nex"
+
+[gateway]
+# Small numbers for a shared host: the account gets a share of the CPUs and
+# memory, not the whole machine.
+workers = 2
+passports = 64
+# One log line per request. Turn it on to troubleshoot, then off again.
+access_log = false

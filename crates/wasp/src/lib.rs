@@ -287,7 +287,9 @@ fn check_keys(config: &Config) -> Result<(), String> {
         let known = |k: &str| {
             SUITE_SECTIONS.contains(&k)
                 || KNOWN_KEYS.iter().any(|(s, _)| *s == k)
-                || gateway_io::settings::KNOWN_KEYS.iter().any(|(s, _)| *s == k)
+                || gateway_io::settings::KNOWN_KEYS
+                    .iter()
+                    .any(|(s, _)| *s == k)
         };
         if let Some(unknown) = root.keys().find(|k| !known(k)) {
             return Err(format!(
@@ -521,9 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn the_example_configuration_passes_the_checks() {
+        let example = conf(include_str!("../../../deploy/wasp.conf.example"));
+        check_keys(&example).expect("known keys");
+        check_hosts(&example, true).expect("hosts named");
+        let gateway = gateway_io::Settings::from_config(&example).expect("gateway settings");
+        assert_eq!((gateway.workers, gateway.passports), (2, 64));
+    }
+
+    #[test]
     fn behind_port_the_hosts_must_be_named() {
         let empty = conf("[site]\n");
-        assert!(check_hosts(&empty, false).is_ok(), "no PORT: localhost only");
+        assert!(
+            check_hosts(&empty, false).is_ok(),
+            "no PORT: localhost only"
+        );
         let err = check_hosts(&empty, true).expect_err("PORT with no hosts");
         assert!(err.contains("site.hosts"), "{err}");
         assert!(check_hosts(&conf("[site]\nhosts = [\"example.com\"]\n"), true).is_ok());
