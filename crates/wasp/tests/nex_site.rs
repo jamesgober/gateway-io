@@ -7,10 +7,12 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gateway_io::{Door, Settings, WebServices};
 use wasp::nex::{EDITOR_ROLE, MEMBER_ROLE, NexAuth};
+use wasp_core::GuestPages;
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
 
@@ -50,6 +52,12 @@ fn config(data: &Path) -> Config {
 
 /// Opens the site; the account exists once.
 fn open(conf: &Config) -> (Door, SocketAddr) {
+    let (door, addr, _) = open_cached(conf);
+    (door, addr)
+}
+
+/// Opens the site, with its guest cache.
+fn open_cached(conf: &Config) -> (Door, SocketAddr, Arc<GuestPages>) {
     let t = Instant::now();
     let wiring = loop {
         match wasp::wire(conf) {
@@ -61,6 +69,7 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
             Err(e) => panic!("wiring: {e}"),
         }
     };
+    let pages = wiring.guest_pages.clone();
     let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
     auth.ensure_account(EMAIL, PASSWORD, &[MEMBER_ROLE])
         .expect("account");
@@ -76,7 +85,7 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     let addr = door.local_addr().expect("addr");
-    (door, addr)
+    (door, addr, pages)
 }
 
 #[derive(Debug)]
@@ -326,7 +335,7 @@ fn entry_body(kind: &str, slug: &str, was: &str, title: &str, body: &str, csrf: 
 fn the_editor_writes_renames_and_removes_content() {
     let data = temp_dir("editor");
     let conf = config(&data.0);
-    let (door, addr) = open(&conf);
+    let (door, addr, pages) = open_cached(&conf);
 
     // Guests are sent to sign in; a member without the editor role is refused.
     assert_eq!(get(addr, "/admin", &[]).status, 303);
@@ -373,6 +382,9 @@ fn the_editor_writes_renames_and_removes_content() {
     assert_eq!(saved.field("location"), Some("/contact"));
     let page = get(addr, "/contact", &[]);
     assert_eq!(page.status, 200, "{page:?}");
+    let hits = pages.stats().hits;
+    assert_eq!(get(addr, "/contact", &[]).body, page.body);
+    assert_eq!(pages.stats().hits, hits + 1, "the guest copy");
     assert!(
         page.body
             .contains("<p>Write &lt;b&gt;to&lt;/b&gt; us.</p><p>Second.</p>"),
@@ -439,6 +451,7 @@ fn the_editor_writes_renames_and_removes_content() {
         &entry_body("page", "write-to-us", "contact", "Contact", "Here.", &csrf),
     );
     assert_eq!(renamed.status, 303, "{renamed:?}");
+    // The save dropped every guest copy: the old path is gone at once.
     assert_eq!(get(addr, "/contact", &[]).status, 404);
     assert_eq!(get(addr, "/write-to-us", &[]).status, 200);
     let _ = door.close(Duration::from_secs(2));

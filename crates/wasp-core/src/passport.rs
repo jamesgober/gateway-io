@@ -317,6 +317,19 @@ impl Passport<Identified> {
         self.slot.reply.mark_cached();
         Exit { slot: self.slot }
     }
+
+    /// An external service's reply, copied in by `write` and marked for
+    /// guests, for the core's guest cache to consider. Only the core can do
+    /// this; the exit is then handed off ([`Exit::into_handed_off`]).
+    pub(crate) fn answer_shared(
+        mut self,
+        ttl: std::time::Duration,
+        write: impl FnOnce(&mut Reply),
+    ) -> Exit {
+        write(&mut self.slot.reply);
+        self.slot.reply.cache_for_guests(ttl);
+        Exit { slot: self.slot }
+    }
 }
 
 impl Passport<Cleared> {
@@ -375,6 +388,13 @@ pub struct Exit {
 }
 
 impl Exit {
+    /// The copy the guest cache was offered is wiped: the passport carries
+    /// no reply, as a hand-off's.
+    pub(crate) fn into_handed_off(mut self) -> Exit {
+        self.slot.reply.mark_handed_off();
+        self
+    }
+
     /// The trip facts.
     #[must_use]
     pub fn trip(&self) -> &Trip {

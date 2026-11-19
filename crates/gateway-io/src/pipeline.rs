@@ -252,9 +252,19 @@ impl Pipeline {
                         reply.header("cache-control", "private, no-store");
                     }
                     let caller = Caller::new(h.identity(), h.token_any());
-                    let outcome = web.respond(req, env, &caller, reply);
+                    let answered = web.respond(req, env, &caller, reply);
+                    let outcome = answered.outcome;
                     if let Some(m) = marks {
                         m.service = Some(Instant::now());
+                    }
+                    if let (Some(ttl), Outcome::Done | Outcome::Close) = (answered.guests, outcome)
+                    {
+                        // A whole page every guest may share: the core's
+                        // guest cache gets a copy to consider.
+                        let exit = self
+                            .core
+                            .finish_for_guests(h, ttl, |copy| copy_reply(reply, copy));
+                        return Flow::Web(exit, outcome);
                     }
                     if outcome == Outcome::More {
                         // A reply in parts: the request keeps its passport,
@@ -294,7 +304,7 @@ impl Pipeline {
         let outcome = match self.web.get(h.service()) {
             Some(web) => {
                 let caller = Caller::new(h.identity(), h.token_any());
-                web.respond(req, env, &caller, reply)
+                web.respond(req, env, &caller, reply).outcome
             }
             // Attached at open and never removed: unreachable. Ending the
             // stream with `Close` would look complete, so let serve-net's
@@ -342,6 +352,21 @@ impl Pipeline {
         self.pool.give_back(exit);
         outcome
     }
+}
+
+/// Copies a web service's reply, as it set it, into the passport's reply for
+/// the guest cache. A reply in parts is not copied (the cache keeps nothing
+/// without a status).
+fn copy_reply(from: &HttpReply, to: &mut wasp_core::Reply) {
+    let parts = from.parts();
+    if parts.is_streamed() {
+        return;
+    }
+    to.status(parts.status());
+    for (name, value) in parts.headers() {
+        to.header(name, value);
+    }
+    to.body(parts.body());
 }
 
 /// Writes the exit's reply into serve-net's reply. serve-net encodes it through

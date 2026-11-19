@@ -14,6 +14,7 @@
 //! after it passed, so no handler runs on an unauthorized request.
 
 use std::any::Any;
+use std::time::Duration;
 
 use serve_net::{Envelope, Finished, HttpHead, HttpReply, HttpRequest, Outcome, WorkClass};
 use wasp_core::{Access, Decision, Identity, Rule, ServiceTag};
@@ -128,6 +129,27 @@ impl WebGate for WaspGate {
     }
 }
 
+/// What a web service did with one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// serve-net's outcome.
+    pub outcome: Outcome,
+    /// Every guest may be given this same reply for this long: the route
+    /// allows it, the request was a guest's `GET` or `HEAD`, and the reply is
+    /// a plain 200 that sets no cookie. The core's guest cache decides
+    /// whether to keep it.
+    pub guests: Option<Duration>,
+}
+
+impl From<Outcome> for Answered {
+    fn from(outcome: Outcome) -> Answered {
+        Answered {
+            outcome,
+            guests: None,
+        }
+    }
+}
+
 /// A service that answers on serve-net's request and reply, given the caller
 /// the core identified. web-net's `App<G, E>` is one for every [`WebGate`]
 /// and every render engine.
@@ -139,7 +161,7 @@ pub trait WebService: Send + Sync + 'static {
         env: &Envelope,
         caller: &Caller<'_>,
         reply: &mut HttpReply,
-    ) -> Outcome;
+    ) -> Answered;
 
     /// A cheap look at the head before admission (the route's work class).
     fn classify(&self, head: &HttpHead<'_>) -> WorkClass {
@@ -163,15 +185,24 @@ impl<G: WebGate, E: web_net::Render> WebService for web_net::App<G, E> {
         env: &Envelope,
         caller: &Caller<'_>,
         reply: &mut HttpReply,
-    ) -> Outcome {
+    ) -> Answered {
         G::with_identity(caller, |who| {
-            web_net::App::respond(self, req, env, Some(who), reply).outcome
+            let served = web_net::App::respond(self, req, env, Some(who), reply);
+            Answered {
+                outcome: served.outcome,
+                guests: match served.cache {
+                    web_net::Cacheable::Guests { max_age } => {
+                        Some(Duration::from_secs(u64::from(max_age)))
+                    }
+                    _ => None,
+                },
+            }
         })
         .unwrap_or_else(|| {
             // Authentication kept no identity this gate can use: a wiring
             // fault. Fail closed.
             reply.text(500, wasp_core::refusal_text(500)).close();
-            Outcome::Close
+            Outcome::Close.into()
         })
     }
 
@@ -193,7 +224,7 @@ impl WebService for Box<dyn WebService> {
         env: &Envelope,
         caller: &Caller<'_>,
         reply: &mut HttpReply,
-    ) -> Outcome {
+    ) -> Answered {
         (**self).respond(req, env, caller, reply)
     }
 

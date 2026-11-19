@@ -298,7 +298,7 @@ fn a_theme_reloads_while_serving_and_a_broken_one_is_refused() {
         ),
     )
     .expect("write");
-    theme::reload(watcher.theme(), &copy.0).expect("reload");
+    watcher.reload_now().expect("reload");
     assert!(
         get_path(addr, "/")
             .body
@@ -311,7 +311,7 @@ fn a_theme_reloads_while_serving_and_a_broken_one_is_refused() {
         "{% extends \"base\" %}{% block content %}{{ page.nope }}{% endblock %}",
     )
     .expect("write");
-    let err = theme::reload(watcher.theme(), &copy.0).expect_err("refused");
+    let err = watcher.reload_now().expect_err("refused");
     assert!(err.0.contains("nope") || err.0.contains("pages"), "{err}");
     assert!(
         get_path(addr, "/")
@@ -322,7 +322,7 @@ fn a_theme_reloads_while_serving_and_a_broken_one_is_refused() {
 
     // A theme missing a template the routes need is refused too.
     std::fs::remove_file(&home).expect("rm");
-    let err = theme::reload(watcher.theme(), &copy.0).expect_err("refused");
+    let err = watcher.reload_now().expect_err("refused");
     assert!(err.0.contains("home"), "{err}");
     assert_eq!(get_path(addr, "/").status, 200);
     let _ = door.close(Duration::from_secs(1));

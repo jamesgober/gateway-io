@@ -468,3 +468,39 @@ fn the_site_puts_health_admin_and_sign_in_in_their_lanes() {
         assert_eq!(site.lane_for(method, path), lane, "{method} {path}");
     }
 }
+
+#[test]
+fn guests_get_whole_site_pages_from_the_cache() {
+    let config = Config::from_text(&with_theme("")).expect("config");
+    let wiring = wasp::wire(&config).expect("wiring");
+    let pages = wiring.guest_pages.clone();
+    let mut web = WebServices::new();
+    web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
+    let door = Door::open(wiring.core, &settings(), UrgentLine::detached(), web).expect("opens");
+    let addr = door.local_addr().expect("addr");
+
+    let first = get_path(addr, "/posts/the-passport").expect("post");
+    assert_eq!(first.status, 200);
+    assert_eq!(first.field("cache-control"), Some("public, max-age=60"));
+    assert_eq!(pages.stats().stored, 1, "kept for guests");
+    let again = get_path(addr, "/posts/the-passport").expect("again");
+    assert_eq!((again.status, &again.body), (200, &first.body));
+    assert_eq!(again.field("content-type"), first.field("content-type"));
+    assert_eq!(pages.stats().hits, 1, "answered from the cache");
+
+    // Not kept: a page not found, the sign-in form, a query.
+    assert_eq!(get_path(addr, "/posts/nope").map(|g| g.status), Some(404));
+    assert!(get_path(addr, "/sign-in").is_some());
+    assert_eq!(get_path(addr, "/?x=1").map(|g| g.status), Some(200));
+    assert_eq!(pages.stats().stored, 1, "{:?}", pages.stats());
+
+    pages.purge();
+    assert_eq!(
+        get_path(addr, "/posts/the-passport").map(|g| g.body),
+        Some(first.body)
+    );
+    assert_eq!(pages.stats().stored, 2, "kept again after the purge");
+    settle(&door);
+    assert_eq!(door.pool().stats().in_use, 0, "every passport returned");
+    let _ = door.close(Duration::from_secs(1));
+}

@@ -14,7 +14,7 @@ publish = false
 # net-io 0.7: serve-net 0.8, bouncer-io 0.11 and web-net 0.10.1 are built on it, and the
 # gate and control-line types cross between them, so one net-io version must be in the tree.
 [workspace.dependencies]
-serve-net = { version = "0.8.1", default-features = false, features = ["http1"] }
+serve-net = { version = "0.8.2", default-features = false, features = ["http1"] }
 net-io = "0.7.2"
 bouncer-io = { version = "0.11", features = ["net-io"] }
 system-suite = { version = "0.8", default-features = false, features = ["kernel", "signals", "config", "log"] }

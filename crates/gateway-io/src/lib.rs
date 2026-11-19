@@ -39,4 +39,4 @@ pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::settings::{Driver, IngressMode, Settings, SettingsError};
 pub use crate::stages::StageTimes;
 pub use crate::tickets::RequestTickets;
-pub use crate::web::{Caller, WaspGate, WebGate, WebService, WebServices, Who};
+pub use crate::web::{Answered, Caller, WaspGate, WebGate, WebService, WebServices, Who};

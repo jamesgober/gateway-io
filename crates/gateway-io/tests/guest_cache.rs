@@ -65,6 +65,11 @@ impl Service for Counting {
             "/short" => {
                 reply.cache_for_guests(Duration::from_millis(50));
             }
+            "/gzip" => {
+                reply
+                    .header("content-encoding", "gzip")
+                    .cache_for_guests(Duration::from_secs(60));
+            }
             "/cookie" => {
                 reply
                     .header("set-cookie", "a=b; Path=/")
@@ -183,16 +188,19 @@ fn only_guests_get_cached_pages_and_only_plain_ones_are_kept() {
     assert_eq!(get(addr, "/cookie", "").1, "call 8");
     assert_eq!(get(addr, "/plain", "").1, "call 9");
     assert_eq!(get(addr, "/plain", "").1, "call 10");
+    // An encoded body was chosen for one visitor's Accept-Encoding.
+    assert_eq!(get(addr, "/gzip", "").1, "call 11");
+    assert_eq!(get(addr, "/gzip", "").1, "call 12");
 
     // A page kept briefly runs out.
-    assert_eq!(get(addr, "/short", "").1, "call 11");
-    assert_eq!(get(addr, "/short", "").1, "call 11");
+    assert_eq!(get(addr, "/short", "").1, "call 13");
+    assert_eq!(get(addr, "/short", "").1, "call 13");
     std::thread::sleep(Duration::from_millis(80));
-    assert_eq!(get(addr, "/short", "").1, "call 12", "expired");
+    assert_eq!(get(addr, "/short", "").1, "call 14", "expired");
 
     // The guest copy of /page is still the first call's.
     assert_eq!(get(addr, "/page", "").1, "call 1");
-    assert_eq!(calls.load(Ordering::SeqCst), 12);
+    assert_eq!(calls.load(Ordering::SeqCst), 14);
     assert!(pages.stats().entries >= 2);
     let _ = door.close(Duration::from_secs(1));
 }

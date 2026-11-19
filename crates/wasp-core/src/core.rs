@@ -6,6 +6,7 @@
 //! ([`CoreSubsystem`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cache::{GuestCache, NoCache};
 use crate::customs::{Customs, HeadRules};
@@ -19,7 +20,7 @@ use crate::profile::Profile;
 use crate::provider::Provider;
 use crate::service::{Service, ServiceCtx};
 use crate::slot::{ProfileId, ServiceTag};
-use crate::slot::{Refusal, Trip};
+use crate::slot::{Refusal, Reply, Trip};
 use crate::stage::{Identified, Inspected};
 use crate::suite::lifecycle::{Deadline, Failure, Link, Subsystem};
 use crate::suite::log;
@@ -383,6 +384,26 @@ impl Core {
             }),
             None => Routed::Exit(p.refuse(500)),
         }
+    }
+
+    /// Finishes a hand-off whose service said every guest may be given the
+    /// same reply for `ttl` (web-net's `Served::cache`). For a guest, `copy`
+    /// writes that reply (status, fields, body) into the passport and the
+    /// guest cache decides whether to keep it, as it does for a passport
+    /// service's answer; then the hand-off finishes as [`Handoff::finish`].
+    /// For anyone else `copy` never runs.
+    pub fn finish_for_guests(
+        &self,
+        h: Handoff,
+        ttl: Duration,
+        copy: impl FnOnce(&mut Reply),
+    ) -> Exit {
+        if !h.p.identity().is_guest() || h.p.auth_cookie().is_some() {
+            return h.finish();
+        }
+        let exit = h.p.answer_shared(ttl, copy);
+        self.cache.offer(&exit);
+        exit.into_handed_off()
     }
 
     /// The job runner, for external services.

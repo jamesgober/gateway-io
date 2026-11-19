@@ -12,7 +12,10 @@
 //!    yes ─▶ the stored status, fields, and body ─▶ the response pipeline
 //!  core, after a passport service answered:
 //!    the service marked the reply (Reply::cache_for_guests), a guest's GET,
-//!    status 200, no Set-Cookie, within the limits      ─▶ kept under the key
+//!    status 200, no Set-Cookie, no Content-Encoding,
+//!    within the limits                                  ─▶ kept under the key
+//!  gateway, after a web service answered (Core::finish_for_guests):
+//!    the same offer, with the web reply copied in
 //! ```
 //!
 //! The door, authentication, and the response pipeline still run on a hit:
@@ -272,15 +275,16 @@ impl GuestCache for GuestPages {
             return;
         };
         // Only a guest's GET (a HEAD reply has no body to keep), a full 200
-        // answer, and nothing personal in it.
+        // answer, nothing personal in it, and a body every client can read
+        // (an encoded one was chosen for this visitor's Accept-Encoding).
         if ttl.is_zero()
             || !exit.identity().is_some_and(|i| i.is_guest())
             || exit.head().method() != "GET"
             || reply.status_code() != 200
             || reply.kind() != ReplyKind::Answer
-            || reply
-                .fields()
-                .any(|(n, _)| n.eq_ignore_ascii_case(b"set-cookie"))
+            || reply.fields().any(|(n, _)| {
+                n.eq_ignore_ascii_case(b"set-cookie") || n.eq_ignore_ascii_case(b"content-encoding")
+            })
         {
             return;
         }

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wasp_core::suite::config::Config;
-use web_net::{Assets, Context, Route, get};
+use web_net::{Assets, CachePolicy, Context, Route, get};
 
 use crate::content::{Content, Entry, Kind};
 use crate::theme::{Editor, Form, Page, SiteEngine, SiteInfo};
@@ -196,6 +196,11 @@ pub(crate) fn configure<G: web_net::Gate>(
 
 /// The public content routes (home, posts, about, other pages), for any
 /// gate.
+/// How long guests' copies of the content pages are kept, in browsers and in
+/// the core's guest cache (which also drops them whenever the content
+/// changes).
+const GUEST_PAGES: CachePolicy = CachePolicy::Guests { max_age: 60 };
+
 pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
     pages: &Pages,
 ) -> [Route<I, R, SiteEngine>; 4] {
@@ -204,6 +209,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
         cx.render(&p.page("Home", None, "", None))
     })
     .public()
+    .cache(GUEST_PAGES)
     .template("home")
     .name("home");
 
@@ -220,6 +226,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
         },
     )
     .public()
+    .cache(GUEST_PAGES)
     .template("post")
     .name("post");
 
@@ -229,6 +236,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
         cx.render(&p.page("About", entry, "Nothing here yet.", None))
     })
     .public()
+    .cache(GUEST_PAGES)
     .template("page")
     .name("about");
 
@@ -243,6 +251,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
         cx.render(&view)
     })
     .public()
+    .cache(GUEST_PAGES)
     .template("page")
     .name("page");
     [home, post_page, about, page]

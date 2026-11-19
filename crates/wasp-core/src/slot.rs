@@ -470,6 +470,7 @@ impl Reply {
     }
 
     pub(crate) fn mark_handed_off(&mut self) {
+        self.wipe();
         self.kind = ReplyKind::HandedOff;
     }
 

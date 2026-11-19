@@ -73,6 +73,8 @@ The site: `/`, `/posts/:slug`, `/about` and every other page at `/:slug` (from t
 
 On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member` and `editor` roles. The editor's pages are never cached, and every form carries a CSRF token.
 
+Guests' copies of the content pages (`/`, posts and pages) are kept in memory and answered before the site runs, for up to 60 seconds, and every save, rename or removal, and every theme reload, drops them at once. Signed-in visitors, queries and pages with a form are always served fresh.
+
 Saves go through the content store, so use a durable one (`content.store = "nex"` or `"bison"`) or the edits end with the process.
 
 ## Import content

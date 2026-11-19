@@ -384,8 +384,10 @@ fn wire_with(
         .map_err(|e| e.0)?;
     let core = Arc::new(core);
     let theme = theme::load(&settings.theme).map_err(|e| e.0)?;
+    let purge = guest_pages.clone();
     let watcher =
-        theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll);
+        theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll)
+            .on_change(move || purge.purge());
     let timing: bool = config
         .get_or("gateway.stage_timing", false)
         .map_err(|e| e.to_string())?;

@@ -425,6 +425,8 @@ pub struct ThemeWatcher {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     link: Option<Link>,
+    /// Called after every reload that took (to drop cached pages).
+    changed: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl ThemeWatcher {
@@ -440,7 +442,24 @@ impl ThemeWatcher {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             link: None,
+            changed: Arc::new(|| {}),
         }
+    }
+
+    /// The same watcher, calling `f` after every reload that took (to drop
+    /// cached pages, which were rendered with the old theme).
+    #[must_use]
+    pub fn on_change(mut self, f: impl Fn() + Send + Sync + 'static) -> ThemeWatcher {
+        self.changed = Arc::new(f);
+        self
+    }
+
+    /// Compiles the theme folder again and swaps it in, as the watcher does
+    /// when the folder changes. On any error nothing changes.
+    pub fn reload_now(&self) -> Result<(), ThemeError> {
+        reload(&self.theme, &self.dir)?;
+        (self.changed)();
+        Ok(())
     }
 
     /// The theme it reloads (a clone renders from the same templates).
@@ -456,9 +475,18 @@ impl ThemeWatcher {
     }
 }
 
-fn reload_and_log(theme: &SiteTheme, dir: &Path, link: &Link, why: &str) {
+fn reload_and_log(
+    theme: &SiteTheme,
+    dir: &Path,
+    changed: &(dyn Fn() + Send + Sync),
+    link: &Link,
+    why: &str,
+) {
     match reload(theme, dir) {
-        Ok(()) => log::info!(link.foundation().log(), "theme reloaded", cause = why),
+        Ok(()) => {
+            changed();
+            log::info!(link.foundation().log(), "theme reloaded", cause = why);
+        }
         Err(e) => log::warn!(
             link.foundation().log(),
             "theme refused; the running one stays",
@@ -478,13 +506,14 @@ impl Subsystem for ThemeWatcher {
         if self.poll.is_zero() {
             return Ok(());
         }
-        let (theme, dir, poll, stop, link, mut seen) = (
+        let (theme, dir, poll, stop, link, mut seen, changed) = (
             self.theme.clone(),
             self.dir.clone(),
             self.poll,
             self.stop.clone(),
             link.clone(),
             self.seen,
+            self.changed.clone(),
         );
         let thread = std::thread::Builder::new()
             .name("theme-watch".into())
@@ -500,7 +529,7 @@ impl Subsystem for ThemeWatcher {
                         let now = fingerprint(&dir);
                         if now != seen {
                             seen = now;
-                            reload_and_log(&theme, &dir, &link, "theme folder changed");
+                            reload_and_log(&theme, &dir, &*changed, &link, "theme folder changed");
                         }
                     }));
                     if turn.is_err() {
@@ -529,11 +558,13 @@ impl Subsystem for ThemeWatcher {
     fn reload(&mut self, _config: &Config) -> Result<Commit, Failure> {
         let (pages, errors) = compile(&self.dir)?;
         let theme = self.theme.clone();
+        let changed = self.changed.clone();
         Ok(Commit::new(move || {
             theme.pages().replace(pages);
             if let Some(e) = theme.error_pages() {
                 e.replace(errors);
             }
+            changed();
         }))
     }
 }
