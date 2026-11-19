@@ -91,6 +91,58 @@ pub enum IngressMode {
     },
 }
 
+/// The default worker count behind an application server (`PORT` set), at
+/// most.
+pub const PORT_WORKERS: u16 = 4;
+
+/// The keys of the sections the gateway reads.
+pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
+    (
+        "gateway",
+        &[
+            "access_log",
+            "drain",
+            "driver",
+            "forwarded_proto",
+            "head_timeout",
+            "ingress",
+            "keep_alive_requests",
+            "listen",
+            "max_body",
+            "passports",
+            "reserve",
+            "shed_check",
+            "shed_passports",
+            "shed_slow",
+            "stage_timing",
+            "trusted_proxies",
+            "workers",
+        ],
+    ),
+    ("door", &["ban", "exempt"]),
+];
+
+/// Refuses a key not in `known` in each of its sections.
+///
+/// # Errors
+///
+/// The first unknown key, with the section's keys.
+pub fn check_section_keys(config: &Config, known: &[(&str, &[&str])]) -> Result<(), String> {
+    for (section, keys) in known {
+        if let Some(unknown) = config.keys(section).into_iter().find(|k| !keys.contains(k)) {
+            return Err(format!(
+                "unknown key `{section}.{unknown}`: check the spelling; the keys of [{section}] are: {}",
+                keys.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_keys(config: &Config) -> Result<(), String> {
+    check_section_keys(config, KNOWN_KEYS)
+}
+
 impl Default for Settings {
     fn default() -> Settings {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -153,12 +205,22 @@ impl Settings {
         }
     }
 
-    /// Reads the settings; every key is optional.
+    /// Reads the settings; every key is optional, and a key the gateway does
+    /// not know in `[gateway]` or `[door]` is refused (a typo never leaves a
+    /// setting at its default). Behind an application server (`PORT` set)
+    /// the default worker count is at most [`PORT_WORKERS`]: a shared host
+    /// reports all of its CPUs, not the account's share.
     pub fn from_config(config: &Config) -> Result<Settings, SettingsError> {
+        check_keys(config).map_err(SettingsError)?;
         let d = Settings::default();
         let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());
+        let default_workers = if std::env::var_os("PORT").is_some() {
+            d.workers.min(PORT_WORKERS)
+        } else {
+            d.workers
+        };
         let workers: u64 = config
-            .get_or("gateway.workers", u64::from(d.workers))
+            .get_or("gateway.workers", u64::from(default_workers))
             .map_err(err)?;
         let keep_alive: u64 = config
             .get_or(

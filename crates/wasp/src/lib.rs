@@ -230,15 +230,72 @@ pub fn wire(config: &Config) -> Result<Wiring, String> {
 /// `WASP_ADMIN_PASSWORD`.
 pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, String> {
     let password = std::env::var(ADMIN_PASSWORD_ENV).ok();
-    let mut wiring = wire_with(config, data_dir, Some(data_dir), password.as_deref())?;
-    if std::env::var_os("PORT").is_some()
-        && site::SiteSettings::from_config(config)?.hosts.is_empty()
-    {
-        wiring.notices.push(
-            "PORT is set (an application server starts this process) but site.hosts is empty: the site answers only localhost; set site.hosts to the site's name".to_owned(),
+    check_hosts(config, std::env::var_os("PORT").is_some())?;
+    wire_with(config, data_dir, Some(data_dir), password.as_deref())
+}
+
+/// Behind an application server (`port`), `site.hosts` must name the site:
+/// with none it answers only `localhost`, so every visitor would get 421.
+/// `site.development = true` allows it (a local run behind a front end).
+fn check_hosts(config: &Config, port: bool) -> Result<(), String> {
+    let development: bool = config
+        .get_or("site.development", false)
+        .map_err(|e| e.to_string())?;
+    if port && !development && site::SiteSettings::from_config(config)?.hosts.is_empty() {
+        return Err(
+            "PORT is set (an application server starts this process) but site.hosts is empty, so every visitor would be refused: set site.hosts to the site's names (or site.development = true for a local run)"
+                .to_owned(),
         );
     }
-    Ok(wiring)
+    Ok(())
+}
+
+/// The keys of the sections the site reads.
+const KNOWN_KEYS: &[(&str, &[&str])] = &[
+    (
+        "site",
+        &[
+            "assets",
+            "base",
+            "development",
+            "hosts",
+            "name",
+            "service",
+            "theme",
+            "theme_poll",
+        ],
+    ),
+    ("content", &["path", "recovery", "store"]),
+    ("auth", &["admin", "origin", "secret", "store"]),
+    ("nex", &["path"]),
+    ("jobs", &["queue", "threads"]),
+    ("hello", &["slow_route"]),
+];
+
+/// The foundation's own sections (it checks their keys itself).
+const SUITE_SECTIONS: &[&str] = &[
+    "audit", "crash", "guard", "ids", "kernel", "log", "metrics", "secrets",
+];
+
+/// Refuses a section nothing reads and a key the site or the gateway does
+/// not know in theirs: a typo in the configuration never leaves a setting
+/// at its default without a word.
+fn check_keys(config: &Config) -> Result<(), String> {
+    gateway_io::settings::check_section_keys(config, KNOWN_KEYS)?;
+    gateway_io::settings::check_section_keys(config, gateway_io::settings::KNOWN_KEYS)?;
+    if let wasp_core::suite::config::backend::Value::Table(root) = config.backend().as_value() {
+        let known = |k: &str| {
+            SUITE_SECTIONS.contains(&k)
+                || KNOWN_KEYS.iter().any(|(s, _)| *s == k)
+                || gateway_io::settings::KNOWN_KEYS.iter().any(|(s, _)| *s == k)
+        };
+        if let Some(unknown) = root.keys().find(|k| !known(k)) {
+            return Err(format!(
+                "unknown section or key `{unknown}` in the configuration: check the spelling"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Phases 1 to 3 from configuration.
@@ -269,6 +326,7 @@ fn wire_with(
     secret_dir: Option<&std::path::Path>,
     admin_password: Option<&str>,
 ) -> Result<Wiring, String> {
+    check_keys(config)?;
     let e = |e: wasp_core::suite::Error| e.to_string();
     let mut notices = Vec::new();
     let mut shared = Shared::default();
@@ -436,4 +494,39 @@ fn wire_with(
         stages,
         notices,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conf(text: &str) -> Config {
+        Config::from_text(text).expect("config")
+    }
+
+    #[test]
+    fn unknown_keys_and_sections_are_refused() {
+        let err = check_keys(&conf("[site]\nhots = [\"example.com\"]\n")).expect_err("typo");
+        assert!(err.contains("site.hots"), "{err}");
+        let err = check_keys(&conf("[gateway]\nacess_log = true\n")).expect_err("typo");
+        assert!(err.contains("gateway.acess_log"), "{err}");
+        let err = check_keys(&conf("[sitee]\nhosts = []\n")).expect_err("section");
+        assert!(err.contains("sitee"), "{err}");
+        assert!(
+            check_keys(&conf(
+                "[log]\nlevel = \"info\"\n[site]\nhosts = [\"example.com\"]\n[gateway]\naccess_log = true\n[door]\nban = []\n[nex]\npath = \"data/nex\"\n"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn behind_port_the_hosts_must_be_named() {
+        let empty = conf("[site]\n");
+        assert!(check_hosts(&empty, false).is_ok(), "no PORT: localhost only");
+        let err = check_hosts(&empty, true).expect_err("PORT with no hosts");
+        assert!(err.contains("site.hosts"), "{err}");
+        assert!(check_hosts(&conf("[site]\nhosts = [\"example.com\"]\n"), true).is_ok());
+        assert!(check_hosts(&conf("[site]\ndevelopment = true\n"), true).is_ok());
+    }
 }
