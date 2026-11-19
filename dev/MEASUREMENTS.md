@@ -213,3 +213,22 @@ The gateway's own stages (hook, passport, core, respond) are 0.5 to 1.5 us of th
 On Windows the blocking driver halves the server time and cuts its p99 by 60-80%; what a client on the same machine sees does not move, because there the loopback and the client side dominate. On Linux the two drivers are the same within noise. The default stays the reactor (it holds thousands of connections per worker, and production is Linux); `gateway.driver = "blocking"` is the option for a Windows development machine (`workers` then is the number of connections). The root of the Windows tail is in net-io's Windows reactor path and goes to net-io with these numbers.
 
 One blocking run on each system ended with a non-200 reply mid-run before the benchmark reconnected on closed connections (now it does); with reconnects every run completed with 0 reconnects on Windows.
+
+## Soak: ten minutes of steady traffic (2026-11-18)
+
+The release `wasp` binary in WSL2 (Linux, rustc 1.99, load average 2.4 to 3.5 from other work), built `--no-default-features --features store-nex`: accounts, sessions and content in nex-db, the access log on, the theme folder watched (polled every second). `cargo run --release -p wasp --example soak -- 127.0.0.1:8092 8 250 600`: 8 keep-alive connections, 250 requests a second each, for 600 s. The traffic mixes cached guest pages (`/`, posts, `/about`), pages with a query (never cached), missing pages (404), the sign-in form (303 to set the pre-session cookie, since the client keeps no cookies) and `/health`. The theme's home template was touched every 60 s, so the theme reloaded and the guest cache was purged under load.
+
+| | result |
+|---|---|
+| requests answered | 1,199,978 in 600 s (2,000 a second), none unanswered |
+| statuses | 70% 2xx, 10% 3xx, 20% 4xx, as expected; 0 5xx, 0 unexpected |
+| client latency per 30 s window | p50 112-127 us, p99 195-315 us, max 0.46-2.4 ms |
+| server time (head to reply) | mean 16.7 us, p50 below 16.4 us, p99 below 41 us |
+| resident memory | 130.3 MB at start, 134.9 MB after 30 s, 135.1 MB at the end |
+| threads, open files | 46 and 146-154 throughout |
+| theme reloads under load | 9 |
+| load watch | never shed (no urgent line change before the stop) |
+| access log | 1,199,981 lines, none dropped |
+| stop | SIGINT, drained, exit 0 |
+
+Memory settles in the first 30 seconds (the guest cache and the connections' buffers) and then holds: 256 KB over the remaining nine and a half minutes.
