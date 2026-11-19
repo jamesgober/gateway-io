@@ -162,7 +162,10 @@ impl NexDb {
             .map_err(|e| StoreError::unavailable(format!("nex-db {}: {e}", dir.display())))?;
         let until = std::time::Instant::now() + wait;
         let db = loop {
-            match nex_db::open(dir) {
+            match nex_db::Database::builder(dir)
+                .observer(crate::events::StoreEvents)
+                .open()
+            {
                 Ok(db) => break db,
                 Err(nex_db::Error::Locked) if std::time::Instant::now() < until => {
                     std::thread::sleep(Duration::from_millis(200));

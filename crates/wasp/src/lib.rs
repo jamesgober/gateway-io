@@ -5,6 +5,7 @@
 #[cfg(feature = "gatekeeper")]
 pub mod auth;
 pub mod content;
+pub mod events;
 pub mod import;
 #[cfg(feature = "store-nex")]
 pub mod nex;

@@ -196,6 +196,7 @@ pub(crate) fn configure<G: web_net::Gate>(
     builder
         .assets(Assets::new("/theme", settings.theme.join("static")))
         .sign_in("/sign-in")
+        .events(crate::events::SiteEvents)
         .health("/health")
         .ready("/ready", ready)
 }
