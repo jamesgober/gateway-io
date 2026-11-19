@@ -39,7 +39,7 @@ fn slash(p: &Path) -> String {
 fn config(data: &Path) -> Config {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     Config::from_text(&format!(
-        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n",
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\nlock_wait = \"0s\"\n",
         slash(&theme),
         slash(&data.join("nex"))
     ))
@@ -267,4 +267,39 @@ fn the_core_authenticates_nex_db_sessions() {
             .ends_with("guest")
     );
     let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_cookie_without_a_value_does_not_hide_the_session() {
+    use wasp::nex::cookie;
+    assert_eq!(
+        cookie(b"flag; __Host-nex=abc; theme=dark", SESSION_COOKIE),
+        Some("abc")
+    );
+    assert_eq!(cookie(b"__Host-nex=a; __Host-nex=b", SESSION_COOKIE), None);
+}
+
+#[test]
+fn a_new_boot_account_needs_a_long_password() {
+    let data = temp_dir("boot");
+    let auth = NexAuth::new(NexDb::open(&data.0.join("nex")).expect("open"));
+    let err = auth
+        .ensure_account("boot@example.com", "short", &["member"])
+        .expect_err("too short");
+    assert!(err.to_string().contains("12"), "{err}");
+    assert!(
+        auth.ensure_account("boot@example.com", "a long enough password", &[])
+            .expect("made")
+            .is_some()
+    );
+    // Again with its password: kept, and the roles it lacks are given back.
+    assert_eq!(
+        auth.ensure_account(
+            "boot@example.com",
+            "a long enough password",
+            &["member", "editor"]
+        )
+        .expect("again"),
+        None
+    );
 }

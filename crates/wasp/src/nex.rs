@@ -375,7 +375,51 @@ impl ContentStore for NexStore {
 pub struct NexAuth {
     db: NexDb,
     roles: Arc<[(Box<str>, u64)]>,
+    checked: Arc<Checked>,
 }
+
+/// What a session's last recheck read (its account's permissions and
+/// standing), so the store is read at most once per [`RECHECK`] per session.
+#[derive(Debug, Default)]
+struct Checked(
+    std::sync::Mutex<std::collections::HashMap<SessionId, (std::time::Instant, PermSet, Standing)>>,
+);
+
+/// Sessions whose last recheck is kept at once; past it, older ones go.
+const CHECKED: usize = 100_000;
+
+impl Checked {
+    fn get(&self, session: SessionId) -> Option<(PermSet, Standing)> {
+        let map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(&session)
+            .filter(|(at, _, _)| at.elapsed() < RECHECK)
+            .map(|(_, p, s)| (*p, *s))
+    }
+
+    fn put(&self, session: SessionId, perms: PermSet, standing: Standing) {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= CHECKED {
+            map.retain(|_, (at, _, _)| at.elapsed() < RECHECK);
+            if map.len() >= CHECKED {
+                map.clear();
+            }
+        }
+        map.insert(session, (std::time::Instant::now(), perms, standing));
+    }
+}
+
+/// The shortest boot account password made from `WASP_ADMIN_PASSWORD`, in
+/// characters.
+pub const MIN_ADMIN_PASSWORD: usize = 12;
+
+/// How long a session lasts without a request.
+pub const IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl NexAuth {
     /// The authenticator over `db`, with `member` granting permission bit 0
@@ -391,6 +435,7 @@ impl NexAuth {
         NexAuth {
             db,
             roles: roles.iter().map(|(n, b)| (Box::from(*n), *b)).collect(),
+            checked: Arc::default(),
         }
     }
 
@@ -412,7 +457,11 @@ impl NexAuth {
 
     /// Makes `identifier` an account with `password` holding `roles`, when
     /// there is none yet (the boot account): the new account's id, or `None`
-    /// when it existed already (it is left as it is).
+    /// when it existed already. A new account's password must be at least
+    /// [`MIN_ADMIN_PASSWORD`] characters. When the account exists and
+    /// `password` is still its password, any of `roles` it lacks is given
+    /// back (a boot stopped between making the account and giving it its
+    /// roles); otherwise it is left as it is.
     pub fn ensure_account(
         &self,
         identifier: &str,
@@ -420,11 +469,6 @@ impl NexAuth {
         roles: &[&str],
     ) -> Result<Option<UserId>, StoreError> {
         let auth = self.db.db().auth();
-        let account = match auth.sign_up(identifier, password) {
-            Ok(a) => a,
-            Err(nex_db::Error::AlreadyExists { .. }) => return Ok(None),
-            Err(e) => return Err(nex(e)),
-        };
         let mut ids = Vec::with_capacity(roles.len());
         for role in roles {
             ids.push(match auth.role_named(role) {
@@ -432,8 +476,40 @@ impl NexAuth {
                 None => auth.define_role(nex_db::Role::new(*role)).map_err(nex)?,
             });
         }
-        auth.assign_roles(account, &ids).map_err(nex)?;
-        Ok(Some(user_of(account)))
+        let verified = |auth: &nex_db::Auth<'_>| match auth.verify_password(identifier, password) {
+            Ok(PasswordCheck::Verified(a)) => Some(a),
+            _ => None,
+        };
+        if password.chars().count() < MIN_ADMIN_PASSWORD && verified(&auth).is_none() {
+            return Err(StoreError::new(
+                StoreErrorKind::Invalid,
+                format!(
+                    "the boot account's password must be at least {MIN_ADMIN_PASSWORD} characters"
+                ),
+            ));
+        }
+        match auth.sign_up(identifier, password) {
+            Ok(account) => {
+                auth.assign_roles(account, &ids).map_err(nex)?;
+                Ok(Some(user_of(account)))
+            }
+            Err(nex_db::Error::AlreadyExists { .. }) => {
+                if let Some(account) = verified(&auth) {
+                    let held = auth.roles(account).map_err(nex)?;
+                    if ids.iter().any(|id| !held.contains(id)) {
+                        let mut all = held;
+                        all.extend(
+                            ids.iter()
+                                .filter(|id| !all.contains(id))
+                                .collect::<Vec<_>>(),
+                        );
+                        auth.assign_roles(account, &all).map_err(nex)?;
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => Err(nex(e)),
+        }
     }
 
     /// Bans the account: every session it holds ends in the same commit.
@@ -459,6 +535,7 @@ impl NexAuth {
         };
         let perms = self.perms_of(account)?;
         let spec = SessionSpec::web()
+            .idle(IDLE)
             .recheck_after(RECHECK)
             .payload(&perms.0.to_le_bytes())
             .map_err(nex)?;
@@ -485,7 +562,10 @@ pub fn cookie<'a>(header: &'a [u8], want: &str) -> Option<&'a str> {
     let text = std::str::from_utf8(header).ok()?;
     let mut found = None;
     for pair in text.split(';') {
-        let (name, value) = pair.trim().split_once('=')?;
+        // A cookie set without `=` (another script's flag) is not ours.
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
         if name == want {
             if found.is_some() {
                 return None; // planted twice: never pick one
@@ -546,37 +626,51 @@ impl Authenticator for NexAuth {
             Err(_) => return Authentication::Unavailable,
         };
         let account = session.account();
-        let mut standing = Standing::Good;
-        if session
+        let id = session_id(token);
+        // The permissions written at sign-in, until the first recheck; from
+        // then on the account's roles and standing as read at most a minute
+        // ago, so a removed role or a suspension reaches open sessions.
+        let (perms, standing) = if session
             .recheck_at()
             .is_some_and(|at| SystemTime::now() >= at)
         {
-            match auth.standing(account) {
-                Ok(Some(nex_db::Standing::Banned { .. })) => {
-                    out.set_cookie(clear_cookie().as_bytes());
-                    return Authentication::Refused(wasp_core::Refusal::status(403));
-                }
-                Ok(Some(nex_db::Standing::Suspended { until, .. })) => {
-                    standing = Standing::Suspended {
+            if let Some(known) = self.checked.get(id) {
+                known
+            } else {
+                let standing = match auth.standing(account) {
+                    Ok(Some(nex_db::Standing::Banned { .. })) => {
+                        out.set_cookie(clear_cookie().as_bytes());
+                        return Authentication::Refused(wasp_core::Refusal::status(403));
+                    }
+                    Ok(Some(nex_db::Standing::Suspended { until, .. })) => Standing::Suspended {
                         until: until.and_then(unix),
-                    };
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let a = guest(out);
-                    out.set_cookie(clear_cookie().as_bytes());
-                    return a;
-                }
-                Err(_) => {}
+                    },
+                    Ok(Some(_)) => Standing::Good,
+                    Ok(None) => {
+                        let a = guest(out);
+                        out.set_cookie(clear_cookie().as_bytes());
+                        return a;
+                    }
+                    // The store cannot answer: never let the request through
+                    // on what it last said.
+                    Err(_) => return Authentication::Unavailable,
+                };
+                let Ok(perms) = self.perms_of(account) else {
+                    return Authentication::Unavailable;
+                };
+                self.checked.put(id, perms, standing);
+                (perms, standing)
             }
-        }
-        let perms = session
-            .payload()
-            .get(..8)
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map_or(PermSet::NONE, |b| PermSet(u64::from_le_bytes(b)));
+        } else {
+            let perms = session
+                .payload()
+                .get(..8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(PermSet::NONE, |b| PermSet(u64::from_le_bytes(b)));
+            (perms, Standing::Good)
+        };
         let user = user_of(account);
-        let session = session_id(token);
+        let session = id;
         out.keep(NexToken::new(&session.0.to_le_bytes()));
         Authentication::Identified(Identity::user(user, session, perms).with_standing(standing))
     }

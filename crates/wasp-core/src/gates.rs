@@ -208,7 +208,9 @@ pub trait Authorizer: Send + Sync + 'static {
 }
 
 /// The first authorizer: the rule's own terms and nothing else. Guests pass
-/// public rules; signed-in accounts pass rules whose permissions they hold.
+/// public rules; signed-in accounts pass rules whose permissions they hold,
+/// except a suspended account, which passes only rules that need none (it
+/// can still sign out) until its suspension ends.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuleTerms;
 
@@ -221,11 +223,25 @@ impl Authorizer for RuleTerms {
         if identity.is_guest() {
             return Decision::Deny(Refusal::status(401));
         }
+        if rule.needed() != PermSet::NONE && suspended_now(identity.standing()) {
+            return Decision::Deny(Refusal::status(403));
+        }
         if identity.perms().contains(rule.needed()) {
             Decision::Allow
         } else {
             Decision::Deny(Refusal::status(403))
         }
+    }
+}
+
+/// Whether `standing` is a suspension that has not ended yet.
+fn suspended_now(standing: crate::Standing) -> bool {
+    match standing {
+        crate::Standing::Good => false,
+        crate::Standing::Suspended { until: None } => true,
+        crate::Standing::Suspended { until: Some(t) } => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(true, |now| now.as_secs() < t),
     }
 }
 
@@ -271,5 +287,30 @@ impl Access {
 impl std::fmt::Debug for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Access")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SessionId, Standing, UserId};
+
+    #[test]
+    fn a_suspended_account_passes_only_rules_that_need_no_permission() {
+        let user = Identity::user(UserId(1), SessionId(1), PermSet(2));
+        let editing = Rule::needs(1, PermSet(2));
+        let signing_out = Rule::needs(2, PermSet::NONE);
+        assert_eq!(RuleTerms.authorize(&user, &editing), Decision::Allow);
+        let suspended = user.with_standing(Standing::Suspended { until: None });
+        assert!(matches!(
+            RuleTerms.authorize(&suspended, &editing),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            RuleTerms.authorize(&suspended, &signing_out),
+            Decision::Allow
+        );
+        let ended = user.with_standing(Standing::Suspended { until: Some(1) });
+        assert_eq!(RuleTerms.authorize(&ended, &editing), Decision::Allow);
     }
 }
