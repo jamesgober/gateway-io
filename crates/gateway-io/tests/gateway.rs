@@ -584,3 +584,44 @@ fn closing_the_door_lowers_a_shed_the_watch_raised() {
     let _ = open.close(Duration::from_secs(1));
     assert_eq!(line.level(), Level::Normal);
 }
+
+#[test]
+fn the_access_log_writes_a_line_per_request_without_the_query() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    let access = gateway_io::AccessLog::with_writer(move |e| {
+        let _ = tx.lock().expect("lock").send(e.clone());
+    })
+    .expect("access log");
+    let line = UrgentLine::detached();
+    let open = Door::open_with(
+        core(),
+        &settings(1, 4),
+        line.clone(),
+        gateway_io::WebServices::new(),
+        gateway_io::Extras {
+            access: Some(access),
+            ..gateway_io::Extras::default()
+        },
+    )
+    .expect("gateway opens");
+    let addr = open.local_addr().expect("addr");
+    assert_eq!(get(addr, "/?token=secret").map(|g| g.status), Some(200));
+    let e = rx.recv_timeout(Duration::from_secs(5)).expect("a line");
+    assert_eq!((&*e.method, &*e.path), ("GET", "/"));
+    assert_eq!((e.status, e.end), (Some(200), "replied"));
+    assert!(e.bytes_out > 0 && e.server_time.is_some(), "{e:?}");
+    assert_eq!(e.client, Some(IpAddr::from([127, 0, 0, 1])));
+    assert!(!format!("{e:?}").contains("secret"), "no query in the log");
+
+    // A shed request is written too.
+    line.set(Level::Shed, "test").expect("shed");
+    open.running().server_handle().wake_all();
+    thread::sleep(Duration::from_millis(50));
+    let _ = get(addr, "/");
+    let e = rx.recv_timeout(Duration::from_secs(5)).expect("a line");
+    assert_eq!((&*e.path, e.status), ("/", Some(503)), "{e:?}");
+    line.shift(Level::Shed, Level::Normal, "test over")
+        .expect("normal");
+    let _ = open.close(Duration::from_secs(1));
+}

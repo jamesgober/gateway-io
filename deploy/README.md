@@ -43,6 +43,9 @@ admin = "you@example.com"
 
 [nex]
 path = "data/nex"
+
+[gateway]
+access_log = true
 ```
 
 With nex-db, accounts and sessions survive restarts; the content can live there too (`content.store = "nex"`).
@@ -76,4 +79,4 @@ and start it again. See the main README for the file format.
 curl -sI https://example.com/health
 ```
 
-The log (standard error, captured by Passenger) shows `ready` at boot, a `boot notice` for anything to fix (an empty `site.hosts` behind `PORT`, bytes discarded from the store), and the door's decisions.
+The log (standard error, captured by Passenger) shows `ready` at boot, a `boot notice` for anything to fix (an empty `site.hosts` behind `PORT`, bytes discarded from the store), the door's decisions, and with `gateway.access_log` one `access` line per request (method, path without the query, status, bytes, server time in microseconds, client address).

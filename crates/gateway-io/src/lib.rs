@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod bouncer;
 pub mod control;
 pub mod events;
@@ -32,6 +33,7 @@ pub mod stages;
 pub mod tickets;
 pub mod web;
 
+pub use crate::access::{AccessEntry, AccessLog};
 pub use crate::control::UrgentControl;
 pub use crate::events::LogSink;
 pub use crate::gateway::{Door, Extras, Gateway, OpenError};

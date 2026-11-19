@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use bouncer_io::{Ticket, TicketTag};
 use wasp_core::Handoff;
 
+use crate::access::Line;
 use crate::stages::Stamps;
 
 /// One live request.
@@ -26,6 +27,8 @@ struct Entry {
     stamps: Option<Stamps>,
     /// A streamed web reply between parts.
     parked: Option<Handoff>,
+    /// The request line, for the access log.
+    line: Option<Line>,
 }
 
 /// One worker's live request tickets. Touched by the owning worker only on the
@@ -59,15 +62,17 @@ impl RequestTickets {
     #[inline]
     #[must_use]
     pub fn hold(&self, worker: u16, ticket: Ticket) -> Option<TicketTag> {
-        self.hold_at(worker, ticket, None)
+        self.hold_at(worker, ticket, None, None)
     }
 
-    /// [`hold`](Self::hold), with the moment the head hook ran (stage timing).
+    /// [`hold`](Self::hold), with the moment the head hook ran (stage timing)
+    /// and the request line (the access log).
     pub(crate) fn hold_at(
         &self,
         worker: u16,
         ticket: Ticket,
         hook: Option<std::time::Instant>,
+        line: Option<Line>,
     ) -> Option<TicketTag> {
         let shelf = self.shelves.get(usize::from(worker))?;
         let tag = ticket.tag();
@@ -79,6 +84,7 @@ impl RequestTickets {
             ticket,
             stamps,
             parked: None,
+            line,
         });
         Some(tag)
     }
@@ -129,15 +135,16 @@ impl RequestTickets {
         self.release_all(worker, tag).0
     }
 
-    /// [`release`](Self::release), and the hand-off still parked (a streamed
-    /// reply the client left before its last part), for the pool.
+    /// [`release`](Self::release), the hand-off still parked (a streamed
+    /// reply the client left before its last part), for the pool, and the
+    /// request line.
     pub(crate) fn release_all(
         &self,
         worker: u16,
         tag: TicketTag,
-    ) -> (Option<Stamps>, Option<Handoff>) {
+    ) -> (Option<Stamps>, Option<Handoff>, Option<Line>) {
         let Some(shelf) = self.shelves.get(usize::from(worker)) else {
-            return (None, None);
+            return (None, None, None);
         };
         // Taken out under the lock, dropped after it.
         let gone = shelf.live.lock().ok().and_then(|mut live| {
@@ -150,11 +157,12 @@ impl RequestTickets {
                 ticket,
                 stamps,
                 parked,
+                line,
             }) => {
                 drop(ticket);
-                (stamps, parked)
+                (stamps, parked, line)
             }
-            None => (None, None),
+            None => (None, None, None),
         }
     }
 

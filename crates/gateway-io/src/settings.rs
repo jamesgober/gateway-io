@@ -59,6 +59,8 @@ pub struct Settings {
     pub driver: Driver,
     /// Stage timing (`[gateway] stage_timing`, default off).
     pub stage_timing: bool,
+    /// A line per request in the log (`[gateway] access_log`, default off).
+    pub access_log: bool,
     /// Addresses banned at the door from boot (`[door] ban`, default none).
     pub ban: Vec<IpAddr>,
     /// Addresses exempt from the door's budgets, for local load tests
@@ -106,6 +108,7 @@ impl Default for Settings {
             keep_alive_requests: 1000,
             driver: Driver::Reactor,
             stage_timing: false,
+            access_log: false,
             ban: Vec::new(),
             exempt: Vec::new(),
             ingress: IngressMode::Direct,
@@ -241,6 +244,9 @@ impl Settings {
             driver,
             stage_timing: config
                 .get_or("gateway.stage_timing", d.stage_timing)
+                .map_err(err)?,
+            access_log: config
+                .get_or("gateway.access_log", d.access_log)
                 .map_err(err)?,
             ban: addresses(config, "door.ban")?,
             exempt: addresses(config, "door.exempt")?,

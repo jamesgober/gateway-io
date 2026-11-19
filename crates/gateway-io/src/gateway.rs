@@ -12,6 +12,7 @@ use wasp_core::suite::lifecycle::{Commit, Deadline, Failure, Link, Position, Sub
 use wasp_core::suite::log;
 use wasp_core::{Core, PassportPool, SlotSizes};
 
+use crate::access::AccessLog;
 use crate::bouncer::{self, DoorCheckpoint};
 use crate::control::UrgentControl;
 use crate::events::LogSink;
@@ -42,6 +43,8 @@ pub struct Extras {
     pub events: Option<Arc<dyn EventSink>>,
     /// Stage timing (`gateway.stage_timing`).
     pub stages: Option<Arc<StageTimes>>,
+    /// A line per request (`gateway.access_log`).
+    pub access: Option<Arc<AccessLog>>,
 }
 
 impl std::fmt::Debug for Extras {
@@ -88,7 +91,11 @@ impl Door {
         web: WebServices,
         extras: Extras,
     ) -> Result<Door, OpenError> {
-        let Extras { events, stages } = extras;
+        let Extras {
+            events,
+            stages,
+            access,
+        } = extras;
         let stages = stages.unwrap_or_else(|| Arc::new(StageTimes::new(false)));
         for (tag, name) in core.external_services() {
             if web.get(tag).is_none() {
@@ -169,14 +176,17 @@ impl Door {
             )));
         }
         let bound = built
-            .bind(Pipeline::with_stages(
-                core,
-                pool.clone(),
-                bouncer.clone(),
-                tickets.clone(),
-                Arc::new(web),
-                stages.clone(),
-            ))
+            .bind(
+                Pipeline::with_stages(
+                    core,
+                    pool.clone(),
+                    bouncer.clone(),
+                    tickets.clone(),
+                    Arc::new(web),
+                    stages.clone(),
+                )
+                .with_access(access),
+            )
             .map_err(|e| OpenError(e.to_string()))?;
         let load = Watcher::start(
             settings.shed_marks(),
@@ -339,6 +349,11 @@ impl Subsystem for Gateway {
             .take()
             .ok_or_else(|| Failure::new("a web service names no service the core declares"))?;
         let events: Arc<dyn EventSink> = LogSink::spawn(link.foundation().clone())?;
+        let access = if settings.access_log {
+            Some(AccessLog::spawn(link.foundation().clone())?)
+        } else {
+            None
+        };
         let open = Door::open_with(
             self.core.clone(),
             &settings,
@@ -347,6 +362,7 @@ impl Subsystem for Gateway {
             Extras {
                 events: Some(events),
                 stages: self.stages.clone(),
+                access,
             },
         )?;
         let addr = open

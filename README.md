@@ -114,6 +114,7 @@ themes/default/static/   site.css                 (served under /theme/)
 | `gateway.max_body` | 1 MiB | the largest buffered body (at most 64 MiB) |
 | `gateway.keep_alive_requests` | 1000 | requests per connection |
 | `gateway.driver` | `reactor` | net-io's driver; `blocking` (one thread per connection: `workers` connections, plus a few threads that answer the ones over the cap) halves server time on a Windows development machine |
+| `gateway.access_log` | false | one `access` line per request in the log: method, path (never the query), status, how it ended, bytes, server time, client; written off the worker, and dropped (and counted) rather than waited for when the log falls behind |
 | `gateway.stage_timing` | false | record where each request's server time goes; logged per stage when the gateway stops |
 | `gateway.ingress` | `direct` | `direct`, or `proxy` behind a reverse proxy: the client is the address in `X-Forwarded-For`, believed only from `gateway.trusted_proxies`, and the door bans and charges that client; a trusted proxy that sends no header is refused |
 | `gateway.trusted_proxies` | none | the proxies' addresses or blocks (`127.0.0.1`, `10.0.0.0/8`); required with `ingress = "proxy"` |

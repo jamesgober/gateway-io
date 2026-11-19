@@ -21,6 +21,7 @@ use wasp_core::{
     Core, Exit, Lane, PassportPool, ProfileId, Refusal, RequestId, Routed, ServiceTag, Trip,
 };
 
+use crate::access::{AccessLog, Line};
 use crate::stages::{StageTimes, Stamps};
 use crate::tickets::RequestTickets;
 use crate::web::{Caller, WebServices};
@@ -90,6 +91,7 @@ pub struct Pipeline {
     tickets: Arc<RequestTickets>,
     web: Arc<WebServices>,
     stages: Arc<StageTimes>,
+    access: Option<Arc<AccessLog>>,
 }
 
 /// A passport out of its shelf for one call. If the call unwinds (a panic in
@@ -162,7 +164,15 @@ impl Pipeline {
             tickets,
             web,
             stages,
+            access: None,
         }
+    }
+
+    /// Writes a line per request to `access`.
+    #[must_use]
+    pub fn with_access(mut self, access: Option<Arc<AccessLog>>) -> Pipeline {
+        self.access = access;
+        self
     }
 
     /// A checkpoint on this request's ticket: `Some(status)` when the bouncer
@@ -429,7 +439,11 @@ impl HttpService for Pipeline {
         {
             return HeadAction::refuse(d.code.http_status());
         }
-        match self.tickets.hold_at(env.worker().get(), ticket, hook) {
+        let line = self
+            .access
+            .as_ref()
+            .map(|_| Line::new(head.method_str(), head.path()));
+        match self.tickets.hold_at(env.worker().get(), ticket, hook, line) {
             Some(tag) => {
                 env.set_user_word(tag.get());
                 HeadAction::Proceed
@@ -487,11 +501,17 @@ impl HttpService for Pipeline {
             web.done(env, finished);
         }
         if env.user_word() == 0 {
+            if let Some(access) = &self.access {
+                access.finished(None, env, finished);
+            }
             return;
         }
-        let (stamps, parked) = self
+        let (stamps, parked, line) = self
             .tickets
             .release_all(env.worker().get(), TicketTag::from_raw(env.user_word()));
+        if let Some(access) = &self.access {
+            access.finished(line, env, finished);
+        }
         if let Some(h) = parked {
             // The client left before the last part.
             self.pool.give_back(h.finish());
