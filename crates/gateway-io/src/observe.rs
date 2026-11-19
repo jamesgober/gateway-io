@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use serve_net::{Envelope, Finished, Observer, RequestEnd};
 
+use crate::control::SHED_FROM;
+use crate::load::LoadSignal;
+
 const OCTAVES: usize = 40;
 const SUB: usize = 4;
 const BUCKETS: usize = OCTAVES * SUB;
@@ -125,28 +128,42 @@ fn upper_edge(i: usize) -> u64 {
     base + (base / 4) * (quarter + 1)
 }
 
-/// serve-net's observer feeding a [`ServerTime`].
+/// serve-net's observer feeding a [`ServerTime`], and the load watch's
+/// signal with the server time of browsing (the lanes `Shed` refuses).
 #[derive(Clone, Debug, Default)]
 pub struct TimeObserver {
     time: Arc<ServerTime>,
+    load: Option<Arc<LoadSignal>>,
 }
 
 impl TimeObserver {
     /// An observer over this histogram.
     #[must_use]
     pub fn new(time: Arc<ServerTime>) -> TimeObserver {
-        TimeObserver { time }
+        TimeObserver { time, load: None }
+    }
+
+    /// Also feeds the load watch's signal.
+    #[must_use]
+    pub fn with_load(mut self, load: Arc<LoadSignal>) -> TimeObserver {
+        self.load = Some(load);
+        self
     }
 }
 
 impl Observer for TimeObserver {
     #[inline]
-    fn request_finished(&self, _env: &Envelope, finished: &Finished) {
+    fn request_finished(&self, env: &Envelope, finished: &Finished) {
         match finished.end {
             RequestEnd::Replied => {
                 if let Some(done) = finished.replied_at {
-                    self.time
-                        .record(done.saturating_duration_since(finished.head_at));
+                    let took = done.saturating_duration_since(finished.head_at);
+                    self.time.record(took);
+                    if let Some(load) = &self.load
+                        && env.lane().0 >= SHED_FROM.0
+                    {
+                        load.record(took);
+                    }
                 }
             }
             RequestEnd::Refused(_) | RequestEnd::Shed | RequestEnd::Denied => {

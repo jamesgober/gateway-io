@@ -528,3 +528,59 @@ fn a_closed_door_lets_go_of_the_core() {
     }
     assert!(weak.upgrade().is_none(), "the core is freed after close");
 }
+
+#[test]
+fn slow_browsing_sheds_on_its_own_and_recovers() {
+    let mut s = settings(1, 4);
+    s.shed_passports = 0;
+    s.shed_slow = Duration::from_millis(20);
+    s.shed_check = Duration::from_millis(10);
+    let (open, addr, line) = open(&s);
+    // Quick replies: nothing happens.
+    for _ in 0..5 {
+        assert_eq!(get(addr, "/").map(|g| g.status), Some(200));
+    }
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(line.level(), Level::Normal);
+
+    // Slow browsing: the watch sheds.
+    let until = Instant::now() + Duration::from_secs(5);
+    while line.level() == Level::Normal && Instant::now() < until {
+        let _ = get(addr, "/slow?ms=150");
+    }
+    assert_eq!(line.level(), Level::Shed, "the load watch shed");
+    open.running().server_handle().wake_all();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        get(addr, "/health").map(|g| g.status),
+        Some(200),
+        "health checks pass under shed"
+    );
+
+    // Quiet again: back to normal on its own.
+    let until = Instant::now() + Duration::from_secs(5);
+    while line.level() == Level::Shed && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(line.level(), Level::Normal, "the load passed");
+    open.running().server_handle().wake_all();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(get(addr, "/").map(|g| g.status), Some(200));
+    let _ = open.close(Duration::from_secs(1));
+}
+
+#[test]
+fn closing_the_door_lowers_a_shed_the_watch_raised() {
+    let mut s = settings(1, 4);
+    s.shed_passports = 0;
+    s.shed_slow = Duration::from_millis(20);
+    s.shed_check = Duration::from_millis(10);
+    let (open, addr, line) = open(&s);
+    let until = Instant::now() + Duration::from_secs(5);
+    while line.level() == Level::Normal && Instant::now() < until {
+        let _ = get(addr, "/slow?ms=150");
+    }
+    assert_eq!(line.level(), Level::Shed);
+    let _ = open.close(Duration::from_secs(1));
+    assert_eq!(line.level(), Level::Normal);
+}

@@ -24,6 +24,7 @@ pub mod events;
 #[cfg(feature = "gatekeeper")]
 pub mod gatekeeper;
 pub mod gateway;
+pub mod load;
 pub mod observe;
 pub mod pipeline;
 pub mod settings;
@@ -34,6 +35,7 @@ pub mod web;
 pub use crate::control::UrgentControl;
 pub use crate::events::LogSink;
 pub use crate::gateway::{Door, Extras, Gateway, OpenError};
+pub use crate::load::{LoadSignal, ShedMarks};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::settings::{Driver, IngressMode, Settings, SettingsError};

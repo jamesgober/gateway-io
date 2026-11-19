@@ -15,6 +15,7 @@ use wasp_core::{Core, PassportPool, SlotSizes};
 use crate::bouncer::{self, DoorCheckpoint};
 use crate::control::UrgentControl;
 use crate::events::LogSink;
+use crate::load::{LoadSignal, Watcher};
 use crate::observe::{ServerTime, TimeObserver};
 use crate::pipeline::{PassportAdmit, Pipeline};
 use crate::settings::{Driver, IngressMode, Settings};
@@ -61,6 +62,8 @@ pub struct Door {
     bouncer: Bouncer,
     time: Arc<ServerTime>,
     ejector: Arc<bouncer::DoorEjector>,
+    /// The load watch, while it runs.
+    load: Option<Watcher>,
 }
 
 impl Door {
@@ -148,13 +151,14 @@ impl Door {
             );
         }
         let time = Arc::new(ServerTime::default());
+        let signal = Arc::new(LoadSignal::default());
         let admit = PassportAdmit::new(pool.clone());
         let built = builder
-            .observer(TimeObserver::new(time.clone()))
+            .observer(TimeObserver::new(time.clone()).with_load(signal.clone()))
             .gate(bouncer.clone())
             .checkpoint(DoorCheckpoint::new(bouncer.clone()))
             .admit(admit.clone())
-            .control(Arc::new(UrgentControl::new(line)))
+            .control(Arc::new(UrgentControl::new(line.clone())))
             .build()
             .map_err(|e| OpenError(format!("gateway configuration: {e}")))?;
         if admit.prepared_workers() > pool.workers() {
@@ -174,6 +178,14 @@ impl Door {
                 stages.clone(),
             ))
             .map_err(|e| OpenError(e.to_string()))?;
+        let load = Watcher::start(
+            settings.shed_marks(),
+            settings.shed_check,
+            line,
+            pool.clone(),
+            signal,
+        )
+        .map_err(|e| OpenError(format!("load watch: {e}")))?;
         let running = bound.open().map_err(|e| OpenError(e.to_string()))?;
         ejector.attach(running.server_handle());
         Ok(Door {
@@ -184,6 +196,7 @@ impl Door {
             bouncer,
             time,
             ejector,
+            load,
         })
     }
 
@@ -231,8 +244,13 @@ impl Door {
 
     /// Shutdown steps 1 and 2: the door closes, then in-flight requests drain
     /// until `deadline`; whatever is left is closed.
-    pub fn close(self, deadline: Duration) -> DrainReport {
+    pub fn close(mut self, deadline: Duration) -> DrainReport {
         self.running.close_door();
+        // A shed the load watch raised is lowered: the next door starts
+        // from what the operator set.
+        if let Some(mut load) = self.load.take() {
+            load.stop();
+        }
         // The bouncer's ejector holds the transport; detached here, nothing
         // keeps the transport (and the core and its stores) alive once the
         // drain ends.

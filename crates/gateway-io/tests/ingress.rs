@@ -109,6 +109,48 @@ fn proxy_ingress_needs_a_trust_list() {
 }
 
 #[test]
+fn shed_settings_are_checked() {
+    let read = |text: &str| Settings::from_config(&Config::from_text(text).expect("config"));
+    let d = read("").expect("defaults");
+    assert_eq!(
+        (d.shed_passports, d.shed_slow, d.shed_check),
+        (90, Duration::from_secs(1), Duration::from_millis(250))
+    );
+    assert!(
+        read(
+            "[gateway]
+shed_passports = 101
+"
+        )
+        .is_err()
+    );
+    assert!(
+        read(
+            "[gateway]
+shed_check = \"5ms\"
+"
+        )
+        .is_err()
+    );
+    assert!(
+        read(
+            "[gateway]
+shed_check = \"2m\"
+"
+        )
+        .is_err()
+    );
+    let off = read(
+        "[gateway]
+shed_passports = 0
+shed_slow = \"0s\"
+",
+    )
+    .expect("off");
+    assert!(!off.shed_marks().on());
+}
+
+#[test]
 fn an_application_server_port_means_loopback_behind_its_front_end() {
     let config = Config::from_text("[gateway]\nlisten = \"0.0.0.0:8080\"\n").expect("config");
     let base = Settings::from_config(&config).expect("settings");

@@ -106,6 +106,9 @@ themes/default/static/   site.css                 (served under /theme/)
 | `gateway.workers` | logical CPUs, at most 64 | reactor workers (1 to 256); with `blocking`, the connections served at once |
 | `gateway.passports` | 256 | passports per worker (requests in flight) |
 | `gateway.reserve` | an eighth of `gateway.passports` | passports per worker held back for health checks, the content editor, and sign-in: browsing cannot take them, so a flood of page views never locks those out |
+| `gateway.shed_passports` | 90 | the gateway sheds browsing on its own when this share of the passports (percent) is in use; 0 turns it off |
+| `gateway.shed_slow` | `1s` | the gateway sheds browsing on its own when browsing replies take this long on average; `0s` turns it off |
+| `gateway.shed_check` | `250ms` | how often the load is read (10 ms to 60 s) |
 | `gateway.drain` | `10s` | the longest a drain may take |
 | `gateway.head_timeout` | `10s` | the head deadline |
 | `gateway.max_body` | 1 MiB | the largest buffered body (at most 64 MiB) |
@@ -135,6 +138,8 @@ themes/default/static/   site.css                 (served under /theme/)
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`; refused unless `gateway.listen` is a loopback address) |
+
+Under heavy load the gateway sheds on its own: when replies to page views get slow or the passports run short, page views are answered with 503 and a short `Retry-After`, while health checks, the content editor and sign-in are still served. It stops by itself once the load has passed (about two seconds of calm), and it never lowers a shed someone else set.
 
 A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt` and `gateway.drain` at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
 

@@ -34,6 +34,17 @@ pub struct Settings {
     /// administrator, and sign-in (`[gateway] reserve`; `None` for the
     /// default, an eighth of `passports`, at least one when there are two).
     pub reserve: Option<u32>,
+    /// The load watch sheds browsing on its own at this share of the
+    /// passports in use, in percent (`[gateway] shed_passports`, default 90;
+    /// 0 turns this reading off).
+    pub shed_passports: u8,
+    /// The load watch sheds browsing on its own when browsing replies take
+    /// this long on average (`[gateway] shed_slow`, default 1 s; "0s" turns
+    /// this reading off).
+    pub shed_slow: Duration,
+    /// How often the load watch reads the load (`[gateway] shed_check`,
+    /// default 250 ms, 10 ms to one minute).
+    pub shed_check: Duration,
     /// The longest a drain may take (`[gateway] drain`, default 10 s).
     pub drain: Duration,
     /// The head deadline (`[gateway] head_timeout`, default 10 s).
@@ -86,6 +97,9 @@ impl Default for Settings {
             workers: u16::try_from(cpus.clamp(1, 64)).unwrap_or(4),
             passports: 256,
             reserve: None,
+            shed_passports: 90,
+            shed_slow: Duration::from_secs(1),
+            shed_check: Duration::from_millis(250),
             drain: Duration::from_secs(10),
             head_timeout: Duration::from_secs(10),
             max_body: 1024 * 1024,
@@ -127,6 +141,15 @@ impl Settings {
             .min(passports_per_worker.saturating_sub(1))
     }
 
+    /// What the load watch looks for.
+    #[must_use]
+    pub fn shed_marks(&self) -> crate::load::ShedMarks {
+        crate::load::ShedMarks {
+            passports: self.shed_passports,
+            slow: self.shed_slow,
+        }
+    }
+
     /// Reads the settings; every key is optional.
     pub fn from_config(config: &Config) -> Result<Settings, SettingsError> {
         let d = Settings::default();
@@ -144,6 +167,17 @@ impl Settings {
             .get_or("gateway.passports", u64::from(d.passports))
             .map_err(err)?;
         let reserve: Option<u64> = config.get("gateway.reserve").map_err(err)?;
+        let shed_passports: u64 = config
+            .get_or("gateway.shed_passports", u64::from(d.shed_passports))
+            .map_err(err)?;
+        let shed_check: Duration = config
+            .get_or("gateway.shed_check", d.shed_check)
+            .map_err(err)?;
+        if !(Duration::from_millis(10)..=Duration::from_secs(60)).contains(&shed_check) {
+            return Err(SettingsError(
+                "gateway.shed_check must be from 10ms to 60s".into(),
+            ));
+        }
         let driver: String = config
             .get_or("gateway.driver", "reactor".to_owned())
             .map_err(err)?;
@@ -175,6 +209,16 @@ impl Settings {
                     ));
                 }
             },
+            shed_passports: u8::try_from(shed_passports)
+                .ok()
+                .filter(|p| *p <= 100)
+                .ok_or_else(|| {
+                    SettingsError("gateway.shed_passports must be 0 to 100 (percent)".into())
+                })?,
+            shed_slow: config
+                .get_or("gateway.shed_slow", d.shed_slow)
+                .map_err(err)?,
+            shed_check,
             drain: config.get_or("gateway.drain", d.drain).map_err(err)?,
             head_timeout: config
                 .get_or("gateway.head_timeout", d.head_timeout)
