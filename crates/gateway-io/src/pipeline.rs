@@ -392,6 +392,9 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
     }
     if let Some(cookie) = exit.auth_cookie() {
         out.header("set-cookie", cookie);
+        // As on the web path: a reply that sets the gate's cookie (a cached
+        // page answering a stale session, for one) is never kept by a cache.
+        out.header("cache-control", "private, no-store");
     }
     if reply.status_code() >= 400 {
         out.header("x-content-type-options", "nosniff");
