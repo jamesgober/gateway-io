@@ -85,6 +85,31 @@ const RECHECK: Duration = Duration::from_secs(60);
 /// The most entries read from one listing at boot.
 const MAX_ENTRIES: usize = 100_000;
 
+/// How long a boot waits for another process to let go of the database.
+pub const LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// Makes `dir` (and any missing parent) and keeps it to its owner: on Unix,
+/// mode 0700, tightened when it is open to the group or others.
+fn private_folder(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 fn nex(e: nex_db::Error) -> StoreError {
     StoreError::new(kind_of(&e), format!("nex-db: {e}"))
 }
@@ -123,20 +148,39 @@ impl Drop for TemporaryFolder {
 
 impl NexDb {
     /// Opens (or creates) the database in `dir`. Refused while another
-    /// process holds it, or when it is not ready to serve.
+    /// process holds it (after waiting [`LOCK_WAIT`] for it to let go: a
+    /// restart can overlap the old process's drain), or when it is not ready
+    /// to serve.
     pub fn open(dir: &Path) -> Result<NexDb, StoreError> {
-        std::fs::create_dir_all(dir)
+        NexDb::open_waiting(dir, LOCK_WAIT)
+    }
+
+    /// [`open`](Self::open), waiting at most `wait` for another process to
+    /// let go of the database.
+    pub fn open_waiting(dir: &Path, wait: Duration) -> Result<NexDb, StoreError> {
+        private_folder(dir)
             .map_err(|e| StoreError::unavailable(format!("nex-db {}: {e}", dir.display())))?;
-        let db = nex_db::open(dir).map_err(|e| match e {
-            nex_db::Error::Locked => StoreError::unavailable(format!(
-                "nex-db {} is open in another process: is another instance running on this data folder?",
-                dir.display()
-            )),
-            other => StoreError::new(
-                kind_of(&other),
-                format!("nex-db {}: {other}", dir.display()),
-            ),
-        })?;
+        let until = std::time::Instant::now() + wait;
+        let db = loop {
+            match nex_db::open(dir) {
+                Ok(db) => break db,
+                Err(nex_db::Error::Locked) if std::time::Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(nex_db::Error::Locked) => {
+                    return Err(StoreError::unavailable(format!(
+                        "nex-db {} is open in another process: is another instance running on this data folder?",
+                        dir.display()
+                    )));
+                }
+                Err(other) => {
+                    return Err(StoreError::new(
+                        kind_of(&other),
+                        format!("nex-db {}: {other}", dir.display()),
+                    ));
+                }
+            }
+        };
         match db.health() {
             Health::Ready => Ok(NexDb {
                 db: Arc::new(db),

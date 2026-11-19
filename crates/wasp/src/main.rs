@@ -10,6 +10,12 @@
 //!
 //!  stop: 1-2 gateway (door closes, drain)  3-6 core  7 kernel (last)
 //! ```
+//!
+//! A stop is a signal (SIGTERM, SIGINT, Ctrl-C) or, behind an application
+//! server (`PORT` set, on Unix), the server letting go: standard input
+//! closing when it is a pipe or a socket (how Passenger stops a process, and
+//! what the start shim's pipe does when the shim exits), or the parent
+//! process going away.
 
 use std::process::ExitCode;
 
@@ -99,6 +105,11 @@ fn main() -> ExitCode {
         return error.report();
     }
 
+    #[cfg(unix)]
+    if std::env::var_os("PORT").is_some() {
+        stop_with_front_end(boot.foundation());
+    }
+
     let system = match boot.ready() {
         Ok(system) => system,
         Err(error) => return error.report(),
@@ -106,4 +117,51 @@ fn main() -> ExitCode {
     // Parked until a stop signal; then the shutdown order runs in reverse of
     // the start order: gateway, core, members, kernel.
     system.run()
+}
+
+/// Behind an application server: asks for the same clean stop a SIGTERM
+/// would when standard input closes (only when it is a pipe or a socket: a
+/// terminal or `/dev/null` is not a front end) or when the parent process
+/// is gone (the process was handed to another parent).
+#[cfg(unix)]
+fn stop_with_front_end(foundation: &wasp_core::suite::Foundation) {
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+
+    let piped = std::fs::metadata("/dev/stdin").is_ok_and(|m| {
+        let t = m.file_type();
+        t.is_fifo() || t.is_socket()
+    });
+    if piped {
+        let f = foundation.clone();
+        let _ = std::thread::Builder::new()
+            .name("wasp-stdin".into())
+            .spawn(move || {
+                let mut sink = [0u8; 256];
+                let mut stdin = std::io::stdin().lock();
+                loop {
+                    match stdin.read(&mut sink) {
+                        Ok(0) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                f.kernel()
+                    .request_supervisor_stop("standard input closed (the front end let go)");
+            });
+    }
+    let parent = std::os::unix::process::parent_id();
+    if parent > 1 {
+        let f = foundation.clone();
+        let _ = std::thread::Builder::new()
+            .name("wasp-parent".into())
+            .spawn(move || {
+                while std::os::unix::process::parent_id() == parent {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                f.kernel()
+                    .request_supervisor_stop("the parent process is gone");
+            });
+    }
 }
