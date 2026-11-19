@@ -96,6 +96,8 @@ fn main() -> ExitCode {
         return error.report();
     }
 
+    watch_providers(boot.foundation(), wiring.core.clone());
+
     // PHASE 4: the door opens last.
     if let Err(error) = boot.start(
         Gateway::new(wiring.core)
@@ -117,6 +119,40 @@ fn main() -> ExitCode {
     // Parked until a stop signal; then the shutdown order runs in reverse of
     // the start order: gateway, core, members, kernel.
     system.run()
+}
+
+/// Logs a warning when a provider (the content store, the database) stops
+/// serving, and a line when it serves again: what `/ready` answering 503
+/// means. A database that went read-only (a full disk) serves again only
+/// after a restart.
+fn watch_providers(
+    foundation: &wasp_core::suite::Foundation,
+    core: std::sync::Arc<wasp_core::Core>,
+) {
+    let f = foundation.clone();
+    let _ = std::thread::Builder::new()
+        .name("wasp-providers".into())
+        .spawn(move || {
+            let mut down: Vec<String> = Vec::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                for p in core.providers() {
+                    let name = p.name().to_owned();
+                    let was_down = down.contains(&name);
+                    match (p.healthy(), was_down) {
+                        (false, false) => {
+                            log::warn!(f.log(), "store not serving", provider = name.as_str());
+                            down.push(name);
+                        }
+                        (true, true) => {
+                            log::info!(f.log(), "store serving again", provider = name.as_str());
+                            down.retain(|n| *n != name);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
 }
 
 /// Behind an application server: asks for the same clean stop a SIGTERM
