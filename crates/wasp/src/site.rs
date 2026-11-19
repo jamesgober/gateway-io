@@ -65,6 +65,9 @@ pub struct SiteSettings {
     pub theme: PathBuf,
     /// How often the theme watcher looks for changes; zero turns it off.
     pub theme_poll: Duration,
+    /// Send sign-in pages asked for over plain http to https: on behind an
+    /// application server (`PORT` set), unless `site.development`.
+    pub https_sign_in: bool,
 }
 
 impl Default for SiteSettings {
@@ -76,6 +79,7 @@ impl Default for SiteSettings {
             assets: None,
             theme: PathBuf::from("themes/default"),
             theme_poll: Duration::from_secs(1),
+            https_sign_in: false,
         }
     }
 }
@@ -111,6 +115,8 @@ impl SiteSettings {
             assets: config.get("site.assets").map_err(e)?,
             theme: config.get_or("site.theme", d.theme).map_err(e)?,
             theme_poll: config.get_or("site.theme_poll", d.theme_poll).map_err(e)?,
+            https_sign_in: std::env::var_os("PORT").is_some()
+                && !config.get_or("site.development", false).map_err(e)?,
         })
     }
 }

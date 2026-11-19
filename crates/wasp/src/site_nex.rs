@@ -288,6 +288,75 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
     [list, new_entry, edit, save, delete]
 }
 
+/// Sign-in attempts one client address may make per [`ATTEMPT_WINDOW`]:
+/// past it the address waits, before any password is hashed.
+pub const ATTEMPTS: u32 = 10;
+
+/// The window [`ATTEMPTS`] are counted in.
+pub const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Client addresses tracked at once; past it the stalest entries go.
+const TRACKED: usize = 10_000;
+
+/// Passwords hashed at once (Argon2id, tens of milliseconds each): a flood
+/// of sign-ins holds at most this many workers, and the rest answer 503.
+pub const HASHING: usize = 2;
+
+/// Sign-in attempts per client address.
+#[derive(Debug, Default)]
+struct Attempts(
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
+);
+
+impl Attempts {
+    /// Counts one attempt from `client`: `false` when it is over the limit.
+    fn admit(&self, client: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= TRACKED && !map.contains_key(&client) {
+            map.retain(|_, (since, _)| now.duration_since(*since) < ATTEMPT_WINDOW);
+            if map.len() >= TRACKED {
+                let stalest = map
+                    .iter()
+                    .min_by_key(|(_, (since, _))| *since)
+                    .map(|(a, _)| *a);
+                if let Some(a) = stalest {
+                    map.remove(&a);
+                }
+            }
+        }
+        let entry = map.entry(client).or_insert((now, 0));
+        if now.duration_since(entry.0) >= ATTEMPT_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= ATTEMPTS
+    }
+}
+
+/// A slot for hashing one password, given back when dropped.
+struct HashSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+fn hash_slot(busy: &std::sync::atomic::AtomicUsize) -> Option<HashSlot<'_>> {
+    use std::sync::atomic::Ordering;
+    let mut n = busy.load(Ordering::Acquire);
+    while n < HASHING {
+        match busy.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(HashSlot(busy)),
+            Err(now) => n = now,
+        }
+    }
+    None
+}
+
+impl Drop for HashSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 fn random_hex() -> Result<String, web_net::Error> {
     let bytes = crypt_io::generate_key().map_err(|_| web_net::Error::internal("random"))?;
     Ok(bytes[..16].iter().map(|b| format!("{b:02x}")).collect())
@@ -332,6 +401,7 @@ pub fn build(
     .template("account")
     .name("account");
 
+    let https_sign_in = settings.https_sign_in;
     let sign_in_form = {
         let p = pages.clone();
         move |cx: &mut NexCx<'_>, error: &str, email: &str| -> web_net::Result {
@@ -341,15 +411,38 @@ pub fn build(
                 back.push_str("?next=");
                 back.push_str(&query_value(&cx.url(&next)?));
             }
+            if https_sign_in && cx.request().scheme().as_str() != "https" {
+                // The browser keeps no Secure cookie from a plain http page:
+                // signing in works over https only.
+                let url = format!("https://{}{}", cx.request().host(), cx.url(&back)?);
+                return cx.redirect_external(303, &url);
+            }
             if web_net::Identity::csrf_binding(cx.identity()).is_none() {
-                // The first visit: a pre-session cookie, then the same page,
-                // so the form's token is bound to this visitor.
+                if cx.query("cookies")?.is_some() {
+                    // Came back without the cookie: the browser refuses it.
+                    cx.status(400);
+                    let form = Form {
+                        error: "Signing in needs cookies. Please allow cookies for this site, then try again."
+                            .to_owned(),
+                        ..Form::default()
+                    };
+                    return cx.render(&p.page("Sign in", None, "", Some(form)));
+                }
+                // The first visit: a pre-session cookie, then the same page
+                // (marked, so a browser that refuses the cookie is told
+                // instead of sent round again), so the form's token is bound
+                // to this visitor.
                 let pre = random_hex()?;
                 cx.set_header(
                     "set-cookie",
                     format!("{PRE_COOKIE}={pre}; Path=/; Secure; HttpOnly; SameSite=Lax"),
                 );
-                return cx.redirect(303, &back);
+                let again = if back.contains('?') {
+                    format!("{back}&cookies=1")
+                } else {
+                    format!("{back}?cookies=1")
+                };
+                return cx.redirect(303, &again);
             }
             let action = cx.url(&back)?;
             let form = Form {
@@ -377,13 +470,30 @@ pub fn build(
 
     let show = sign_in_form;
     let a = auth.clone();
+    let attempts = Arc::new(Attempts::default());
+    let hashing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sign_in_post: NexRoute = post("/sign-in", move |cx: &mut NexCx<'_>| {
         let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
         if !cx.identity().identity.is_guest() {
             return cx.redirect(303, &next);
         }
         let form: SignIn = cx.form()?;
-        // Argon2id runs here, on this worker (see the limits).
+        if let Some(client) = cx.request().client().addr()
+            && !attempts.admit(client, std::time::Instant::now())
+        {
+            cx.status(429);
+            cx.set_header("retry-after", "600");
+            return show(
+                cx,
+                "Too many sign-in attempts from your address. Please wait a few minutes, then try again.",
+                &form.email,
+            );
+        }
+        // Argon2id runs here, on this worker, at most HASHING at once.
+        let Some(_slot) = hash_slot(&hashing) else {
+            cx.set_header("retry-after", "2");
+            return Err(web_net::Error::unavailable("auth.busy"));
+        };
         match a
             .sign_in(&form.email, form.password.expose())
             .map_err(|_| web_net::Error::unavailable("auth.unavailable"))?
@@ -445,4 +555,39 @@ pub fn build(
         .route(sign_out)
         .build()
         .map_err(|e| format!("site: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_address_gets_its_attempts_per_window_and_no_more() {
+        let a = Attempts::default();
+        let ip: IpAddr = "198.51.100.7".parse().expect("ip");
+        let other: IpAddr = "198.51.100.8".parse().expect("ip");
+        let t = Instant::now();
+        for _ in 0..ATTEMPTS {
+            assert!(a.admit(ip, t));
+        }
+        assert!(!a.admit(ip, t), "over the limit");
+        assert!(a.admit(other, t), "another address is not affected");
+        assert!(
+            a.admit(ip, t + ATTEMPT_WINDOW + Duration::from_secs(1)),
+            "a new window"
+        );
+    }
+
+    #[test]
+    fn hashing_slots_are_bounded_and_given_back() {
+        let busy = std::sync::atomic::AtomicUsize::new(0);
+        let held: Vec<_> = (0..HASHING)
+            .map(|_| hash_slot(&busy).expect("slot"))
+            .collect();
+        assert!(hash_slot(&busy).is_none(), "all slots in use");
+        drop(held);
+        assert!(hash_slot(&busy).is_some());
+    }
 }
