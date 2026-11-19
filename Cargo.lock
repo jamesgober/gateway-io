@@ -729,9 +729,9 @@ checksum = "4a80b508fa38c5f39796f957b58b2f65227600f3bfb461c8d968e7babddb9a37"
 
 [[package]]
 name = "net-io"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c8a40b13d0e64742474f7fc515085cb3b72e53676143b10ba80c7019c290b6"
+checksum = "8bfe4a65fd91025b84c79bdcf60ef724789e32f7713f3f6fba54294d6f063f6c"
 
 [[package]]
 name = "nex-db"
