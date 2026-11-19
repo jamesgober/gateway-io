@@ -29,6 +29,7 @@ enum Line {
         code: &'static str,
         cause: String,
     },
+    #[cfg(feature = "store-nex")]
     Security(&'static str),
 }
 
@@ -84,6 +85,7 @@ pub fn connect(foundation: &Foundation) {
                             );
                         }
                     }
+                    #[cfg(feature = "store-nex")]
                     Line::Security(what) => {
                         log::info!(f.log(), "security", event = what);
                     }
