@@ -136,6 +136,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `content.path` | `<data folder>/content.bison` | the bison-db file |
 | `auth.store` | `gatekeeper` (`nex` in a build without it) | the site's accounts and sessions: `gatekeeper` (feature `gatekeeper`, on by default; in memory: a restart signs everyone out) or `nex` (feature `store-nex`; nex-db: durable) |
 | `nex.path` | `<data folder>/nex` | the nex-db database, shared by `auth.store = "nex"` and `content.store = "nex"`; one process at a time |
+| `nex.lock_wait` | `15s` | how long a boot waits for another process (a restart overlapping the old one's stop) to let go of the database before it refuses |
 | `auth.admin` | none | an account made at boot (given the `member` and `editor` roles with nex-db); its password from `WASP_ADMIN_PASSWORD` |
 | `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |

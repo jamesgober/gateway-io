@@ -90,10 +90,13 @@ fn nex_db(
         return Ok(db.clone());
     }
     let path: Option<std::path::PathBuf> = config.get("nex.path").map_err(|e| e.to_string())?;
+    let wait: std::time::Duration = config
+        .get_or("nex.lock_wait", nex::LOCK_WAIT)
+        .map_err(|e| e.to_string())?;
     let db = match path {
-        Some(path) => nex::NexDb::open(&path),
+        Some(path) => nex::NexDb::open_waiting(&path, wait),
         None if shared.temporary => nex::NexDb::open_temporary(),
-        None => nex::NexDb::open(&data_dir.join("nex")),
+        None => nex::NexDb::open_waiting(&data_dir.join("nex"), wait),
     }
     .map_err(|e| e.to_string())?;
     shared.nex = Some(db.clone());
@@ -267,7 +270,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("content", &["path", "recovery", "store"]),
     ("auth", &["admin", "origin", "secret", "store"]),
-    ("nex", &["path"]),
+    ("nex", &["lock_wait", "path"]),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];
