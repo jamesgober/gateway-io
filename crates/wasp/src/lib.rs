@@ -234,6 +234,9 @@ pub fn wire(config: &Config) -> Result<Wiring, String> {
 /// `WASP_ADMIN_PASSWORD`.
 pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, String> {
     let password = std::env::var(ADMIN_PASSWORD_ENV).ok();
+    // Typos first: `hots = [...]` is named as the typo it is, not as an
+    // empty host list.
+    check_keys(config)?;
     check_hosts(config, std::env::var_os("PORT").is_some())?;
     wire_with(config, data_dir, Some(data_dir), password.as_deref())
 }
