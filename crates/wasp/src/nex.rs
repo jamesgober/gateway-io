@@ -279,9 +279,14 @@ impl Provider for NexStore {
 }
 
 impl ContentStore for NexStore {
+    /// Every post and page. A slug held by both a post and a page (an entry
+    /// whose kind changed, saved by an older build) reads as the one that
+    /// changed last.
     fn load(&self) -> Result<Vec<Stored>, StoreError> {
         let content = self.db.db().content();
-        let mut out = Vec::new();
+        let mut out: Vec<Stored> = Vec::new();
+        let mut changed: std::collections::HashMap<String, (usize, SystemTime)> =
+            std::collections::HashMap::new();
         for kind in ["post", "page"] {
             let mut page = content
                 .list(&Listing::latest(kind).limit(1000))
@@ -294,14 +299,27 @@ impl ContentStore for NexStore {
                             .unwrap_or("")
                             .to_owned()
                     };
-                    out.push(Stored {
+                    let stored = Stored {
                         kind: kind.to_owned(),
                         slug: text("slug"),
                         title: text("title"),
                         summary: text("summary"),
                         body: text("body"),
                         date: text("date"),
-                    });
+                    };
+                    let at = e.updated_at();
+                    match changed.get(&stored.slug).copied() {
+                        Some((i, before)) => {
+                            if at > before {
+                                changed.insert(stored.slug.clone(), (i, at));
+                                out[i] = stored;
+                            }
+                        }
+                        None => {
+                            changed.insert(stored.slug.clone(), (out.len(), at));
+                            out.push(stored);
+                        }
+                    }
                     if out.len() > MAX_ENTRIES {
                         return Err(StoreError::other(format!(
                             "more than {MAX_ENTRIES} entries"
@@ -345,6 +363,15 @@ impl ContentStore for NexStore {
                     .path(path);
                 content.put(entity).map_err(nex)?;
             }
+        }
+        // A slug is one entry: when its kind changed, the other kind's
+        // route goes, or the next boot could read the old one back.
+        let other = if entry.kind == "post" { "page" } else { "post" };
+        if let Some(route) = content
+            .resolve(SITE, &path_of(other, &entry.slug))
+            .map_err(nex)?
+        {
+            content.delete(route.entity()).map_err(nex)?;
         }
         Ok(())
     }

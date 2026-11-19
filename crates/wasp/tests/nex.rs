@@ -303,3 +303,35 @@ fn a_new_boot_account_needs_a_long_password() {
         None
     );
 }
+
+#[test]
+fn a_kind_change_survives_a_restart() {
+    let data = temp_dir("kind");
+    let dir = data.0.join("nex");
+    let entry = |kind: &str| Stored {
+        kind: kind.into(),
+        slug: "flip".into(),
+        title: "Flip".into(),
+        summary: String::new(),
+        body: "Body.".into(),
+        date: if kind == "post" {
+            "2026-11-19".into()
+        } else {
+            String::new()
+        },
+    };
+    {
+        let store = NexStore::new(NexDb::open(&dir).expect("open"));
+        store.put(&entry("page")).expect("page");
+        store.put(&entry("post")).expect("now a post");
+    }
+    let store = NexStore::new(reopen(&dir));
+    let flips: Vec<_> = store
+        .load()
+        .expect("load")
+        .into_iter()
+        .filter(|s| s.slug == "flip")
+        .map(|s| s.kind)
+        .collect();
+    assert_eq!(flips, ["post"], "one entry, the post");
+}
