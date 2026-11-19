@@ -16,7 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -170,19 +170,58 @@ luminess::view!(Page as "page" {
 /// The theme: what the watcher reloads.
 pub type SiteTheme = Theme<Page>;
 
-/// A render engine that records the time of each render into the stage
-/// timing (when it is on). What web-net renders with.
+/// How many times the engine rendered, since the site was built: one
+/// relaxed add per render.
+#[derive(Debug, Default)]
+pub struct RenderCounts {
+    pages: AtomicU64,
+    error_pages: AtomicU64,
+}
+
+impl RenderCounts {
+    /// Pages rendered from a template ([`web_net::Render::render`]).
+    #[must_use]
+    pub fn pages(&self) -> u64 {
+        self.pages.load(Ordering::Relaxed)
+    }
+
+    /// Error pages rendered ([`web_net::Render::error_page`]).
+    #[must_use]
+    pub fn error_pages(&self) -> u64 {
+        self.error_pages.load(Ordering::Relaxed)
+    }
+
+    /// Both together.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.pages() + self.error_pages()
+    }
+}
+
+/// A render engine that counts every render and records its time into the
+/// stage timing (when it is on). What web-net renders with.
 #[derive(Clone)]
 pub struct Timed<E> {
     inner: E,
     stages: Arc<gateway_io::StageTimes>,
+    counts: Arc<RenderCounts>,
 }
 
 impl<E> Timed<E> {
     /// `inner`, timed into `stages`.
     #[must_use]
     pub fn new(inner: E, stages: Arc<gateway_io::StageTimes>) -> Timed<E> {
-        Timed { inner, stages }
+        Timed {
+            inner,
+            stages,
+            counts: Arc::new(RenderCounts::default()),
+        }
+    }
+
+    /// The renders so far (every clone shares them).
+    #[must_use]
+    pub fn counts(&self) -> &Arc<RenderCounts> {
+        &self.counts
     }
 
     /// `inner`, with timing off.
@@ -206,6 +245,7 @@ impl<E: web_net::Render> web_net::Render for Timed<E> {
         view: &Self::View<'_>,
         out: &mut web_net::Output<'_>,
     ) -> Result<(), web_net::RenderError> {
+        self.counts.pages.fetch_add(1, Ordering::Relaxed);
         if !self.stages.enabled() {
             return self.inner.render(template, view, out);
         }
@@ -220,7 +260,14 @@ impl<E: web_net::Render> web_net::Render for Timed<E> {
         page: &web_net::ErrorPage<'_>,
         out: &mut web_net::Output<'_>,
     ) -> Result<bool, web_net::RenderError> {
-        self.inner.error_page(page, out)
+        self.counts.error_pages.fetch_add(1, Ordering::Relaxed);
+        if !self.stages.enabled() {
+            return self.inner.error_page(page, out);
+        }
+        let t = std::time::Instant::now();
+        let done = self.inner.error_page(page, out);
+        self.stages.render(t.elapsed());
+        done
     }
 }
 

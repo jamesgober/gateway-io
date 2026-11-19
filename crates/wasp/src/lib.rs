@@ -47,6 +47,8 @@ pub struct Wiring {
     pub theme: theme::ThemeWatcher,
     /// The core's guest output cache, purged whenever the content changes.
     pub guest_pages: Arc<wasp_core::GuestPages>,
+    /// How many times the site rendered a page or an error page.
+    pub renders: Arc<theme::RenderCounts>,
     /// Stage timing (`gateway.stage_timing`), shared by the gateway and the
     /// render engine.
     pub stages: Arc<gateway_io::StageTimes>,
@@ -397,6 +399,7 @@ fn wire_with(
     let purge = guest_pages.clone();
     let manifest = content::Content::new(manifest).on_change(move || purge.purge());
     let engine = theme::Timed::new(theme, stages.clone());
+    let renders = engine.counts().clone();
     // `/ready`: 503 while any provider (the content store, the database)
     // cannot serve, for the front end and the supervisor.
     let ready_core = core.clone();
@@ -429,6 +432,7 @@ fn wire_with(
         nex: shared.nex,
         theme: watcher,
         guest_pages,
+        renders,
         stages,
         notices,
     })
