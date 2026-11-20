@@ -247,7 +247,12 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
     let edit: NexRoute = get("/admin/edit/:slug", move |cx: &mut NexCx<'_>| {
         let slug = cx.param("slug")?.into_owned();
         let Some(entry) = p.content.snapshot().find(&slug) else {
-            return Err(web_net::Error::not_found("admin.unknown"));
+            return Err(crate::site::fail(
+                cx,
+                404,
+                "admin.unknown",
+                "No post or page has that slug. It may have been renamed or removed.",
+            ));
         };
         let view = filled(editor(cx, &p)?, &entry);
         cx.render(&p.editor_page(&format!("Edit {}", entry.title), view))

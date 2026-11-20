@@ -307,6 +307,39 @@ impl Pages {
     }
 }
 
+/// Ends a handler with `status` (400 to 599) and the application error code
+/// `code`, its error page showing `message` instead of the configured or
+/// generic one; the code and the message go to the log too. A status
+/// outside 400 to 599 is a 500 with the code `site.bad_status`.
+///
+/// ```ignore
+/// return Err(site::fail(cx, 410, "content.gone", "This post was taken down."));
+/// ```
+pub fn fail<I, E>(
+    cx: &web_net::Context<'_, I, E>,
+    status: u16,
+    code: &'static str,
+    message: &str,
+) -> web_net::Error
+where
+    I: web_net::Identity,
+    E: web_net::Render,
+{
+    let reference = cx.id().to_string();
+    if !(400..=599).contains(&status) {
+        gateway_io::note::note(
+            "site.bad_status",
+            &format!("site::fail was given status {status}"),
+            &reference,
+        );
+        return web_net::Error::internal("site.bad_status");
+    }
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::events::fail_with(&reference, &message);
+    gateway_io::note::note(code, &message, &reference);
+    web_net::Error::new(status, code)
+}
+
 /// The site's builder settings every gate shares: hosts, base, assets, the
 /// theme's files, the sign-in page, health and readiness.
 pub(crate) fn configure<G: web_net::Gate>(

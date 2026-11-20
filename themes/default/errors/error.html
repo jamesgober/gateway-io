@@ -11,7 +11,7 @@
 <main class="error">
 <h1>{{ error.status }} {{ error.title }}</h1>
 <p>{{ error.message }}</p>
-<p class="reference">Reference: {{ error.reference }}</p>
+<p class="reference">Reference: {{ error.reference }}{% if error.code %} ({{ error.code }}){% endif %}</p>
 </main>
 </body>
 </html>

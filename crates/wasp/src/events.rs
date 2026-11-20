@@ -164,6 +164,48 @@ thread_local! {
     /// token, on this thread: web-net reports the refusal, then renders its
     /// error page on the same thread, and the page names no code.
     static EXPIRED_FORM: RefCell<String> = const { RefCell::new(String::new()) };
+
+    /// The application's error code web-net last reported on this thread,
+    /// with the request's reference.
+    static LAST_CODE: RefCell<(String, &'static str)> = const { RefCell::new((String::new(), "")) };
+
+    /// The message a handler gave with `site::fail`, with the request's
+    /// reference.
+    static FAILED: RefCell<(String, String)> = const { RefCell::new((String::new(), String::new())) };
+}
+
+/// The application's error code of the request `reference` names, as
+/// web-net reported it on this thread (for its error page). Asked once.
+pub fn code_of(reference: &str) -> Option<&'static str> {
+    LAST_CODE.with(|c| {
+        let mut c = c.borrow_mut();
+        let hit = (!c.0.is_empty() && c.0 == reference).then_some(c.1);
+        c.0.clear();
+        hit
+    })
+}
+
+/// Keeps `message` as what the error page of the request `reference` says
+/// (see `site::fail`).
+pub fn fail_with(reference: &str, message: &str) {
+    FAILED.with(|f| {
+        let mut f = f.borrow_mut();
+        f.0.clear();
+        f.0.push_str(reference);
+        f.1.clear();
+        f.1.push_str(message);
+    });
+}
+
+/// The message a handler gave for the request `reference` names, if it
+/// gave one. Asked once.
+pub fn failed_message(reference: &str) -> Option<String> {
+    FAILED.with(|f| {
+        let mut f = f.borrow_mut();
+        let hit = (!f.0.is_empty() && f.0 == reference).then(|| std::mem::take(&mut f.1));
+        f.0.clear();
+        hit
+    })
 }
 
 /// Whether web-net refused the request `reference` names for its form's
@@ -196,10 +238,14 @@ fn token_refused(code: &str) -> bool {
 
 impl web_net::Events for SiteEvents {
     fn event(&self, e: &web_net::Event<'_>) {
+        let reference = e.id.to_string();
         if e.kind == web_net::EventKind::Denied && token_refused(e.code) {
-            let reference = e.id.to_string();
-            EXPIRED_FORM.with(|r| *r.borrow_mut() = reference);
+            EXPIRED_FORM.with(|r| *r.borrow_mut() = reference.clone());
         }
+        // For the error page web-net renders next on this thread, and for
+        // the gateway's log.
+        LAST_CODE.with(|c| *c.borrow_mut() = (reference.clone(), e.code));
+        gateway_io::note::note(e.code, "", &reference);
         if QUEUE_TX.get().is_none() {
             return;
         }
@@ -213,7 +259,7 @@ impl web_net::Events for SiteEvents {
         };
         push(Line::Site {
             kind,
-            reference: e.id.to_string(),
+            reference,
             route: e.route.unwrap_or("").to_owned(),
             status: e.status,
             code: e.code,

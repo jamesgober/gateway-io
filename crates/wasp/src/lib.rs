@@ -347,7 +347,9 @@ fn check_keys(config: &Config) -> Result<(), String> {
     gateway_io::settings::check_section_keys(config, gateway_io::settings::KNOWN_KEYS)?;
     if let wasp_core::suite::config::backend::Value::Table(root) = config.backend().as_value() {
         let known = |k: &str| {
-            SUITE_SECTIONS.contains(&k)
+            // `[errors]` checks its own keys (a status or a class each).
+            k == "errors"
+                || SUITE_SECTIONS.contains(&k)
                 || KNOWN_KEYS.iter().any(|(s, _)| *s == k)
                 || gateway_io::settings::KNOWN_KEYS
                     .iter()
@@ -550,10 +552,15 @@ fn wire_with(
         .map_err(|e| e.0)?;
     let core = Arc::new(core);
     let theme = theme::load(&settings.theme).map_err(|e| e.0)?;
+    let error_rules = theme::ErrorRules::from_config(config)?;
+    error_rules.check(theme.error_pages())?;
+    let error_rules: theme::ErrorRulesCell =
+        Arc::new(std::sync::RwLock::new(Arc::new(error_rules)));
     let purge = guest_pages.clone();
     let watcher =
         theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll)
-            .on_change(move || purge.purge());
+            .on_change(move || purge.purge())
+            .with_rules(error_rules.clone());
     let timing: bool = config
         .get_or("gateway.stage_timing", false)
         .map_err(|e| e.to_string())?;
@@ -563,7 +570,10 @@ fn wire_with(
     let purge = guest_pages.clone();
     let manifest = content::Content::new(manifest).on_change(move || purge.purge());
     let admin = theme::load_admin(&settings.admin_theme).map_err(|e| e.0)?;
-    let engine = theme::Timed::new(theme::SiteRender::new(theme, admin), stages.clone());
+    let engine = theme::Timed::new(
+        theme::SiteRender::new(theme, admin).with_rules(error_rules),
+        stages.clone(),
+    );
     let renders = engine.counts().clone();
     // `/ready`: 503 while any provider (the content store, the database)
     // cannot serve, for the front end and the supervisor.

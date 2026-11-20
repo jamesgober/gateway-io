@@ -44,8 +44,8 @@ fn main() {
         css: "/theme/site.css".into(),
         icon: "/theme/favicon.svg".into(),
     });
-    let post = theme.template("post").expect("post");
-    let home = theme.template("home").expect("home");
+    let post = theme.pages().template("post").expect("post");
+    let home = theme.pages().template("home").expect("home");
     let entry = manifest.get(Kind::Post, "the-passport");
     let mut buf = Vec::with_capacity(4096);
 
@@ -76,7 +76,7 @@ fn main() {
     let post_cost = measure(|| {
         buf.clear();
         let mut out = Output::new(&mut buf, 1 << 20);
-        theme.render(post, &page, &mut out).expect("render");
+        web_net::Render::render(theme.pages(), post, &page, &mut out).expect("render");
         black_box(&buf);
     });
     let post_len = buf.len();
@@ -88,7 +88,7 @@ fn main() {
     let home_cost = measure(|| {
         buf.clear();
         let mut out = Output::new(&mut buf, 1 << 20);
-        theme.render(home, &home_page, &mut out).expect("render");
+        web_net::Render::render(theme.pages(), home, &home_page, &mut out).expect("render");
         black_box(&buf);
     });
     println!("| step | ns |");
