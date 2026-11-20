@@ -436,7 +436,7 @@ fn a_realm_keeps_its_sessions_and_keys_in_it() {
     let conf = config_with(
         &data.0,
         "realm = \"blog\"\n",
-        "[host.blog.api]\nprefix = \"/json\"\n",
+        "[api]\nenabled = true\n[host.blog.api]\nprefix = \"/json\"\n",
     );
     let (door, addr, db) = open_db(&conf);
     NexAuth::new(db)

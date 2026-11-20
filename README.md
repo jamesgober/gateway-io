@@ -355,7 +355,7 @@ Lines are written by the access log's thread, never by the worker serving the re
 
 ## API
 
-With nex-db accounts, a site has a JSON API under `/api/v1`:
+With nex-db accounts, a site can have a JSON API under `/api/v1`. It is off until `[api] enabled = true`, so a site that doesn't use it doesn't expose it:
 
 | Request | Who | Answer |
 |---|---|---|
@@ -384,7 +384,7 @@ An unknown address under the prefix is 404 `api.not_found`, and any method but `
 
 API requests run in the bulk lane, so under load they are refused before page views. Each caller has a budget of its own, `api.rate` requests a second in bursts of `api.burst`: an account (all its keys and its browser sessions share one), or a guest's address. Over it the answer is 429 with `Retry-After`, and no other caller slows down.
 
-`[api] prefix` moves the API and `[api] enabled = false` turns it off. A host profile sets its own in `[host.<name>.api]`. With the gatekeeper there is no API.
+`[api] enabled = true` turns the API on and `[api] prefix` moves it. A host profile sets its own in `[host.<name>.api]`. With the gatekeeper there is no API.
 
 ## Configuration
 
@@ -430,7 +430,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `auth.admin` | none | an account made at boot (given the `member`, `editor` and `admin` roles with nex-db, at every start); its password from `WASP_ADMIN_PASSWORD`, needed with nex-db only until the account exists |
 | `auth.secret` | `gate.key` beside `nex.path` with nex-db, else `<data folder>/gate.key` | the site's 32-byte master secret, made on the first run (owner-only on Unix), kept with the site's database so it follows the site and its backups: the gatekeeper's keys and, with nex-db, the forms' CSRF key come from it, so a form opened before a restart still posts after it. Move the file away (while stopped) to change it; open forms are then refused once |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
-| `api.enabled` | true with nex-db accounts | the JSON API (none with the gatekeeper) |
+| `api.enabled` | false | the JSON API, with nex-db accounts (none with the gatekeeper) |
 | `api.prefix` | `/api/v1` | where the API lives, under `site.base`; never a path the site uses (`/admin`, `/account`, `/posts`, ...) |
 | `api.rate` | 10 | API requests a second for each caller (an account, all its keys and sessions together, or a guest's address); `0` for no budget. Read at boot |
 | `api.burst` | twice `api.rate` | the most at once after a quiet spell, at least `api.rate` |
