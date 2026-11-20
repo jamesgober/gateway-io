@@ -400,6 +400,11 @@ fn another_user_cannot_reach_the_socket() {
     use std::os::unix::fs::PermissionsExt;
 
     if let Err(why) = as_nobody_available() {
+        // In CI it must run, so a green run there means it did.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "another_user_cannot_reach_the_socket must run in CI: {why}"
+        );
         eprintln!("skipped another_user_cannot_reach_the_socket: {why}");
         return;
     }
