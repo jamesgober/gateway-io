@@ -42,6 +42,7 @@ fn main() {
         account: "/account".into(),
         admin: "/admin".into(),
         css: "/theme/site.css".into(),
+        icon: "/theme/favicon.svg".into(),
     });
     let post = theme.template("post").expect("post");
     let home = theme.template("home").expect("home");

@@ -71,7 +71,7 @@ Open **Setup Node.js App** (on some hosts, **Application Manager**; it works the
 
 On its first start, wasp makes the account `admin` with the password from `WASP_ADMIN_PASSWORD`.
 
-- Keep the variable set afterwards: wasp refuses to start while `auth.admin` is set and the variable is missing.
+- After that first start you can remove the variable: wasp starts without it once the account exists.
 - Changing the variable later does not change the password. The account is made only when it does not exist yet.
 
 Sign in at `https://<your domain>/sign-in`, then open `/admin` to write posts and pages.

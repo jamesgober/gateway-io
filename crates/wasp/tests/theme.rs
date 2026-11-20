@@ -212,6 +212,7 @@ fn error_pages_for_404_405_and_500() {
         account: "/account".into(),
         admin: "/admin".into(),
         css: "/theme/site.css".into(),
+        icon: "/theme/favicon.svg".into(),
     });
     let ok: SiteRoute = get("/ok", move |cx: &mut SiteCx<'_>| {
         cx.render(&Page {

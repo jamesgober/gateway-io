@@ -26,10 +26,17 @@ use wasp_core::suite::log;
 
 fn main() -> ExitCode {
     // PHASE 0: the foundation and the kernel. Nothing is open yet.
-    let mut boot = match System::builder("wasp").boot() {
+    // No single-instance lock: a restart behind an application server
+    // overlaps the old process's drain, and the database has its own lock.
+    let mut boot = match System::builder("wasp")
+        .build_info(wasp_core::suite::build_info!())
+        .single_instance(false)
+        .boot()
+    {
         Ok(boot) => boot,
         Err(error) => return error.report(),
     };
+    say_where_the_configuration_came_from(boot.foundation());
 
     // `wasp import <folder>`: content into the store, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,9 +85,10 @@ fn main() -> ExitCode {
             log::error!(
                 boot.foundation().log(),
                 "refused to load",
-                reason = reason.as_str()
+                reason = reason.as_str(),
+                exit_code = u64::from(REFUSED)
             );
-            return ExitCode::from(78);
+            return ExitCode::from(REFUSED);
         }
     };
     for notice in &wiring.notices {
@@ -91,10 +99,10 @@ fn main() -> ExitCode {
         );
     }
     if let Err(error) = boot.start(CoreSubsystem::new(wiring.core.clone())) {
-        return error.report();
+        return failed(boot.foundation(), &error);
     }
     if let Err(error) = boot.start(wiring.theme) {
-        return error.report();
+        return failed(boot.foundation(), &error);
     }
 
     watch_providers(boot.foundation(), wiring.core.clone());
@@ -105,7 +113,7 @@ fn main() -> ExitCode {
             .web("web", wiring.site)
             .stages(wiring.stages),
     ) {
-        return error.report();
+        return failed(boot.foundation(), &error);
     }
 
     #[cfg(unix)]
@@ -120,6 +128,47 @@ fn main() -> ExitCode {
     // Parked until a stop signal; then the shutdown order runs in reverse of
     // the start order: gateway, core, members, kernel.
     system.run()
+}
+
+/// The exit code when the configuration names something that cannot be
+/// loaded (`EX_CONFIG`).
+const REFUSED: u8 = 78;
+
+/// A subsystem that did not start, in the log as well as on standard error.
+fn failed(foundation: &wasp_core::suite::Foundation, error: &wasp_core::suite::Error) -> ExitCode {
+    let message = error.to_string();
+    log::error!(
+        foundation.log(),
+        "did not start",
+        error = message.as_str(),
+        action = error.action()
+    );
+    error.report()
+}
+
+/// Logs the configuration file in use, and warns when there is none: every
+/// setting is then at its default (port 8080, data in the user's data
+/// folder), which is rarely what was meant.
+fn say_where_the_configuration_came_from(foundation: &wasp_core::suite::Foundation) {
+    let config = foundation.config();
+    if let Some(file) = config.source() {
+        let file = file.display().to_string();
+        log::info!(foundation.log(), "configuration file", file = file.as_str());
+        return;
+    }
+    let here = std::path::Path::new("wasp.conf");
+    let why = if !here.is_file() {
+        "no wasp.conf in the working directory and WASP_CONFIG is not set"
+    } else if wasp_core::suite::sys::process::is_elevated().unwrap_or(true) {
+        "wasp.conf in the working directory is not read by a process running as root or administrator: name it with WASP_CONFIG"
+    } else {
+        "wasp.conf in the working directory was not read"
+    };
+    log::warn!(
+        foundation.log(),
+        "no configuration file: every setting is at its default",
+        why = why
+    );
 }
 
 /// Logs a warning when a provider (the content store, the database) stops

@@ -60,9 +60,11 @@ pub struct SiteInfo {
     pub admin: String,
     /// The stylesheet URL.
     pub css: String,
+    /// The site icon's address.
+    pub icon: String,
 }
 
-luminess::view!(SiteInfo as "site" { name: text, home: text, about: text, account: text, admin: text, css: text });
+luminess::view!(SiteInfo as "site" { name: text, home: text, about: text, account: text, admin: text, css: text, icon: text });
 
 /// A form on a page (`page.form`): the sign-in form, the sign-out button.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -261,6 +263,16 @@ impl<E: web_net::Render> web_net::Render for Timed<E> {
         out: &mut web_net::Output<'_>,
     ) -> Result<bool, web_net::RenderError> {
         self.counts.error_pages.fetch_add(1, Ordering::Relaxed);
+        let expired;
+        let page = if crate::events::form_expired(page.reference) {
+            let mut p = *page;
+            p.title = FORM_EXPIRED_TITLE;
+            p.message = FORM_EXPIRED;
+            expired = p;
+            &expired
+        } else {
+            page
+        };
         if !self.stages.enabled() {
             return self.inner.error_page(page, out);
         }
@@ -270,6 +282,12 @@ impl<E: web_net::Render> web_net::Render for Timed<E> {
         done
     }
 }
+
+/// The error page's title when a form's token was refused.
+pub const FORM_EXPIRED_TITLE: &str = "Form expired";
+
+/// The error page's message when a form's token was refused.
+pub const FORM_EXPIRED: &str = "This form expired. Reload the page and try again. If you typed a lot, go back first and copy it.";
 
 /// The engine web-net renders the site with.
 pub type SiteEngine = Timed<SiteTheme>;

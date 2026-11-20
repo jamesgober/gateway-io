@@ -63,7 +63,10 @@ fn open_cached(conf: &Config) -> (Door, SocketAddr, Arc<GuestPages>) {
         match wasp::wire(conf) {
             Ok(w) => break w,
             // A closed door's threads let go of the database a moment later.
-            Err(e) if e.contains("another instance") && t.elapsed() < Duration::from_secs(5) => {
+            Err(e)
+                if e.contains("in use by another process")
+                    && t.elapsed() < Duration::from_secs(5) =>
+            {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => panic!("wiring: {e}"),
@@ -320,6 +323,80 @@ fn a_nex_db_session_survives_a_restart() {
     let _ = door.close(Duration::from_secs(2));
 }
 
+/// The site's configuration with its master secret in `data`, as the
+/// process keeps it in its data folder.
+fn config_with_secret(data: &Path) -> Config {
+    let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[auth]\nstore = \"nex\"\nsecret = \"{}\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n",
+        slash(&theme),
+        slash(&data.join("gate.key")),
+        slash(&data.join("nex"))
+    ))
+    .expect("config")
+}
+
+#[test]
+fn a_form_opened_before_a_restart_posts_after_it() {
+    let data = temp_dir("form-restart");
+    let conf = config_with_secret(&data.0);
+    let (door, addr) = open(&conf);
+    let (pre, csrf) = form(addr);
+    let _ = door.close(Duration::from_secs(2));
+
+    let (door, addr) = open(&conf);
+    let done = post(
+        addr,
+        "/sign-in",
+        &[&pre],
+        "same-origin",
+        &sign_in_body(EMAIL, PASSWORD, &csrf),
+    );
+    assert_eq!(done.status, 303, "the old form still signs in: {done:?}");
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_refused_form_says_it_expired() {
+    let data = temp_dir("form-expired");
+    let conf = config(&data.0);
+    let (door, addr) = open(&conf);
+    // The master secret is kept beside the database, with the site.
+    let key = data.0.join("gate.key");
+    assert!(key.is_file(), "{}", key.display());
+    let (pre, _) = form(addr);
+    let refused = post(
+        addr,
+        "/sign-in",
+        &[&pre],
+        "same-origin",
+        &sign_in_body(EMAIL, PASSWORD, "not-a-token"),
+    );
+    assert_eq!(refused.status, 403, "{refused:?}");
+    assert!(
+        refused.body.contains("This form expired. Reload the page"),
+        "{}",
+        refused.body
+    );
+    assert!(
+        !refused.body.contains("do not have access"),
+        "{}",
+        refused.body
+    );
+
+    // A post from another site is still refused as one.
+    let forged = post(
+        addr,
+        "/sign-in",
+        &[&pre],
+        "cross-site",
+        &sign_in_body(EMAIL, PASSWORD, "not-a-token"),
+    );
+    assert_eq!(forged.status, 403, "{forged:?}");
+    assert!(!forged.body.contains("form expired"), "{}", forged.body);
+    let _ = door.close(Duration::from_secs(2));
+}
+
 fn entry_body(kind: &str, slug: &str, was: &str, title: &str, body: &str, csrf: &str) -> String {
     format!(
         "kind={kind}&slug={}&was={}&title={}&summary=&date=2026-11-18&body={}&csrf_token={}",
@@ -360,7 +437,8 @@ fn the_editor_writes_renames_and_removes_content() {
     assert_eq!(list.field("cache-control"), Some("no-store"));
     assert!(list.body.contains("The passport"), "{}", list.body);
 
-    // A new page: saved, then served at its own path, escaped.
+    // A new page: saved, then served at its own path, escaped. The body's
+    // line breaks are CRLF, as a browser sends a textarea's.
     let blank = get(addr, "/admin/new/page", &[&ed]);
     assert_eq!(blank.status, 200, "{blank:?}");
     let csrf = blank.csrf();
@@ -374,7 +452,7 @@ fn the_editor_writes_renames_and_removes_content() {
             "contact",
             "",
             "Contact",
-            "Write <b>to</b> us.\n\nSecond.",
+            "Write <b>to</b> us.\r\n\r\nSecond.",
             &csrf,
         ),
     );

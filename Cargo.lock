@@ -967,9 +967,9 @@ dependencies = [
 
 [[package]]
 name = "serve-net"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e791899e51ef461c63d02a4679a74f4ce261fbf5e4478efa37f15c6e4f0c1f3"
+checksum = "6dd5115d6c04057ef65d3a649752311c5ac297d18f738dbe13c2e3ce2f8a7b1a"
 dependencies = [
  "http-net",
  "net-io",
@@ -1067,6 +1067,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sys-lib"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db5875fe591b6e3e7047e592c90b28865eb834170ecdbe8f3f1156d4ca7adbc"
+dependencies = [
+ "clock-lib",
+ "id-forge",
+ "path-lib",
+]
+
+[[package]]
 name = "system-suite"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,6 +1087,7 @@ dependencies = [
  "log-io",
  "path-lib",
  "signal-mod",
+ "sys-lib",
 ]
 
 [[package]]
