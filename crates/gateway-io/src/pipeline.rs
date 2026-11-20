@@ -84,6 +84,7 @@ impl Admit for PassportAdmit {
 
 /// The gateway's service: the passport pipeline around the core, and the
 /// hand-off to web services.
+#[derive(Clone)]
 pub struct Pipeline {
     core: Arc<Core>,
     pool: Arc<PassportPool>,
@@ -94,6 +95,8 @@ pub struct Pipeline {
     access: Option<Arc<AccessLog>>,
     /// The lanes with a budget per caller, by core lane.
     budgeted: [bool; 6],
+    /// The pool that answers `WorkClass::Cpu` routes off the worker.
+    cpu: Option<Arc<crate::offload::CpuPool>>,
 }
 
 /// A passport out of its shelf for one call. If the call unwinds (a panic in
@@ -168,6 +171,76 @@ impl Pipeline {
             stages,
             access: None,
             budgeted: [false; 6],
+            cpu: None,
+        }
+    }
+
+    /// Answers the routes marked `WorkClass::Cpu` on `pool` instead of the
+    /// worker; `None` answers everything on the worker.
+    #[must_use]
+    pub(crate) fn with_cpu(mut self, pool: Option<Arc<crate::offload::CpuPool>>) -> Pipeline {
+        self.cpu = pool;
+        self
+    }
+
+    /// A request whose route is marked `WorkClass::Cpu`, handed to the CPU
+    /// pool: `Some(outcome)` when it was taken off the worker (or refused
+    /// because the pool is full), `None` to answer it here. The reply is
+    /// deferred and completed by the pool thread, which runs the whole
+    /// pipeline on an owned copy of the request.
+    fn offload(
+        &self,
+        req: &HttpRequest<'_>,
+        env: &Envelope,
+        reply: &mut HttpReply,
+    ) -> Option<Outcome> {
+        let cpu = self.cpu.as_ref()?;
+        if env.user_word() == 0 {
+            return None;
+        }
+        let web = self.web.get(ServiceTag(env.tag()))?;
+        if web.classify(req.head()) != serve_net::WorkClass::Cpu {
+            return None;
+        }
+        let Some(place) = cpu.reserve() else {
+            reply
+                .text(503, wasp_core::refusal_text(503))
+                .retry_after(Duration::from_secs(1));
+            return Some(Outcome::Done);
+        };
+        let copy = serve_net::engine::Family::detach(&serve_net::HttpFamily, req)?;
+        let mut token = reply.defer();
+        let env = env.clone();
+        let me = self.clone();
+        let job: crate::offload::Job = Box::new(move || {
+            // Nobody waits any more (the client left, the deadline passed,
+            // the server stops): dropping the token ends it.
+            if token.is_cancelled() {
+                return;
+            }
+            let mut outcome = Outcome::Done;
+            copy.with(&mut |req| {
+                outcome = me.call_here(req, &env, token.reply());
+            });
+            if matches!(outcome, Outcome::Close) {
+                token.reply().close();
+            }
+            // A worker whose completion queue is full is given a moment.
+            for _ in 0..200 {
+                match token.complete() {
+                    Err(serve_net::CompleteError::Busy(t)) => {
+                        token = t;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    _ => return,
+                }
+            }
+        });
+        match place.submit(job) {
+            Ok(()) => Some(Outcome::Deferred),
+            // Only while the process stops: the token is gone with the job,
+            // and the connection gets the 500 refusal.
+            Err(_) => Some(Outcome::Deferred),
         }
     }
 
@@ -479,6 +552,26 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
 }
 
 impl Pipeline {
+    /// [`HttpService::call`] on this thread: the worker's, or a CPU pool
+    /// thread's.
+    fn call_here(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
+        // The path, for a web service on this thread that asks where it is
+        // (`note::path_under`); what it notes is taken when the call ends.
+        crate::note::begin(req.path());
+        let outcome = self.call_noted(req, env, reply);
+        if let Some(note) = crate::note::end()
+            && self.access.is_some()
+            && env.user_word() != 0
+        {
+            self.tickets.set_note(
+                env.worker().get(),
+                TicketTag::from_raw(env.user_word()),
+                note,
+            );
+        }
+        outcome
+    }
+
     /// [`HttpService::call`], between the note's start and end.
     fn call_noted(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
         let tag = TicketTag::from_raw(env.user_word());
@@ -570,21 +663,11 @@ impl HttpService for Pipeline {
     }
 
     fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
-        // The path, for a web service on this thread that asks where it is
-        // (`note::path_under`); what it notes is taken when the call ends.
-        crate::note::begin(req.path());
-        let outcome = self.call_noted(req, env, reply);
-        if let Some(note) = crate::note::end()
-            && self.access.is_some()
-            && env.user_word() != 0
-        {
-            self.tickets.set_note(
-                env.worker().get(),
-                TicketTag::from_raw(env.user_word()),
-                note,
-            );
+        // Password hashing and other slow routes, off the worker.
+        if let Some(outcome) = self.offload(req, env, reply) {
+            return outcome;
         }
-        outcome
+        self.call_here(req, env, reply)
     }
 
     fn done(&self, env: &Envelope, finished: &Finished) {

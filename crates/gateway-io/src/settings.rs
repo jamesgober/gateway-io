@@ -59,6 +59,10 @@ pub struct Settings {
     pub driver: Driver,
     /// Stage timing (`[gateway] stage_timing`, default off).
     pub stage_timing: bool,
+    /// Threads that answer the routes marked `WorkClass::Cpu` (password
+    /// hashing) off the reactor workers (`[gateway] cpu_threads`, default
+    /// 2; 0 answers them on the worker).
+    pub cpu_threads: u16,
     /// A line per request in the log (`[gateway] access_log`, default off).
     pub access_log: bool,
     /// Addresses banned at the door from boot (`[door] ban`, default none).
@@ -152,6 +156,7 @@ pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
         "gateway",
         &[
             "access_log",
+            "cpu_threads",
             "drain",
             "driver",
             "forwarded_proto",
@@ -211,6 +216,7 @@ impl Default for Settings {
             keep_alive_requests: 1000,
             driver: Driver::Reactor,
             stage_timing: false,
+            cpu_threads: 2,
             access_log: false,
             ban: Vec::new(),
             exempt: Vec::new(),
@@ -359,6 +365,15 @@ impl Settings {
             stage_timing: config
                 .get_or("gateway.stage_timing", d.stage_timing)
                 .map_err(err)?,
+            cpu_threads: {
+                let n: u64 = config
+                    .get_or("gateway.cpu_threads", u64::from(d.cpu_threads))
+                    .map_err(err)?;
+                u16::try_from(n)
+                    .ok()
+                    .filter(|n| *n <= 64)
+                    .ok_or_else(|| SettingsError("gateway.cpu_threads must be 0 to 64".into()))?
+            },
             access_log: config
                 .get_or("gateway.access_log", d.access_log)
                 .map_err(err)?,

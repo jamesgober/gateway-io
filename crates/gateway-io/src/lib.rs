@@ -28,6 +28,7 @@ pub mod gateway;
 pub mod load;
 pub mod note;
 pub mod observe;
+mod offload;
 pub mod pipeline;
 pub mod rules;
 pub mod settings;

@@ -713,7 +713,9 @@ fn sign_in_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .public()
     .template("sign-in")
-    .name("sign-in-post");
+    .name("sign-in-post")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     let code_page = |s: &Accounts, cx: &mut NexCx<'_>, user: UserId, error: &str| {
         guard(cx);
@@ -972,7 +974,9 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .allow(SIGNED_IN)
     .template("admin/security")
-    .name("account-password");
+    .name("account-password")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     let s = acc.clone();
     let everywhere: NexRoute = post("/account/sign-out-everywhere", move |cx: &mut NexCx<'_>| {
@@ -1114,7 +1118,9 @@ fn key_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .allow(SIGNED_IN)
     .template("admin/security")
-    .name("account-key-make");
+    .name("account-key-make")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     let s = acc.clone();
     let revoke: NexRoute = post("/account/keys/revoke", move |cx: &mut NexCx<'_>| {
@@ -1251,7 +1257,9 @@ fn two_factor_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .allow(SIGNED_IN)
     .template("admin/two-factor")
-    .name("account-two-factor-post");
+    .name("account-two-factor-post")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     let s = acc.clone();
     let off: NexRoute = post("/account/two-factor/off", move |cx: &mut NexCx<'_>| {
@@ -1286,7 +1294,9 @@ fn two_factor_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .allow(SIGNED_IN)
     .template("admin/security")
-    .name("account-two-factor-off");
+    .name("account-two-factor-off")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     let s = acc.clone();
     let codes: NexRoute = post("/account/recovery-codes", move |cx: &mut NexCx<'_>| {
@@ -1324,7 +1334,9 @@ fn two_factor_routes(acc: &Accounts) -> Vec<NexRoute> {
     })
     .allow(SIGNED_IN)
     .template("admin/codes")
-    .name("account-recovery-codes");
+    .name("account-recovery-codes")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
     vec![start, confirm, off, codes]
 }
