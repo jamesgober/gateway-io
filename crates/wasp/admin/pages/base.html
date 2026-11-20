@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{{ page.title }} | {{ page.site.name }} admin{% endblock %}</title>
+<link rel="stylesheet" href="{{ page.site.admin }}/static/admin.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header>
+<a class="brand" href="{{ page.site.admin }}">{{ page.site.name }}</a>
+<nav><a href="{{ page.site.admin }}">Content</a> <a href="{{ page.site.account }}">Account</a> <a href="{{ page.site.home }}">View site</a></nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

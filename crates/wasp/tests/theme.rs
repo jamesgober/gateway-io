@@ -234,7 +234,8 @@ fn error_pages_for_404_405_and_500() {
     .template("page");
     let app = App::with_gate(WaspGate::new(core.access().clone()))
         .render(theme::Timed::untimed(
-            theme::load(&default_theme()).expect("theme"),
+            theme::SiteRender::builtin(theme::load(&default_theme()).expect("theme"))
+                .expect("admin theme"),
         ))
         .development()
         .route(ok)

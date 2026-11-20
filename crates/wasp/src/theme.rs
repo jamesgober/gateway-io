@@ -1,11 +1,21 @@
 //! The theme: page templates and error pages compiled from a folder, and the
-//! watcher that reloads them while the site serves.
+//! watcher that reloads them while the site serves; and the admin pages'
+//! own theme, kept apart from it.
 //!
 //! ```text
-//!  <theme>/pages/*.html    page templates (`base`, `home`, `post`, `page`, `sign-in`, `account`, `admin`, `edit`), view `page`
+//!  <theme>/pages/*.html    page templates (`base`, `home`, `post`, `page`, `sign-in`, `account`), view `page`
 //!  <theme>/errors/*.html   error pages (`error`, `error/404`, ...), view `error`
 //!  <theme>/static/         files served under /theme/ (the stylesheet)
+//!
+//!  admin theme             built into the binary (`[admin] theme = "builtin"`), or a
+//!                          folder of the same shape when `[admin] custom_theme = true`:
+//!  <admin>/pages/*.html    `base`, `list`, `edit`, view `page`; routes name them `admin/<name>`
+//!  <admin>/static/         files served under /admin/static/ (the built-in one: admin.css)
 //! ```
+//!
+//! A route's `admin/...` template always comes from the admin theme, never
+//! from the site theme: a site theme cannot restyle the admin pages, or put
+//! anything into them.
 //!
 //! Templates compile once, when the theme is loaded or changed, never per
 //! request. This is the only module that uses Luminess directly. A reload compiles both engines and checks the templates the
@@ -29,9 +39,24 @@ use wasp_core::suite::log;
 use crate::content::Entry;
 
 /// The templates every theme must have (the routes name them).
-pub const REQUIRED: &[&str] = &[
-    "home", "post", "page", "sign-in", "account", "admin", "edit",
+pub const REQUIRED: &[&str] = &["home", "post", "page", "sign-in", "account"];
+
+/// The templates every admin theme must have (routes name them `admin/<name>`).
+pub const ADMIN_REQUIRED: &[&str] = &["list", "edit"];
+
+/// The built-in admin theme's templates.
+const ADMIN_PAGES: &[(&str, &str)] = &[
+    ("base", include_str!("../admin/pages/base.html")),
+    ("list", include_str!("../admin/pages/list.html")),
+    ("edit", include_str!("../admin/pages/edit.html")),
 ];
+
+/// The built-in admin theme's stylesheet, served at `/admin/static/admin.css`.
+pub const ADMIN_CSS: &str = include_str!("../admin/static/admin.css");
+
+/// The content security policy of every admin page: nothing inline, nothing
+/// from another origin, never framed.
+pub const ADMIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 // The view schemas: every Luminess name the site uses is in this module, so
 // a Luminess upgrade changes this file and nothing else.
@@ -289,8 +314,137 @@ pub const FORM_EXPIRED_TITLE: &str = "Form expired";
 /// The error page's message when a form's token was refused.
 pub const FORM_EXPIRED: &str = "This form expired. Reload the page and try again. If you typed a lot, go back first and copy it.";
 
+/// The admin pages' engine.
+pub type AdminTheme = Engine<Page>;
+
+/// Where the admin theme comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminSource {
+    /// The one built into the binary: it works whatever the site theme is.
+    Builtin,
+    /// A folder (`pages/`, `static/`), allowed only by `admin.custom_theme`.
+    Folder(PathBuf),
+}
+
+/// Loads the admin theme. The built-in one compiles from the binary.
+pub fn load_admin(source: &AdminSource) -> Result<AdminTheme, ThemeError> {
+    match source {
+        AdminSource::Builtin => compile_admin(
+            "built-in admin theme",
+            ADMIN_PAGES
+                .iter()
+                .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+                .collect(),
+        ),
+        AdminSource::Folder(dir) => {
+            let mut budget = MAX_THEME_BYTES;
+            let mut files = 0;
+            let pages = sources(&dir.join("pages"), &mut budget, &mut files)?;
+            compile_admin(&dir.display().to_string(), pages)
+        }
+    }
+}
+
+/// Compiles an admin theme on its own thread with a large stack, as a site
+/// theme is.
+fn compile_admin(shown: &str, pages: Vec<(String, String)>) -> Result<AdminTheme, ThemeError> {
+    let name = shown.to_owned();
+    let worker = std::thread::Builder::new()
+        .name("theme-compile".into())
+        .stack_size(COMPILE_STACK)
+        .spawn(move || {
+            let failed = ThemeError(format!("admin theme {name}: the compiler failed"));
+            std::panic::catch_unwind(move || {
+                let engine = pages
+                    .into_iter()
+                    .fold(Engine::<Page>::builder(), |b, (n, s)| b.template(n, s))
+                    .build()
+                    .map_err(|e| ThemeError(format!("admin theme {name}: {e}")))?;
+                for required in ADMIN_REQUIRED {
+                    if !engine.contains(required) {
+                        return Err(ThemeError(format!(
+                            "admin theme {name}: pages/{required}.html is missing"
+                        )));
+                    }
+                }
+                Ok(engine)
+            })
+            .unwrap_or(Err(failed))
+        })
+        .map_err(|e| ThemeError(format!("admin theme {shown}: {e}")))?;
+    worker.join().unwrap_or_else(|_| {
+        Err(ThemeError(format!(
+            "admin theme {shown}: the compiler failed"
+        )))
+    })
+}
+
+/// A template id from the admin theme: the high bit, never set by a site
+/// theme's ids.
+const ADMIN_TEMPLATE: u32 = 1 << 31;
+
+/// The site theme and the admin theme as one engine: a template named
+/// `admin/<name>` is the admin theme's `<name>`, and every other name is
+/// the site theme's. Error pages are the site theme's.
+#[derive(Clone)]
+pub struct SiteRender {
+    site: SiteTheme,
+    admin: AdminTheme,
+}
+
+impl SiteRender {
+    /// The site theme with its admin theme.
+    #[must_use]
+    pub fn new(site: SiteTheme, admin: AdminTheme) -> SiteRender {
+        SiteRender { site, admin }
+    }
+
+    /// The site theme with the built-in admin theme.
+    pub fn builtin(site: SiteTheme) -> Result<SiteRender, ThemeError> {
+        Ok(SiteRender::new(site, load_admin(&AdminSource::Builtin)?))
+    }
+}
+
+impl web_net::Render for SiteRender {
+    type View<'a> = Page;
+
+    fn template(&self, name: &str) -> Option<web_net::TemplateId> {
+        match name.strip_prefix("admin/") {
+            Some(admin) => web_net::Render::template(&self.admin, admin)
+                .filter(|t| t.0 & ADMIN_TEMPLATE == 0)
+                .map(|t| web_net::TemplateId(t.0 | ADMIN_TEMPLATE)),
+            None => {
+                web_net::Render::template(&self.site, name).filter(|t| t.0 & ADMIN_TEMPLATE == 0)
+            }
+        }
+    }
+
+    #[inline]
+    fn render(
+        &self,
+        template: web_net::TemplateId,
+        view: &Page,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<(), web_net::RenderError> {
+        if template.0 & ADMIN_TEMPLATE == 0 {
+            web_net::Render::render(&self.site, template, view, out)
+        } else {
+            let id = web_net::TemplateId(template.0 & !ADMIN_TEMPLATE);
+            web_net::Render::render(&self.admin, id, view, out)
+        }
+    }
+
+    fn error_page(
+        &self,
+        page: &web_net::ErrorPage<'_>,
+        out: &mut web_net::Output<'_>,
+    ) -> Result<bool, web_net::RenderError> {
+        web_net::Render::error_page(&self.site, page, out)
+    }
+}
+
 /// The engine web-net renders the site with.
-pub type SiteEngine = Timed<SiteTheme>;
+pub type SiteEngine = Timed<SiteRender>;
 
 /// Why a theme was refused.
 #[derive(Debug)]

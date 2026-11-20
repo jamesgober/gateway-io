@@ -31,7 +31,7 @@ use wasp_core::suite::config::Config;
 use web_net::{Assets, CachePolicy, Context, Route, get};
 
 use crate::content::{Content, Entry, Kind};
-use crate::theme::{Editor, Form, Page, SiteEngine, SiteInfo};
+use crate::theme::{ADMIN_CSS, AdminSource, Editor, Form, Page, SiteEngine, SiteInfo};
 
 #[cfg(feature = "gatekeeper")]
 pub use gatekeeper_site::{SiteApp, SiteCx, SiteRoute, build};
@@ -68,6 +68,8 @@ pub struct SiteSettings {
     /// Send sign-in pages asked for over plain http to https: on behind an
     /// application server (`PORT` set), unless `site.development`.
     pub https_sign_in: bool,
+    /// Where the admin pages' theme comes from (`[admin] theme`).
+    pub admin_theme: AdminSource,
 }
 
 impl Default for SiteSettings {
@@ -80,8 +82,29 @@ impl Default for SiteSettings {
             theme: PathBuf::from("themes/default"),
             theme_poll: Duration::from_secs(1),
             https_sign_in: false,
+            admin_theme: AdminSource::Builtin,
         }
     }
+}
+
+/// `[admin] theme`: `builtin` (the default), or a folder, which is allowed
+/// only with `[admin] custom_theme = true` (an install can keep its admin
+/// pages to the one built in).
+fn admin_source(config: &Config) -> Result<AdminSource, String> {
+    let e = |e: wasp_core::suite::Error| e.to_string();
+    let theme: String = config
+        .get_or("admin.theme", "builtin".to_owned())
+        .map_err(e)?;
+    let custom: bool = config.get_or("admin.custom_theme", false).map_err(e)?;
+    if theme == "builtin" {
+        return Ok(AdminSource::Builtin);
+    }
+    if !custom {
+        return Err(format!(
+            "admin.theme names the folder `{theme}`, but custom admin themes are off: set admin.custom_theme = true to allow one, or remove admin.theme"
+        ));
+    }
+    Ok(AdminSource::Folder(PathBuf::from(theme)))
 }
 
 impl SiteSettings {
@@ -117,6 +140,7 @@ impl SiteSettings {
             theme_poll: config.get_or("site.theme_poll", d.theme_poll).map_err(e)?,
             https_sign_in: std::env::var_os("PORT").is_some()
                 && !config.get_or("site.development", false).map_err(e)?,
+            admin_theme: admin_source(config)?,
         })
     }
 }
@@ -194,6 +218,22 @@ pub(crate) fn configure<G: web_net::Gate>(
     if let Some(dir) = &settings.assets {
         builder = builder.assets(Assets::new("/static", dir.clone()));
     }
+    builder = match &settings.admin_theme {
+        AdminSource::Builtin => builder.route(
+            get(
+                "/admin/static/admin.css",
+                |cx: &mut Context<'_, G::Identity, SiteEngine>| {
+                    cx.set_header("cache-control", "public, max-age=3600");
+                    cx.bytes(200, "text/css; charset=utf-8", ADMIN_CSS.as_bytes())
+                },
+            )
+            .public()
+            .name("admin-css"),
+        ),
+        AdminSource::Folder(dir) => {
+            builder.assets(Assets::new("/admin/static", dir.join("static")))
+        }
+    };
     builder
         .assets(Assets::new("/theme", settings.theme.join("static")))
         .sign_in("/sign-in")

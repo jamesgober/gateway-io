@@ -143,8 +143,10 @@ form_net::form! {
 /// The editor's view for this request: every entry, the form's addresses,
 /// and the token; the entry fields empty.
 fn editor(cx: &mut NexCx<'_>, pages: &Pages) -> Result<Editor, web_net::Error> {
-    // Never kept by a browser or a cache in front of the site.
+    // Never kept by a browser or a cache in front of the site, and held to
+    // the admin pages' own content security policy.
     cx.set_header("cache-control", "no-store");
+    cx.set_header("content-security-policy", crate::theme::ADMIN_CSP);
     Ok(Editor {
         entries: Arc::new(pages.content.snapshot().all()),
         save: cx.url("/admin/save")?,
@@ -196,7 +198,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
         cx.render(&p.editor_page("Content", view))
     })
     .allow(EDITING)
-    .template("admin")
+    .template("admin/list")
     .name("admin");
 
     let p = pages.clone();
@@ -215,7 +217,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
         cx.render(&p.editor_page(title, view))
     })
     .allow(EDITING)
-    .template("edit")
+    .template("admin/edit")
     .name("admin-new");
 
     let p = pages.clone();
@@ -228,7 +230,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
         cx.render(&p.editor_page(&format!("Edit {}", entry.title), view))
     })
     .allow(EDITING)
-    .template("edit")
+    .template("admin/edit")
     .name("admin-edit");
 
     let p = pages.clone();
@@ -271,7 +273,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
         }
     })
     .allow(EDITING)
-    .template("edit")
+    .template("admin/edit")
     .name("admin-save");
 
     let p = pages.clone();
