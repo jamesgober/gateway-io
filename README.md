@@ -110,10 +110,10 @@ A site path is under the site's base, and becomes absolute (`https://` and the f
 With nex-db, every signed-in account has `/account/security`:
 
 - **Password.** Change it with the current one. Every other session ends.
-- **Sign out everywhere.** Ends every session of the account, this one too.
-- **Two-step sign-in.** Turn it on with an authenticator app. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off and "Forget remembered devices" undo that.
+- **Sign out everywhere.** Ends every session of the account, this one too, and forgets its remembered devices.
+- **Two-step sign-in.** Turn it on with an authenticator app and your password. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off, signing out everywhere and "Forget remembered devices" undo that.
 
-An account with the `admin` role has `/admin/accounts`. It lists every account with its roles and standing, and disables, enables or removes one. Disabling ends its sessions. Neither your own account nor the boot account can be changed there.
+An account with the `admin` role has `/admin/accounts`. It lists every account with its roles and standing, and disables or removes one, or enables one that is disabled or locked out (a ban stays). Disabling ends its sessions. Neither your own account nor the boot account can be changed there.
 
 Every one of these writes an `audit` line to the log: who, what, and which account.
 
@@ -138,9 +138,9 @@ Every key here is read again on a reload. A value under its floor stops the boot
 | `auth.session.absolute` | `30d` | a session ends this long after sign-in (`1m` to `400d`) |
 | `auth.session.max_concurrent` | 0 | the most sessions an account holds; a new sign-in past it ends the oldest (0: no cap) |
 | `auth.session.recheck` | `1m` | how often a session's roles and standing are read again (`1s` to `1h`) |
-| `auth.lockout.attempts` | 10 | wrong passwords or codes for one account within `window` that lock it (1 to 1000; never off) |
-| `auth.lockout.window` | `15m` | the window `attempts` are counted in |
-| `auth.lockout.duration` | `15m` | how long a lockout lasts |
+| `auth.lockout.attempts` | 10 | wrong passwords or codes for one account within `window` that lock it (1 to 20; never off) |
+| `auth.lockout.window` | `15m` | the window `attempts` are counted in (at least `1m`) |
+| `auth.lockout.duration` | `15m` | how long a lockout lasts (at least `1m`) |
 | `auth.lockout.address_attempts` | 10 | sign-in attempts one address may make within `address_window` |
 | `auth.lockout.address_window` | `10m` | the window `address_attempts` are counted in |
 

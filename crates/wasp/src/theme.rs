@@ -257,6 +257,8 @@ pub struct Security {
     pub offered: bool,
     /// The account's roles require two-step sign-in.
     pub required: bool,
+    /// The form asks for the password too.
+    pub ask_password: bool,
     /// The secret to type into an authenticator app (set-up only).
     pub secret: String,
     /// The `otpauth://` link (set-up only).
@@ -297,6 +299,7 @@ luminess::view!(Security as "security" {
     totp: bool,
     offered: bool,
     required: bool,
+    ask_password: bool,
     secret: text,
     uri: text,
     codes: list(text),

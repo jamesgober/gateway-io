@@ -18,9 +18,11 @@
 //! | `POST /admin/accounts/disable`, `enable`, `remove` | `admin` | never the viewer's own account or the boot account |
 //!
 //! Between the two steps of a sign-in the browser holds `__Host-nexstep`:
-//! the account, the step, and when it ends (five minutes), sealed with a key
-//! derived from the master secret and bound to the visitor's pre-session
-//! cookie. "Remember this device" sets `__Host-nexdev`: the account and when
+//! the account, the step, when it ends (five minutes), and a random nonce,
+//! sealed with a key derived from the master secret and bound to the
+//! visitor's pre-session cookie. A step is good once: completing it spends
+//! its nonce, and the set-up step refuses an account that already has
+//! two-step sign-in on or may not sign in. "Remember this device" sets `__Host-nexdev`: the account and when
 //! it was set, sealed with another derived key.
 
 use std::sync::Arc;
@@ -129,11 +131,49 @@ enum Step {
     Setup = 2,
 }
 
+/// A half-done sign-in's nonce: spent when the step completes.
+type Nonce = [u8; 16];
+
+/// The nonces of completed steps, kept until their cookies have expired.
+#[derive(Debug, Default)]
+pub(crate) struct Spent(std::sync::Mutex<std::collections::HashMap<Nonce, std::time::Instant>>);
+
+/// Completed steps remembered at once; past it (after the expired ones go)
+/// a completion is refused for now rather than forgotten.
+const SPENT_CAP: usize = 100_000;
+
+impl Spent {
+    fn is_spent(&self, nonce: &Nonce) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(nonce)
+    }
+
+    /// Spends `nonce`: `false` when it was spent already, or when the set
+    /// is full of live steps.
+    fn spend(&self, nonce: Nonce) -> bool {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= SPENT_CAP {
+            map.retain(|_, at| at.elapsed() < STEP_TTL);
+            if map.len() >= SPENT_CAP {
+                return false;
+            }
+        }
+        map.insert(nonce, std::time::Instant::now()).is_none()
+    }
+}
+
 fn step_cookie(keys: &CookieKeys, step: Step, user: UserId, binding: &[u8]) -> Option<String> {
-    let mut plain = Vec::with_capacity(26 + binding.len());
+    let random = crypt_io::generate_key().ok()?;
+    let mut plain = Vec::with_capacity(41 + binding.len());
     plain.push(step as u8);
     plain.extend_from_slice(&user.0.to_be_bytes());
     plain.extend_from_slice(&(now_secs() + STEP_TTL.as_secs()).to_be_bytes());
+    plain.extend_from_slice(&random[..16]);
     plain.extend_from_slice(binding);
     let value = seal(&keys.step, STEP_AAD, &plain)?;
     Some(format!(
@@ -147,15 +187,22 @@ fn clear(name: &str) -> String {
 }
 
 /// The half-done sign-in this visitor holds at `want`, when it is still
-/// good and bound to the visitor's pre-session cookie.
-fn read_step(cx: &NexCx<'_>, keys: &CookieKeys, want: Step) -> Option<UserId> {
+/// good, not spent, and bound to the visitor's pre-session cookie.
+fn read_step(
+    cx: &NexCx<'_>,
+    keys: &CookieKeys,
+    spent: &Spent,
+    want: Step,
+) -> Option<(UserId, Nonce)> {
     let binding = web_net::Identity::csrf_binding(cx.identity())?;
     let value = cx.header("cookie").and_then(|h| cookie(h, STEP_COOKIE))?;
     let plain = open(&keys.step, STEP_AAD, value)?;
-    let (head, rest) = plain.split_at_checked(25)?;
+    let (head, rest) = plain.split_at_checked(41)?;
     let user = UserId(u128::from_be_bytes(head.get(1..17)?.try_into().ok()?));
     let until = u64::from_be_bytes(head.get(17..25)?.try_into().ok()?);
-    (head[0] == want as u8 && rest == binding && now_secs() < until).then_some(user)
+    let nonce: Nonce = head.get(25..41)?.try_into().ok()?;
+    (head[0] == want as u8 && rest == binding && now_secs() < until && !spent.is_spent(&nonce))
+        .then_some((user, nonce))
 }
 
 fn device_cookie(keys: &CookieKeys, user: UserId, remember: Duration) -> Option<String> {
@@ -206,6 +253,16 @@ form_net::form! {
         current: Secret,
         new: Secret,
         again: Secret,
+    }
+    ignore = ["csrf_token"];
+}
+
+form_net::form! {
+    /// Turning two-step sign-in on from the account page: the code, and the
+    /// password, so a borrowed session cannot.
+    struct EnrollForm {
+        code: String,
+        password: Secret,
     }
     ignore = ["csrf_token"];
 }
@@ -266,6 +323,8 @@ pub(crate) struct Accounts {
     pub(crate) boot: Option<String>,
     /// The sign-in form.
     pub(crate) show: ShowSignIn,
+    /// The completed sign-in steps.
+    pub(crate) spent: Arc<Spent>,
 }
 
 impl Accounts {
@@ -310,6 +369,14 @@ impl Accounts {
             "admin/security",
             &self.pages.security_page("Security", view),
         )
+    }
+
+    /// Whether `user` may set two-step sign-in up at sign-in: it may sign
+    /// in, and has no two-step sign-in on yet.
+    #[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+    fn setup_allowed(&self, user: UserId) -> Result<bool, web_net::Error> {
+        Ok(self.auth.may_sign_in(user).map_err(store)?
+            && !self.auth.totp_on(user).map_err(store)?)
     }
 
     /// The email of `user`, for an audit line.
@@ -460,7 +527,7 @@ fn sign_in_routes(acc: &Accounts) -> Vec<NexRoute> {
 
     let s = acc.clone();
     let code_get: NexRoute = get("/sign-in/code", move |cx: &mut NexCx<'_>| {
-        let Some(user) = read_step(cx, &s.keys, Step::Code) else {
+        let Some((user, _)) = read_step(cx, &s.keys, &s.spent, Step::Code) else {
             return cx.redirect(303, "/sign-in");
         };
         code_page(&s, cx, user, "")
@@ -471,7 +538,7 @@ fn sign_in_routes(acc: &Accounts) -> Vec<NexRoute> {
 
     let s = acc.clone();
     let code_post: NexRoute = post("/sign-in/code", move |cx: &mut NexCx<'_>| {
-        let Some(user) = read_step(cx, &s.keys, Step::Code) else {
+        let Some((user, nonce)) = read_step(cx, &s.keys, &s.spent, Step::Code) else {
             return cx.redirect(303, "/sign-in");
         };
         let form: CodeForm = cx.form()?;
@@ -485,7 +552,16 @@ fn sign_in_routes(acc: &Accounts) -> Vec<NexRoute> {
                 "Too many attempts from your address. Please wait a few minutes, then try again.",
             );
         }
-        match s.auth.check_code(user, &form.code).map_err(store)? {
+        let check = s.auth.check_code(user, &form.code).map_err(store)?;
+        if matches!(
+            check,
+            CodeCheck::Code | CodeCheck::Recovery | CodeCheck::Blocked
+        ) && !s.spent.spend(nonce)
+        {
+            // Spent by another request at the same moment.
+            return cx.redirect(303, "/sign-in");
+        }
+        match check {
             CodeCheck::Code => {
                 s.finish(cx, user, form.remember)?;
                 let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
@@ -558,9 +634,13 @@ fn setup_routes(acc: &Accounts) -> Vec<NexRoute> {
 
     let s = acc.clone();
     let get_setup: NexRoute = get("/sign-in/setup", move |cx: &mut NexCx<'_>| {
-        let Some(user) = read_step(cx, &s.keys, Step::Setup) else {
+        let Some((user, _)) = read_step(cx, &s.keys, &s.spent, Step::Setup) else {
             return cx.redirect(303, "/sign-in");
         };
+        if !s.setup_allowed(user)? {
+            cx.set_header("set-cookie", clear(STEP_COOKIE));
+            return cx.redirect(303, "/sign-in");
+        }
         setup_page(&s, cx, user, true, "")
     })
     .public()
@@ -569,9 +649,13 @@ fn setup_routes(acc: &Accounts) -> Vec<NexRoute> {
 
     let s = acc.clone();
     let post_setup: NexRoute = post("/sign-in/setup", move |cx: &mut NexCx<'_>| {
-        let Some(user) = read_step(cx, &s.keys, Step::Setup) else {
+        let Some((user, nonce)) = read_step(cx, &s.keys, &s.spent, Step::Setup) else {
             return cx.redirect(303, "/sign-in");
         };
+        if !s.setup_allowed(user)? {
+            cx.set_header("set-cookie", clear(STEP_COOKIE));
+            return cx.redirect(303, "/sign-in");
+        }
         let form: CodeForm = cx.form()?;
         if !s.admit(cx) {
             cx.status(429);
@@ -585,6 +669,9 @@ fn setup_routes(acc: &Accounts) -> Vec<NexRoute> {
         }
         match s.auth.confirm_totp(user, &form.code).map_err(store)? {
             Some(codes) => {
+                if !s.spent.spend(nonce) {
+                    return cx.redirect(303, "/sign-in");
+                }
                 s.finish(cx, user, false)?;
                 let who = s.who(user);
                 crate::events::audit(&who, "two_step_on", &who);
@@ -686,6 +773,7 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
         s.auth.sign_out_everywhere(user).map_err(store)?;
         crate::events::audit(&who, "signed_out_everywhere", &who);
         cx.set_header("set-cookie", clear(SESSION_COOKIE));
+        cx.set_header("set-cookie", clear(DEVICE_COOKIE));
         cx.redirect(303, "/")
     })
     .allow(SIGNED_IN)
@@ -736,6 +824,7 @@ fn two_factor_routes(acc: &Accounts) -> Vec<NexRoute> {
         let view = Security {
             error: error.to_owned(),
             action: cx.url("/account/two-factor")?,
+            ask_password: true,
             secret,
             uri,
             ..s.view(cx, user)?
@@ -765,9 +854,24 @@ fn two_factor_routes(acc: &Accounts) -> Vec<NexRoute> {
     let s = acc.clone();
     let confirm: NexRoute = post("/account/two-factor", move |cx: &mut NexCx<'_>| {
         let user = me(cx)?;
-        let form: CodeForm = cx.form()?;
+        let form: EnrollForm = cx.form()?;
         if s.auth.rules(user).map_err(store)?.mfa == MfaMode::Off {
             return Err(web_net::Error::not_found("account.two_factor_off"));
+        }
+        if s.auth.totp_on(user).map_err(store)? {
+            return cx.redirect(303, "/account/security");
+        }
+        let Some(_slot) = hash_slot(&s.hashing) else {
+            cx.set_header("retry-after", "2");
+            return Err(web_net::Error::unavailable("auth.busy"));
+        };
+        if !s
+            .auth
+            .password_is(user, form.password.expose())
+            .map_err(store)?
+        {
+            cx.status(422);
+            return enroll_page(&s, cx, user, false, "The password is not right.");
         }
         match s.auth.confirm_totp(user, &form.code).map_err(store)? {
             Some(codes) => {
@@ -960,7 +1064,16 @@ fn admin_routes(acc: &Accounts) -> Vec<NexRoute> {
                     "account_disabled"
                 }
                 "enable" => {
-                    s.auth.enable(target, user).map_err(store)?;
+                    if !s.auth.enable(target, user).map_err(store)? {
+                        cx.status(422);
+                        return list(
+                            &s,
+                            cx,
+                            user,
+                            "Only a disabled or locked account can be enabled here.",
+                            "",
+                        );
+                    }
                     "account_enabled"
                 }
                 _ => {
