@@ -26,6 +26,30 @@ fn default_theme() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default")
 }
 
+/// Makes `path` this account's own on Windows, where a configuration file
+/// other accounts can change is refused and a temporary folder can let them
+/// (one some machines share with another group). Unix files here are made
+/// owner-writable already.
+fn private(path: &Path) {
+    #[cfg(windows)]
+    {
+        let me = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(domain), Ok(user)) => format!("{domain}\\{user}"),
+            (_, Ok(user)) => user,
+            _ => return,
+        };
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{me}:F"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 fn slash(p: &Path) -> String {
     p.display()
         .to_string()
@@ -349,6 +373,7 @@ fn the_watcher_reloads_a_changed_theme_through_the_kernel() {
         ),
     )
     .expect("conf");
+    private(&conf);
     let mut boot = System::builder("wasp-theme-test")
         .portable(conf_dir.join("root"))
         .config_file(&conf)

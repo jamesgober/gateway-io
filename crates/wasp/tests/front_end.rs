@@ -201,7 +201,9 @@ fn a_parent_that_dies_takes_it_down() {
     while alive(pid) {
         assert!(
             Instant::now() < until,
-            "wasp {pid} still runs 20s after its parent died"
+            "wasp {pid} still runs 20s after its parent died (state: {})\n{}",
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default(),
+            tail(&log)
         );
         std::thread::sleep(Duration::from_millis(50));
     }

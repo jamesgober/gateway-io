@@ -25,6 +25,11 @@ use wasp_core::suite::System;
 use wasp_core::suite::log;
 
 fn main() -> ExitCode {
+    // The parent that started this process, read before anything else: a
+    // front end that dies while the boot runs must still be noticed.
+    #[cfg(unix)]
+    let parent = std::os::unix::process::parent_id();
+
     // PHASE 0: the foundation and the kernel. Nothing is open yet.
     // No single-instance lock: a restart behind an application server
     // overlaps the old process's drain, and the database has its own lock.
@@ -34,9 +39,11 @@ fn main() -> ExitCode {
         .boot()
     {
         Ok(boot) => boot,
-        Err(error) => return error.report(),
+        Err(error) => {
+            say_how_to_fix_a_folder(&error);
+            return error.report();
+        }
     };
-    say_where_the_configuration_came_from(boot.foundation());
 
     // `wasp import <folder>`: content into the store, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -118,7 +125,7 @@ fn main() -> ExitCode {
 
     #[cfg(unix)]
     if std::env::var_os("PORT").is_some() {
-        stop_with_front_end(boot.foundation());
+        stop_with_front_end(boot.foundation(), parent);
     }
 
     let system = match boot.ready() {
@@ -146,29 +153,37 @@ fn failed(foundation: &wasp_core::suite::Foundation, error: &wasp_core::suite::E
     error.report()
 }
 
-/// Logs the configuration file in use, and warns when there is none: every
-/// setting is then at its default (port 8080, data in the user's data
-/// folder), which is rarely what was meant.
-fn say_where_the_configuration_came_from(foundation: &wasp_core::suite::Foundation) {
-    let config = foundation.config();
-    if let Some(file) = config.source() {
-        let file = file.display().to_string();
-        log::info!(foundation.log(), "configuration file", file = file.as_str());
+/// When the boot refused a folder others can reach, says which and the
+/// command that fixes it, ahead of the suite's report: an install made by
+/// an older build may have its folders at mode 0755.
+fn say_how_to_fix_a_folder(error: &wasp_core::suite::Error) {
+    use wasp_core::suite::path::Error as PathError;
+
+    if error.kind() != wasp_core::suite::ErrorKind::DirectoryInsecure {
         return;
     }
-    let here = std::path::Path::new("wasp.conf");
-    let why = if !here.is_file() {
-        "no wasp.conf in the working directory and WASP_CONFIG is not set"
-    } else if wasp_core::suite::sys::process::is_elevated().unwrap_or(true) {
-        "wasp.conf in the working directory is not read by a process running as root or administrator: name it with WASP_CONFIG"
-    } else {
-        "wasp.conf in the working directory was not read"
-    };
-    log::warn!(
-        foundation.log(),
-        "no configuration file: every setting is at its default",
-        why = why
-    );
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if let Some(PathError::Refused { path, .. }) = e.downcast_ref::<PathError>() {
+            let shown = path.display();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    eprintln!(
+                        "wasp: {shown} can be reached by other users (mode {mode:o}); run: chmod 700 {shown}"
+                    );
+                    return;
+                }
+            }
+            eprintln!(
+                "wasp: {shown} can be reached by other users; make it private to this account"
+            );
+            return;
+        }
+        cause = e.source();
+    }
 }
 
 /// Logs a warning when a provider (the content store, the database) stops
@@ -208,9 +223,11 @@ fn watch_providers(
 /// Behind an application server: asks for the same clean stop a SIGTERM
 /// would when standard input closes (only when it is a pipe or a socket: a
 /// terminal or `/dev/null` is not a front end) or when the parent process
-/// is gone (the process was handed to another parent).
+/// is gone (the process was handed to another parent). `parent` is the one
+/// read when the process started, so a parent that died during the boot
+/// stops it too.
 #[cfg(unix)]
-fn stop_with_front_end(foundation: &wasp_core::suite::Foundation) {
+fn stop_with_front_end(foundation: &wasp_core::suite::Foundation, parent: u32) {
     use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
 
@@ -237,7 +254,6 @@ fn stop_with_front_end(foundation: &wasp_core::suite::Foundation) {
                     .request_supervisor_stop("standard input closed (the front end let go)");
             });
     }
-    let parent = std::os::unix::process::parent_id();
     if parent > 1 {
         let f = foundation.clone();
         let _ = std::thread::Builder::new()

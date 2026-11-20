@@ -32,6 +32,30 @@ fn write_conf(path: &Path, port: u16, door: &str) {
     std::fs::write(path, text).expect("config written");
 }
 
+/// Makes `path` this account's own on Windows, where a configuration file
+/// other accounts can change is refused and a temporary folder can let them
+/// (one some machines share with another group). Unix files here are made
+/// owner-writable already.
+fn private(path: &Path) {
+    #[cfg(windows)]
+    {
+        let me = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(domain), Ok(user)) => format!("{domain}\\{user}"),
+            (_, Ok(user)) => user,
+            _ => return,
+        };
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{me}:F"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// The status of `GET /`, or `None` when the connection got no response.
 fn status(addr: SocketAddr) -> Option<u16> {
     let mut s = TcpStream::connect(addr).ok()?;
@@ -58,6 +82,7 @@ fn a_reload_bans_and_lifts_at_the_door() {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     write_conf(&conf, port, "ban = []");
+    private(&conf);
 
     let mut boot = System::builder("wasp-reload-test")
         .portable(dir.0.join("root"))

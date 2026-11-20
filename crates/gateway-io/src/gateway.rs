@@ -357,7 +357,7 @@ impl Subsystem for Gateway {
         let open = Door::open_with(
             self.core.clone(),
             &settings,
-            link.urgent().clone(),
+            link.foundation().kernel().urgent().clone(),
             web,
             Extras {
                 events: Some(events),

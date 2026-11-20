@@ -29,6 +29,30 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Makes `path` this account's own on Windows, where a configuration file
+/// other accounts can change is refused and a temporary folder can let them
+/// (one some machines share with another group). Unix files here are made
+/// owner-writable already.
+fn private(path: &Path) {
+    #[cfg(windows)]
+    {
+        let me = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(domain), Ok(user)) => format!("{domain}\\{user}"),
+            (_, Ok(user)) => user,
+            _ => return,
+        };
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{me}:F"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 fn slash(p: &Path) -> String {
     p.display()
         .to_string()
@@ -68,9 +92,11 @@ fn wasp_conf_in_the_working_directory_is_read() {
         ),
     )
     .expect("config");
+    private(&dir.0.join("wasp.conf"));
+    let err = dir.0.join("stderr.log");
     let mut child = wasp(&dir.0)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&err).expect("stderr file"))
         .spawn()
         .expect("spawn");
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -88,7 +114,12 @@ fn wasp_conf_in_the_working_directory_is_read() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    assert!(listening, "the port wasp.conf names is listening");
+    let said = std::fs::read_to_string(&err).unwrap_or_default();
+    assert!(
+        listening,
+        "the port wasp.conf names is listening
+{said}"
+    );
 }
 
 #[test]
@@ -112,4 +143,26 @@ fn no_configuration_file_is_a_warning_and_a_refusal_logs_its_code() {
     assert!(text.contains("\"level\":\"warn\""), "{text}");
     assert!(text.contains("refused to load"), "{text}");
     assert!(text.contains("\"exit_code\":78"), "{text}");
+}
+
+/// A log folder others can read (mode 0755, as an older build made it)
+/// refuses the boot, naming the folder and the fix.
+#[cfg(unix)]
+#[test]
+fn a_log_folder_others_can_read_is_refused_with_the_fix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = folder("open-logs");
+    let logs = dir.0.join("dirs").join("LOGS");
+    std::fs::create_dir_all(&logs).expect("logs");
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = wasp(&dir.0).output().expect("run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(77), "{text}");
+    assert!(text.contains(&logs.display().to_string()), "{text}");
+    assert!(text.contains("(mode 755); run: chmod 700"), "{text}");
 }
