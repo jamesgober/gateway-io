@@ -29,7 +29,7 @@ pub struct ApiSettings {
 impl Default for ApiSettings {
     fn default() -> ApiSettings {
         ApiSettings {
-            enabled: true,
+            enabled: false,
             prefix: DEFAULT_PREFIX.to_owned(),
         }
     }
@@ -95,15 +95,12 @@ fn checked_prefix(prefix: &str, key: &str) -> Result<String, String> {
 }
 
 impl ApiSettings {
-    /// Reads `[api]` (`enabled`, `prefix`), each key optional. With
-    /// `gatekeeper` (no nex-db accounts) there is no API: off unless
-    /// `enabled = true`, which is refused.
+    /// Reads `[api]` (`enabled`, `prefix`), each key optional. The API is
+    /// off until `enabled = true`: a site that does not use it does not
+    /// expose it. With `gatekeeper` (no nex-db accounts) there is no API,
+    /// and `enabled = true` is refused.
     pub fn from_config(config: &Config, gatekeeper: bool) -> Result<ApiSettings, String> {
-        let base = ApiSettings {
-            enabled: !gatekeeper,
-            ..ApiSettings::default()
-        };
-        let api = ApiSettings::read(config, "api", &base)?;
+        let api = ApiSettings::read(config, "api", &ApiSettings::default())?;
         if gatekeeper && api.enabled {
             return Err(
                 "api.enabled needs nex-db accounts (auth.store = \"nex\"): the API's keys are kept there"
@@ -616,9 +613,11 @@ mod tests {
     }
 
     #[test]
-    fn the_api_is_on_with_nex_db_only() {
+    fn the_api_is_off_until_turned_on_and_with_nex_db_only() {
         let c = |t: &str| Config::from_text(t).expect("config");
-        let on = ApiSettings::from_config(&c(""), false).expect("nex");
+        let off = ApiSettings::from_config(&c(""), false).expect("nex");
+        assert!(!off.enabled, "off by default");
+        let on = ApiSettings::from_config(&c("[api]\nenabled = true\n"), false).expect("on");
         assert!(on.enabled);
         assert_eq!(on.prefix, "/api/v1");
         assert!(

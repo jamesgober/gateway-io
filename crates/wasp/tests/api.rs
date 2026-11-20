@@ -40,10 +40,16 @@ fn slash(p: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
+/// The site with the API turned on, unless `extra` has its own `[api]`.
 fn config(data: &Path, extra: &str) -> Config {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    let api = if extra.contains("[api]") {
+        ""
+    } else {
+        "[api]\nenabled = true\n"
+    };
     Config::from_text(&format!(
-        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{extra}",
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{api}{extra}",
         slash(&theme),
         slash(&data.join("nex")),
     ))
@@ -500,7 +506,7 @@ fn content_reads_and_errors_are_json() {
 #[test]
 fn the_api_moves_or_goes_with_its_settings() {
     let data = temp_dir("settings");
-    let conf = config(&data.0, "[api]\nprefix = \"/json\"\n");
+    let conf = config(&data.0, "[api]\nenabled = true\nprefix = \"/json\"\n");
     let (door, addr, _) = open(&conf, false);
     assert_eq!(call(addr, "GET", "/json/posts", &[], "").status, 200);
     let old = call(addr, "GET", "/api/v1/posts", &[], "");
@@ -510,7 +516,8 @@ fn the_api_moves_or_goes_with_its_settings() {
     drop(data);
 
     let data = temp_dir("off");
-    let conf = config(&data.0, "[api]\nenabled = false\n");
+    // Off by default: no `[api]` at all.
+    let conf = config(&data.0, "[api]\n");
     let (door, addr, _) = open(&conf, false);
     assert!(!call(addr, "GET", "/api/v1/posts", &[], "").is_json());
     let session = sign_in(addr);
@@ -547,7 +554,7 @@ fn the_api_moves_or_goes_with_its_settings() {
 #[test]
 fn each_account_has_one_budget_for_all_its_keys() {
     let data = temp_dir("budget");
-    let conf = config(&data.0, "[api]\nrate = 1\nburst = 2\n");
+    let conf = config(&data.0, "[api]\nenabled = true\nrate = 1\nburst = 2\n");
     let (door, addr, _) = open(&conf, true);
     let session = sign_in(addr);
     let a = make_key(addr, &session, "a", &[]);
