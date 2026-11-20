@@ -135,7 +135,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(unix)]
-    if std::env::var_os("PORT").is_some() {
+    if gateway_io::settings::behind_front_end() {
         stop_with_front_end(boot.foundation(), parent);
     }
 

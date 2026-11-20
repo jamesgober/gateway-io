@@ -1,6 +1,6 @@
 # Deploying behind Apache with Phusion Passenger (cPanel)
 
-The site runs as one process on a loopback port. Apache terminates TLS and passes requests through Passenger; the process trusts only that local front end for client addresses.
+The site runs as one process behind a small start shim, on a Unix socket only this account can use. Apache terminates TLS and passes requests through Passenger to the shim, and the shim passes them to wasp; wasp believes only the shim about client addresses.
 
 For the steps alone, in order, see [CPANEL.md](CPANEL.md).
 
@@ -37,7 +37,7 @@ CPANEL.md            the steps, in order
 service/             a systemd unit and a launchd job, for a server you run yourself
 ```
 
-`wasp.conf.example` is the configuration for a first site: nex-db for accounts and content in `data/nex`, two workers, and warnings only in the log. Copy it to `wasp.conf` and set `site.hosts` and `auth.admin`. A key wasp does not know stops it at boot, and with `PORT` set an empty `site.hosts` does too.
+`wasp.conf.example` is the configuration for a first site: nex-db for accounts and content in `data/nex`, two workers, and warnings only in the log. Copy it to `wasp.conf` and set `site.hosts` and `auth.admin`. A key wasp does not know stops it at boot, and behind the shim an empty `site.hosts` does too.
 
 Set `WASP_ADMIN_PASSWORD` in the application's environment, never in the file.
 
@@ -45,18 +45,18 @@ Set `WASP_ADMIN_PASSWORD` in the application's environment, never in the file.
 
 cPanel runs the site as a Node app ("Setup Node.js App", or "Application Manager" on some hosts), with `app.js` as the startup file and **Production** mode. The shim:
 
-- starts `./wasp` on a free loopback port with `PORT` set, so wasp listens on `127.0.0.1:$PORT` and trusts only loopback for `X-Forwarded-For` and `X-Forwarded-Proto`;
+- makes `run/` (mode 0700) and starts `./wasp` with `WASP_SOCKET=run/wasp.sock` (its full path), so wasp listens on that socket (mode 0600), closes any connection from another user before reading a byte, and believes only the shim for `X-Forwarded-For` and `X-Forwarded-Proto`. A socket's path is at most about 100 bytes: if the application folder is deep, set `WASP_SOCKET` in the environment to a shorter path in a folder only you can enter;
 - starts listening itself only once wasp accepts connections, so the request that wakes the app is answered by the site;
 - passes every request through, adding the client to `X-Forwarded-For`;
 - stops wasp cleanly when Passenger stops the app (after its idle time, on **Restart**, on `touch tmp/restart.txt`), and waits for it to exit.
 
 wasp also stops by itself when its standard input closes (when it is a pipe) or its parent process goes away, so it is never left running on its own. A start that overlaps the previous process's stop waits up to 15 s for the database to be free.
 
-On a server you manage yourself, Passenger can run wasp without the shim (a generic app whose start command is `./wasp`); Passenger closes its standard input to stop it. Without Passenger, let the service manager run it: `service/wasp.service` for systemd, `service/com.example.wasp.plist` for launchd (see "Start at boot" in the main README).
+On a server you manage yourself, Passenger can run wasp without the shim (a generic app whose start command is `./wasp`); Passenger closes its standard input to stop it. Passenger reaches a generic app on a loopback port only, so do that only on a server no other account can log in to. Without Passenger, let the service manager run it: `service/wasp.service` for systemd, `service/com.example.wasp.plist` for launchd (see "Start at boot" in the main README).
 
 Turn on **Force HTTPS Redirect** for the domain: signing in needs https, because the browser does not keep a `Secure` cookie on a plain http page.
 
-Requests must come through Apache, which sends `X-Forwarded-For`. A request straight to the local port names no client and is refused (`bouncer.door.proxy_hop` in the log), so point health checks at the public address.
+Requests must come through Apache, which sends `X-Forwarded-For`. A request that names no client is refused (`bouncer.door.proxy_hop` in the log), so point health checks at the public address.
 
 ## Content
 

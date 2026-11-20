@@ -37,7 +37,7 @@ DEPLOY.md            the background
 CPANEL.md            this checklist
 ```
 
-wasp makes the `data` folder (owner-only) on its first start.
+wasp makes the `data` folder (owner-only) on its first start, and the shim makes `run` (owner-only too). `run` holds `wasp.sock`, the socket the shim reaches wasp through. Only your account can open it, and wasp drops any connection from another user before reading a byte, so no one else on the server can pose as your site's front end. Leave `run` alone. If a file that is not a socket ends up at `run/wasp.sock`, or a socket of another user does, wasp refuses to start and says so in the log, and it never deletes it.
 
 ## 3. Write wasp.conf
 
@@ -78,7 +78,7 @@ Sign in at `https://<your domain>/sign-in`, then open `/admin` to write posts an
 
 ## 7. Check it
 
-Run these from your own computer, not the server. A request straight to wasp's local port names no client, so it is refused.
+Run these from your own computer, not the server. wasp listens on no port: only the shim reaches it, through `run/wasp.sock`.
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" https://<your domain>/ready
@@ -103,7 +103,7 @@ To see one line per request for a while, set `access_log = true` under `[gateway
 - **Restart:** use **Restart** on the application's page in cPanel.
 - **Update:**
   1. Stop the application.
-  2. Replace `wasp`, `app.js` and `themes/default` with the new bundle's. Keep `wasp.conf` and `data/`.
+  2. Replace `wasp`, `app.js` and `themes/default` with the new bundle's. Keep `wasp.conf` and `data/`. `run/` may stay; a socket left in it is replaced at the next start.
   3. Start it again.
 - **Back up:** copy the `data` folder while the application is stopped. Only one process may open the database at a time.
 - **A full disk:** when the account's quota fills, the database stops taking writes: sign-in and saves answer 503, and `/ready` answers 503. Free some space, then restart the application.
