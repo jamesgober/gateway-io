@@ -34,6 +34,7 @@ app.js               the start shim
 wasp.conf.example    the configuration to copy to wasp.conf
 DEPLOY.md            these notes
 CPANEL.md            the steps, in order
+service/             a systemd unit and a launchd job, for a server you run yourself
 ```
 
 `wasp.conf.example` is the configuration for a first site: nex-db for accounts and content in `data/nex`, two workers, and warnings only in the log. Copy it to `wasp.conf` and set `site.hosts` and `auth.admin`. A key wasp does not know stops it at boot, and with `PORT` set an empty `site.hosts` does too.
@@ -51,7 +52,7 @@ cPanel runs the site as a Node app ("Setup Node.js App", or "Application Manager
 
 wasp also stops by itself when its standard input closes (when it is a pipe) or its parent process goes away, so it is never left running on its own. A start that overlaps the previous process's stop waits up to 15 s for the database to be free.
 
-On a server you manage yourself, Passenger can run wasp without the shim (a generic app whose start command is `./wasp`); Passenger closes its standard input to stop it.
+On a server you manage yourself, Passenger can run wasp without the shim (a generic app whose start command is `./wasp`); Passenger closes its standard input to stop it. Without Passenger, let the service manager run it: `service/wasp.service` for systemd, `service/com.example.wasp.plist` for launchd (see "Start at boot" in the main README).
 
 Turn on **Force HTTPS Redirect** for the domain: signing in needs https, because the browser does not keep a `Secure` cookie on a plain http page.
 

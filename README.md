@@ -87,6 +87,38 @@ A custom admin theme (`admin.custom_theme`) now needs five more pages: `security
 
 A stop signal that was already ignored when wasp started stays ignored: SIGHUP under `nohup`, and SIGINT for a job a shell script started in the background with `&`. A script that stops wasp with `kill -INT` should send SIGTERM instead.
 
+### Start at boot
+
+On a server you run yourself, the service manager starts wasp at boot, restarts it after a crash, and stops it cleanly. `deploy/` has a file for each. On a cPanel host, Passenger starts it instead (see [deploy/CPANEL.md](deploy/CPANEL.md)).
+
+**Linux (systemd).** [deploy/systemd/wasp.service](deploy/systemd/wasp.service) runs wasp as its own user, with the binary and theme in `/opt/wasp`, the configuration in `/etc/wasp/wasp.conf` and the data in `/var/lib/wasp`. Its standard error goes to the journal.
+
+```bash
+sudo useradd --system --home-dir /var/lib/wasp --shell /usr/sbin/nologin wasp
+sudo mkdir -p /opt/wasp /etc/wasp
+sudo cp wasp /opt/wasp/ && sudo cp -R themes /opt/wasp/
+sudo cp wasp.conf.example /etc/wasp/wasp.conf      # then edit it: see below
+sudo chown root:wasp /etc/wasp/wasp.conf && sudo chmod 640 /etc/wasp/wasp.conf
+sudo cp deploy/systemd/wasp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wasp
+```
+
+In `/etc/wasp/wasp.conf`, name the folders in full: `theme = "/opt/wasp/themes/default"`, `nex.path = "/var/lib/wasp/nex"`, and `log.file = false` (the journal keeps the log). For the first start only, put `WASP_ADMIN_PASSWORD=...` in `/etc/wasp/wasp.env` (owned by root, mode 600), and delete the file once the boot account exists.
+
+wasp tells systemd when it is ready (`Type=notify`), so `systemctl start` returns once the site serves. Then:
+- `systemctl reload wasp` sends SIGHUP, which reloads the configuration;
+- `systemctl stop wasp` sends SIGTERM, which drains, then stops;
+- `journalctl -u wasp` shows the log.
+
+A crash restarts it after two seconds. A configuration it refuses (exit 78) or a folder others can read (exit 77) doesn't restart, since a restart can't fix either: `journalctl -u wasp` says why. systemd makes every folder wasp uses, private to the service. The unit also keeps wasp away from the rest of the system (read-only system folders, no home folders, no devices, no new privileges). To listen on port 80 or 443 without root, uncomment the two capability lines in the unit.
+
+**macOS (launchd).** [deploy/launchd/com.example.wasp.plist](deploy/launchd/com.example.wasp.plist) runs `/usr/local/wasp/wasp` with `WASP_CONFIG=/usr/local/wasp/wasp.conf`. Change the label to your own reverse domain name, and the paths to where wasp is.
+- **As a launch agent** (starts when you log in, runs as you), copy it to `~/Library/LaunchAgents/` and run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.wasp.plist`.
+- **As a launch daemon** (starts at boot, no login), add a `UserName` key with the account to run as, copy it to `/Library/LaunchDaemons/` (owned by root, mode 644), and run `sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.wasp.plist`.
+
+First make its log folder, private to the account: `mkdir -m 700 -p /usr/local/var/log/wasp`. launchd starts it again after a crash or a failed start (every 30 seconds while it keeps failing), and not after a clean stop.
+
 ## Edit content
 
 On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member`, `editor` and `admin` roles at every start. The editor's pages are never cached, and every form carries a CSRF token.
