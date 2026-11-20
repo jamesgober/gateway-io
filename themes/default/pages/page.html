@@ -2,6 +2,14 @@
 {% block content %}
 <article>
 <h1>{{ page.title }}</h1>
-{% if page.entry %}{{ page.entry.body }}{% else %}<p>{{ page.message }}</p>{% endif %}
+{% if page.entry %}{{ page.entry.body }}
+{%- if page.entry.fields %}
+<dl class="fields">
+{%- for f in page.entry.fields %}{% if f.value and f.value != "false" %}
+<dt>{{ f.label }}</dt><dd>{% if f.kind == "url" or f.kind == "media" %}<a href="{{ f.value }}">{{ f.value }}</a>{% elif f.kind == "bool" %}yes{% else %}{{ f.value }}{% endif %}</dd>
+{%- endif %}{% endfor %}
+</dl>
+{%- endif %}
+{% else %}<p>{{ page.message }}</p>{% endif %}
 </article>
 {% endblock %}

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use wasp_core::suite::config::Config;
 use wasp_core::{Provider, ProviderError};
 
 /// What kind of entry: it picks the default template.
@@ -53,6 +54,330 @@ pub struct Entry {
     /// The search and sharing fields, as the author set them (empty: the
     /// page head falls back to the title and summary).
     pub meta: Meta,
+    /// The declared custom fields of the entry's kind, in declaration order,
+    /// each with its checked value (empty when the entry has none).
+    pub fields: Arc<Vec<FieldValue>>,
+}
+
+/// One declared field's value on an entry (`page.entry.fields`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldValue {
+    /// The field's name.
+    pub name: String,
+    /// Its label.
+    pub label: String,
+    /// Its type (`text`, `textarea`, `url`, `number`, `bool`, `date`,
+    /// `select`, `media`).
+    pub kind: String,
+    /// The value, checked against the type (`true` or `false` for a
+    /// `bool`); empty when the entry has none.
+    pub value: String,
+}
+
+/// The kind of value a declared field holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldType {
+    /// One line of text.
+    Text,
+    /// Several lines of text.
+    Textarea,
+    /// A site path or an `http(s)://` address.
+    Url,
+    /// A decimal number.
+    Number,
+    /// Yes or no.
+    Bool,
+    /// A `YYYY-MM-DD` date.
+    Date,
+    /// One of the declared options.
+    Select,
+    /// The address of a file (a site path or an `http(s)://` address until
+    /// there is a media library).
+    Media,
+}
+
+impl FieldType {
+    /// The type's name, as declared.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldType::Text => "text",
+            FieldType::Textarea => "textarea",
+            FieldType::Url => "url",
+            FieldType::Number => "number",
+            FieldType::Bool => "bool",
+            FieldType::Date => "date",
+            FieldType::Select => "select",
+            FieldType::Media => "media",
+        }
+    }
+
+    fn parse(text: &str) -> Option<FieldType> {
+        Some(match text {
+            "text" => FieldType::Text,
+            "textarea" => FieldType::Textarea,
+            "url" => FieldType::Url,
+            "number" => FieldType::Number,
+            "bool" => FieldType::Bool,
+            "date" => FieldType::Date,
+            "select" => FieldType::Select,
+            "media" => FieldType::Media,
+            _ => return None,
+        })
+    }
+}
+
+/// One declared custom field (`[content.fields.<kind>.<name>]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldDecl {
+    /// The name: lower case letters, digits and `_`, starting with a letter.
+    pub name: String,
+    /// The label the editor shows.
+    pub label: String,
+    /// The kind of value.
+    pub kind: FieldType,
+    /// A save without a value is refused (for a `bool`: it must be checked).
+    pub required: bool,
+    /// A line of help under the field in the editor.
+    pub help: String,
+    /// The choices of a `select`.
+    pub options: Vec<String>,
+    /// Where the editor shows it (then by name).
+    pub order: i64,
+}
+
+/// Where a custom field's value is kept in a store record: its name with
+/// this prefix, so it never meets a built-in field.
+pub const FIELD_PREFIX: &str = "f_";
+
+/// The most fields declared for one kind.
+pub const MAX_FIELDS: usize = 32;
+
+/// The longest field name.
+pub const MAX_FIELD_NAME: usize = 32;
+
+/// The longest `text` value, in characters.
+pub const FIELD_TEXT_MAX: usize = 500;
+
+/// The longest `textarea` value, in characters.
+pub const FIELD_TEXTAREA_MAX: usize = 20_000;
+
+/// The most options a `select` declares.
+pub const MAX_OPTIONS: usize = 100;
+
+/// The custom fields declared for posts and pages.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fields {
+    post: Vec<FieldDecl>,
+    page: Vec<FieldDecl>,
+}
+
+impl Fields {
+    /// The fields `kind` declares, in the editor's order.
+    #[must_use]
+    pub fn of(&self, kind: Kind) -> &[FieldDecl] {
+        match kind {
+            Kind::Post => &self.post,
+            Kind::Page => &self.page,
+        }
+    }
+
+    /// The fields `[content.fields.post.*]` and `[content.fields.page.*]`
+    /// declare. A bad declaration is refused with its key.
+    pub fn from_config(config: &Config) -> Result<Fields, String> {
+        let e = |e: wasp_core::suite::Error| e.to_string();
+        if let Some(k) = config
+            .keys("content.fields")
+            .into_iter()
+            .find(|k| !matches!(*k, "post" | "page"))
+        {
+            return Err(format!(
+                "content.fields.{k}: fields are declared for `post` or `page`"
+            ));
+        }
+        let mut out = Fields::default();
+        for (kind, list) in [("post", &mut out.post), ("page", &mut out.page)] {
+            let names = config.keys(&format!("content.fields.{kind}"));
+            if names.len() > MAX_FIELDS {
+                return Err(format!(
+                    "content.fields.{kind}: at most {MAX_FIELDS} fields"
+                ));
+            }
+            for name in names {
+                let at = format!("content.fields.{kind}.{name}");
+                let ok = name.len() <= MAX_FIELD_NAME
+                    && name.starts_with(|c: char| c.is_ascii_lowercase())
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !ok {
+                    return Err(format!(
+                        "{at}: a field name is lower case letters, digits and `_`, starting with a letter, at most {MAX_FIELD_NAME} characters"
+                    ));
+                }
+                if let Some(k) = config.keys(&at).into_iter().find(|k| {
+                    !matches!(
+                        *k,
+                        "help" | "label" | "options" | "order" | "required" | "type"
+                    )
+                }) {
+                    return Err(format!(
+                        "unknown key `{at}.{k}`: the keys of a field are help, label, options, order, required, type"
+                    ));
+                }
+                // Every declaration says what it holds (the configuration
+                // reader drops an empty table, so a field always has a key).
+                let Some(type_name) = config.get::<String>(&format!("{at}.type")).map_err(e)?
+                else {
+                    return Err(format!("{at}.type is missing"));
+                };
+                let Some(field_type) = FieldType::parse(&type_name) else {
+                    return Err(format!(
+                        "{at}.type is `{type_name}`: text, textarea, url, number, bool, date, select, or media"
+                    ));
+                };
+                let options: Vec<String> = config
+                    .get_or(&format!("{at}.options"), Vec::new())
+                    .map_err(e)?;
+                if field_type == FieldType::Select {
+                    if options.is_empty() || options.len() > MAX_OPTIONS {
+                        return Err(format!(
+                            "{at}.options: a select needs 1 to {MAX_OPTIONS} options"
+                        ));
+                    }
+                    if let Some(o) = options.iter().find(|o| {
+                        o.trim().is_empty()
+                            || o.chars().count() > 100
+                            || o.chars().any(char::is_control)
+                    }) {
+                        return Err(format!(
+                            "{at}.options: `{o}` must be one line of 1 to 100 characters"
+                        ));
+                    }
+                } else if !options.is_empty() {
+                    return Err(format!("{at}.options: only a select has options"));
+                }
+                let label: String = config
+                    .get_or(&format!("{at}.label"), name.to_owned())
+                    .map_err(e)?;
+                let help: String = config
+                    .get_or(&format!("{at}.help"), String::new())
+                    .map_err(e)?;
+                list.push(FieldDecl {
+                    name: name.to_owned(),
+                    label,
+                    kind: field_type,
+                    required: config.get_or(&format!("{at}.required"), false).map_err(e)?,
+                    help,
+                    options,
+                    order: config.get_or(&format!("{at}.order"), 0_i64).map_err(e)?,
+                });
+            }
+            list.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+        }
+        Ok(out)
+    }
+}
+
+/// `value` for `decl`, checked and in the form it is kept: `Err` with the
+/// reason in words for the author.
+fn field_value(decl: &FieldDecl, value: &str) -> Result<String, String> {
+    let one_line = || value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let v = match decl.kind {
+        FieldType::Text => {
+            let v = one_line();
+            if v.chars().count() > FIELD_TEXT_MAX {
+                return Err(format!("is longer than {FIELD_TEXT_MAX} characters"));
+            }
+            v
+        }
+        FieldType::Textarea => {
+            let v = unix_newlines(value).trim().to_owned();
+            if v.chars().count() > FIELD_TEXTAREA_MAX {
+                return Err(format!("is longer than {FIELD_TEXTAREA_MAX} characters"));
+            }
+            if v.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                return Err("has a control character".to_owned());
+            }
+            v
+        }
+        FieldType::Url | FieldType::Media => {
+            let v = value.trim().to_owned();
+            if !v.is_empty() && !address_ok(&v) {
+                return Err(
+                    "must be a site path starting with `/`, or an `https://` or `http://` address, with no spaces"
+                        .to_owned(),
+                );
+            }
+            v
+        }
+        FieldType::Number => {
+            let v = value.trim().to_owned();
+            let digits = v.strip_prefix('-').unwrap_or(&v);
+            let (whole, fraction) = digits.split_once('.').unwrap_or((digits, "0"));
+            let ok = v.is_empty()
+                || (v.len() <= 32
+                    && !whole.is_empty()
+                    && !fraction.is_empty()
+                    && whole.bytes().all(|b| b.is_ascii_digit())
+                    && fraction.bytes().all(|b| b.is_ascii_digit()));
+            if !ok {
+                return Err("must be a number, like `12` or `-3.5`".to_owned());
+            }
+            v
+        }
+        FieldType::Bool => match value.trim() {
+            "" | "false" | "off" | "0" => "false".to_owned(),
+            "true" | "on" | "1" => "true".to_owned(),
+            _ => return Err("must be true or false".to_owned()),
+        },
+        FieldType::Date => {
+            let v = value.trim().to_owned();
+            if !v.is_empty() && !date_ok(&v) {
+                return Err("must be a date, YYYY-MM-DD".to_owned());
+            }
+            v
+        }
+        FieldType::Select => {
+            let v = value.trim().to_owned();
+            if !v.is_empty() && !decl.options.contains(&v) {
+                return Err(format!("must be one of: {}", decl.options.join(", ")));
+            }
+            v
+        }
+    };
+    if decl.kind != FieldType::Textarea && v.chars().any(char::is_control) {
+        return Err("has a control character".to_owned());
+    }
+    Ok(v)
+}
+
+/// `YYYY-MM-DD` with a month of 1 to 12 and a day that month can have.
+fn date_ok(v: &str) -> bool {
+    let b = v.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| v.get(r).and_then(|t| t.parse::<u32>().ok());
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
+        return false;
+    };
+    if !v
+        .bytes()
+        .enumerate()
+        .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&d)
 }
 
 /// An entry's search and sharing fields. Each is optional; the page head
@@ -260,6 +585,8 @@ pub struct Draft<'a> {
     pub date: &'a str,
     /// The search and sharing fields.
     pub meta: Meta,
+    /// The custom fields' values by name, as typed.
+    pub fields: Vec<(String, String)>,
 }
 
 /// Why a draft was refused (the editor sees it; nothing is saved).
@@ -304,6 +631,7 @@ impl From<Invalid> for SaveError {
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
     base: String,
+    fields: Arc<Fields>,
     entries: BTreeMap<String, Arc<Entry>>,
     posts: Arc<Vec<Arc<Entry>>>,
     store: Option<Arc<dyn ContentStore>>,
@@ -334,6 +662,9 @@ pub struct Stored {
     pub date: String,
     /// The search and sharing fields (missing in an older record: empty).
     pub meta: Meta,
+    /// The custom fields' values by name (without the store's prefix); a
+    /// field missing here is empty.
+    pub fields: Vec<(String, String)>,
 }
 
 /// What kind of failure a store reports, whatever the backend: a file, an
@@ -502,7 +833,7 @@ mod bison_store {
     use bison_db::{Db, DbOptions, Document, RecoveryMode, SyncPolicy, Value};
     use wasp_core::{Provider, ProviderError};
 
-    use super::{ContentStore, Meta, StoreError, StoreErrorKind, Stored};
+    use super::{ContentStore, FIELD_PREFIX, Meta, StoreError, StoreErrorKind, Stored};
 
     /// Content in a bison-db file: one document per entry, keyed by slug. Every
     /// write is synced to disk (content is written rarely and must survive a
@@ -660,6 +991,13 @@ mod bison_store {
                         *f = text(name);
                     }
                 }
+                let fields = doc
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.strip_prefix(FIELD_PREFIX)?;
+                        Some((name.to_owned(), v.as_str()?.to_owned()))
+                    })
+                    .collect();
                 out.push(Stored {
                     kind: text("kind"),
                     slug: text("slug"),
@@ -668,6 +1006,7 @@ mod bison_store {
                     body: text("body"),
                     date: text("date"),
                     meta,
+                    fields,
                 });
             }
             Ok(out)
@@ -691,6 +1030,9 @@ mod bison_store {
                 if !value.is_empty() {
                     doc.set(name, value);
                 }
+            }
+            for (name, value) in &entry.fields {
+                doc.set(format!("{FIELD_PREFIX}{name}").as_str(), value.as_str());
             }
             self.failing((|| {
                 let mut db = self
@@ -729,6 +1071,15 @@ mod bison_store {
     }
 }
 
+/// The draft's value for the field `name`, or empty.
+fn field_of<'d>(draft: &'d Draft<'_>, name: &str) -> &'d str {
+    draft
+        .fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .map_or("", |(_, v)| v.as_str())
+}
+
 /// Escapes text for HTML, once, at save time.
 fn escape_into(out: &mut String, text: &str) {
     for c in text.chars() {
@@ -760,10 +1111,30 @@ impl Manifest {
         }
     }
 
+    /// The same manifest, with these custom fields declared.
+    #[must_use]
+    pub fn with_fields(mut self, fields: Fields) -> Manifest {
+        self.fields = Arc::new(fields);
+        self
+    }
+
+    /// The custom fields declared.
+    #[must_use]
+    pub fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
     /// Validates and prepares a draft, then stores it (replacing an entry with
     /// the same slug) and rebuilds the post listing, newest first.
     pub fn save(&mut self, draft: &Draft<'_>) -> Result<(), SaveError> {
-        self.validate(draft)?;
+        self.save_checked(draft, false)
+    }
+
+    /// [`save`](Self::save), with `required` custom fields not checked when
+    /// `seed` (the sample content a first run gets knows no field the site
+    /// declares).
+    fn save_checked(&mut self, draft: &Draft<'_>, seed: bool) -> Result<(), SaveError> {
+        self.validate(draft, seed)?;
         let entry = Arc::new(self.prepare(draft));
         if let Some(store) = &self.store {
             // The author's text is what is stored; the HTML is made again
@@ -777,6 +1148,11 @@ impl Manifest {
                     body: draft.body.to_owned(),
                     date: entry.date.clone(),
                     meta: entry.meta.clone(),
+                    fields: entry
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.value.clone()))
+                        .collect(),
                 })
                 .map_err(SaveError::Store)?;
         }
@@ -785,8 +1161,10 @@ impl Manifest {
         Ok(())
     }
 
-    /// The rules a draft must meet, at save and at load.
-    fn validate(&self, draft: &Draft<'_>) -> Result<(), Invalid> {
+    /// The rules a draft must meet, at save and at load (`load`: a required
+    /// custom field may be empty, and a value nothing declares is passed
+    /// over).
+    fn validate(&self, draft: &Draft<'_>, load: bool) -> Result<(), Invalid> {
         let slug_ok = !draft.slug.is_empty()
             && draft
                 .slug
@@ -810,7 +1188,32 @@ impl Manifest {
         draft
             .meta
             .check()
-            .map_err(|e| Invalid(format!("`{}`: {}", draft.slug, e.0)))
+            .map_err(|e| Invalid(format!("`{}`: {}", draft.slug, e.0)))?;
+        let declared = self.fields.of(draft.kind);
+        if !load
+            && let Some((name, _)) = draft
+                .fields
+                .iter()
+                .find(|(n, _)| !declared.iter().any(|d| d.name == *n))
+        {
+            return Err(Invalid(format!(
+                "`{}`: no field `{name}` is declared for a {}",
+                draft.slug,
+                draft.kind.as_str()
+            )));
+        }
+        for decl in declared {
+            let value = field_of(draft, &decl.name);
+            let v = field_value(decl, value)
+                .map_err(|why| Invalid(format!("`{}`: {} {why}", draft.slug, decl.label)))?;
+            if !load && decl.required && (v.is_empty() || v == "false") {
+                return Err(Invalid(format!(
+                    "`{}`: {} is required",
+                    draft.slug, decl.label
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// A draft that passed validation, prepared: the body escaped and split
@@ -838,6 +1241,19 @@ impl Manifest {
             date: draft.date.to_owned(),
             text: text.into_owned(),
             meta: draft.meta.cleaned(),
+            fields: Arc::new(
+                self.fields
+                    .of(draft.kind)
+                    .iter()
+                    .map(|d| FieldValue {
+                        name: d.name.clone(),
+                        label: d.label.clone(),
+                        kind: d.kind.as_str().to_owned(),
+                        // Checked by `validate` already.
+                        value: field_value(d, field_of(draft, &d.name)).unwrap_or_default(),
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -861,7 +1277,18 @@ impl Manifest {
         base: &str,
         seed: bool,
     ) -> Result<Manifest, StoreError> {
-        let mut m = Manifest::with_base(base);
+        Manifest::open_with(store, base, seed, Fields::default())
+    }
+
+    /// [`open`](Self::open), with these custom fields declared: every
+    /// stored value is checked against its field's type.
+    pub fn open_with(
+        store: Arc<dyn ContentStore>,
+        base: &str,
+        seed: bool,
+        fields: Fields,
+    ) -> Result<Manifest, StoreError> {
+        let mut m = Manifest::with_base(base).with_fields(fields);
         let stored = store.load()?;
         for s in &stored {
             // The same rules and preparation as a save: what any writer put
@@ -885,8 +1312,10 @@ impl Manifest {
                 body: &s.body,
                 date: &s.date,
                 meta: s.meta.clone(),
+                fields: s.fields.clone(),
             };
-            m.validate(&draft).map_err(|e| StoreError::invalid(e.0))?;
+            m.validate(&draft, true)
+                .map_err(|e| StoreError::invalid(e.0))?;
             let entry = Arc::new(m.prepare(&draft));
             m.entries.insert(entry.slug.clone(), entry);
         }
@@ -895,7 +1324,7 @@ impl Manifest {
         m.store = Some(store);
         if stored.is_empty() && seed {
             for d in &sample_drafts() {
-                m.save(d).map_err(|e| match e {
+                m.save_checked(d, true).map_err(|e| match e {
                     SaveError::Store(e) => e,
                     SaveError::Invalid(e) => StoreError::invalid(e.0),
                 })?;
@@ -1101,6 +1530,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             body: "This page came in through the gateway, was identified by the core, routed by the web service, and rendered by the theme.\n\nEvery value on it was read through a view, never through JSON.",
             date: "2026-11-08",
             meta: Meta::default(),
+            fields: Vec::new(),
         },
         Draft {
             kind: Kind::Post,
@@ -1110,6 +1540,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             body: "Every request carries one from the pool to the reply, and back, wiped.",
             date: "2026-11-09",
             meta: Meta::default(),
+            fields: Vec::new(),
         },
         Draft {
             kind: Kind::Post,
@@ -1119,6 +1550,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             body: "<b>Not bold.</b> & not a tag either.",
             date: "2026-11-10",
             meta: Meta::default(),
+            fields: Vec::new(),
         },
         Draft {
             kind: Kind::Page,
@@ -1128,6 +1560,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             body: "A site in memory, themed from a folder, on the platform's walking skeleton.",
             date: "",
             meta: Meta::default(),
+            fields: Vec::new(),
         },
     ]
 }
@@ -1144,6 +1577,140 @@ fn unix_newlines(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fields(text: &str) -> Result<Fields, String> {
+        Fields::from_config(&Config::from_text(text).expect("toml"))
+    }
+
+    #[test]
+    fn field_declarations_are_checked() {
+        for (text, says) in [
+            (
+                "[content.fields.post.Author]\ntype = \"text\"\n",
+                "lower case",
+            ),
+            (
+                "[content.fields.post.author]\ntype = \"colour\"\n",
+                "text, textarea",
+            ),
+            (
+                "[content.fields.post.size]\ntype = \"select\"\n",
+                "1 to 100 options",
+            ),
+            (
+                "[content.fields.post.size]\ntype = \"text\"\noptions = [\"a\"]\n",
+                "only a select",
+            ),
+            (
+                "[content.fields.post.size]\nlable = \"Size\"\n",
+                "unknown key",
+            ),
+            (
+                "[content.fields.post.size]\nlabel = \"Size\"\n",
+                "type is missing",
+            ),
+            (
+                "[content.fields.event.size]\ntype = \"text\"\n",
+                "`post` or `page`",
+            ),
+        ] {
+            let e = fields(text).expect_err(text);
+            assert!(e.contains(says), "{text}: {e}");
+        }
+        let f = fields(
+            "[content.fields.post.zeta]\ntype = \"text\"\norder = 1\n[content.fields.post.alpha]\ntype = \"text\"\norder = 2\n[content.fields.post.beta]\ntype = \"text\"\norder = 1\n",
+        )
+        .expect("fields");
+        let names: Vec<&str> = f.of(Kind::Post).iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["beta", "zeta", "alpha"], "by order, then name");
+        assert!(f.of(Kind::Page).is_empty());
+    }
+
+    #[test]
+    fn field_values_are_checked_by_type() {
+        let decl = |kind| FieldDecl {
+            name: "f".into(),
+            label: "F".into(),
+            kind,
+            required: false,
+            help: String::new(),
+            options: vec!["small".into(), "large".into()],
+            order: 0,
+        };
+        let ok = |kind, v: &str| field_value(&decl(kind), v);
+        assert_eq!(ok(FieldType::Text, "  a\r\n b ").as_deref(), Ok("a b"));
+        assert_eq!(ok(FieldType::Textarea, "a\r\nb").as_deref(), Ok("a\nb"));
+        assert!(ok(FieldType::Url, "javascript:alert(1)").is_err());
+        assert_eq!(
+            ok(FieldType::Media, "/static/a.png").as_deref(),
+            Ok("/static/a.png")
+        );
+        assert_eq!(ok(FieldType::Number, "-3.5").as_deref(), Ok("-3.5"));
+        for bad in ["1e5", "3.", ".5", "12a", "--1"] {
+            assert!(ok(FieldType::Number, bad).is_err(), "{bad}");
+        }
+        assert_eq!(ok(FieldType::Bool, "on").as_deref(), Ok("true"));
+        assert_eq!(ok(FieldType::Bool, "").as_deref(), Ok("false"));
+        assert!(ok(FieldType::Bool, "maybe").is_err());
+        assert_eq!(
+            ok(FieldType::Date, "2024-02-29").as_deref(),
+            Ok("2024-02-29")
+        );
+        for bad in ["2023-02-29", "2026-13-01", "2026-1-01", "20260101"] {
+            assert!(ok(FieldType::Date, bad).is_err(), "{bad}");
+        }
+        assert_eq!(ok(FieldType::Select, "large").as_deref(), Ok("large"));
+        assert!(ok(FieldType::Select, "huge").is_err());
+        assert!(ok(FieldType::Text, &"x".repeat(FIELD_TEXT_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn required_is_checked_at_save_and_types_at_load() {
+        let declared = fields("[content.fields.post.price]\ntype = \"number\"\nrequired = true\n")
+            .expect("fields");
+        let draft = |fields: Vec<(String, String)>| Draft {
+            kind: Kind::Post,
+            slug: "p",
+            title: "P",
+            summary: "",
+            body: "x",
+            date: "2026-11-20",
+            meta: Meta::default(),
+            fields,
+        };
+        let mut m = Manifest::new().with_fields(declared.clone());
+        let e = m.save(&draft(Vec::new())).expect_err("required");
+        assert!(e.to_string().contains("price is required"), "{e}");
+        let e = m
+            .save(&draft(vec![("colour".into(), "red".into())]))
+            .expect_err("undeclared");
+        assert!(e.to_string().contains("no field `colour`"), "{e}");
+        m.save(&draft(vec![("price".into(), "12.50".into())]))
+            .expect("saved");
+        let e = m.get(Kind::Post, "p").expect("entry");
+        assert_eq!(e.fields[0].value, "12.50");
+        assert_eq!(e.fields[0].kind, "number");
+
+        // At load an empty required field passes; a value its type no
+        // longer allows does not.
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+        let stored = |value: &str| Stored {
+            kind: "post".into(),
+            slug: "p".into(),
+            title: "P".into(),
+            summary: String::new(),
+            body: "x".into(),
+            date: "2026-11-20".into(),
+            meta: Meta::default(),
+            fields: vec![("price".into(), value.into())],
+        };
+        store.put(&stored("")).expect("put");
+        Manifest::open_with(store.clone(), "", false, declared.clone())
+            .expect("an empty required field loads");
+        store.put(&stored("cheap")).expect("put");
+        let e = Manifest::open_with(store, "", false, declared).expect_err("not a number");
+        assert!(e.message.contains("price must be a number"), "{e:?}");
+    }
 
     #[test]
     fn meta_fields_are_cleaned_and_checked() {
@@ -1212,6 +1779,7 @@ mod tests {
             body: "First line\r\nstill first.\r\n\r\nSecond.\r\rThird, from an old Mac.",
             date: "2026-11-19",
             meta: Meta::default(),
+            fields: Vec::new(),
         })
         .expect("save");
         let e = m.get(Kind::Post, "crlf").expect("entry");
@@ -1256,6 +1824,7 @@ mod tests {
                 body: "A <b>body</b>.",
                 date: "2026-11-11",
                 meta: Meta::default(),
+                fields: Vec::new(),
             })
             .expect("save");
             assert!(m.remove("hello-world").expect("remove"));
@@ -1306,6 +1875,7 @@ mod tests {
             body: "Write to us.",
             date: "",
             meta: Meta::default(),
+            fields: Vec::new(),
         };
         content.save(&draft, None).expect("new");
         assert!(before.find("contact").is_none(), "a snapshot never changes");
@@ -1346,6 +1916,7 @@ mod tests {
             body: "",
             date: "2026-11-10",
             meta: Meta::default(),
+            fields: Vec::new(),
         };
         assert!(m.save(&bad).is_err());
         assert!(
@@ -1382,6 +1953,7 @@ mod tests {
                     body: body.into(),
                     date: "2026-11-11".into(),
                     meta: Meta::default(),
+                    fields: Vec::new(),
                 })
                 .expect("put");
         };

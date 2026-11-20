@@ -120,6 +120,7 @@ mod bison {
                         robots: "noindex".into(),
                         ..wasp::content::Meta::default()
                     },
+                    fields: vec![("author".into(), "Ann".into())],
                 })
                 .expect("put");
         }
@@ -141,7 +142,11 @@ mod bison {
         );
         door.close(Duration::from_secs(5));
         let store = reopen(&dir.0.join("content.bison"));
-        assert_eq!(store.load().expect("load").len(), 5);
+        let all = store.load().expect("load");
+        assert_eq!(all.len(), 5);
+        // A field nothing declares here is kept by the store, not shown.
+        let kept = all.iter().find(|s| s.slug == "kept").expect("kept");
+        assert_eq!(kept.fields, [("author".to_owned(), "Ann".to_owned())]);
     }
 
     /// Opens the store a closed door held: the transport's threads let go
@@ -186,6 +191,7 @@ mod bison {
                         body: "x".repeat(200),
                         date: "2026-11-12".into(),
                         meta: wasp::content::Meta::default(),
+                        fields: Vec::new(),
                     })
                     .expect("put");
             }

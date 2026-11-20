@@ -17,6 +17,11 @@ theme = "themes/default"
 [content]
 store = "nex"
 
+# Fields of your own for posts or pages (the README's "Custom fields"):
+# [content.fields.post.author]
+# type = "text"
+# label = "Author"
+
 [auth]
 store = "nex"
 # CHANGE: the email you sign in with. Its password comes from the

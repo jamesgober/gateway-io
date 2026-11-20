@@ -645,6 +645,7 @@ mod tests {
                 body: "Text.",
                 date: "",
                 meta,
+                fields: Vec::new(),
             })
             .expect("save");
         let entry = manifest.get(Kind::Page, "about").expect("entry");
