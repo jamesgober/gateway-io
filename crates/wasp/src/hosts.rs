@@ -13,7 +13,8 @@
 //! name = "The Blog"           # default: site.name
 //! theme = "themes/blog"       # default: site.theme
 //! content = "blog"            # the content site; default: the profile's name
-//! realm = "shared"            # accounts and sessions: the default realm
+//! realm = "blog"              # accounts and sessions of its own ("shared": the default)
+//! admin = "you@example.com"   # its realm's boot account (password: WASP_ADMIN_PASSWORD)
 //!
 //! [host.blog.errors.404]      # falls back to [errors.*]
 //! message = "No such post."
@@ -48,8 +49,12 @@ pub struct HostProfile {
     pub theme: Option<PathBuf>,
     /// The content site.
     pub content: String,
-    /// The accounts realm (`shared`).
+    /// The accounts realm: `shared` (nex-db's default, with `auth.admin`),
+    /// or a realm of its own, whose accounts and sessions no other realm
+    /// sees.
     pub realm: String,
+    /// The boot account of a realm of its own.
+    pub admin: Option<String>,
 }
 
 /// Every profile, and the default one.
@@ -62,7 +67,7 @@ pub struct HostProfiles {
 }
 
 const PROFILE_KEYS: &[&str] = &[
-    "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
+    "admin", "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
 ];
 
 /// `host` as profiles compare it: lower case, without a port or a trailing
@@ -166,9 +171,21 @@ impl HostProfiles {
             let realm: String = config
                 .get_or(&format!("{at}.realm"), "shared".to_owned())
                 .map_err(e)?;
-            if realm != "shared" {
+            let realm_ok = realm == "shared"
+                || (realm.len() <= 32
+                    && realm.starts_with(|c: char| c.is_ascii_lowercase())
+                    && realm
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+            if !realm_ok || realm == "users" {
                 return Err(format!(
-                    "{at}.realm is `{realm}`: only `shared` (the site's one realm) for now"
+                    "{at}.realm is `{realm}`: `shared`, or a name of lower case letters, digits and `_` (not `users`)"
+                ));
+            }
+            let admin: Option<String> = config.get(&format!("{at}.admin")).map_err(e)?;
+            if admin.is_some() && realm == "shared" {
+                return Err(format!(
+                    "{at}.admin is for a realm of its own; the shared realm's boot account is auth.admin"
                 ));
             }
             let content: String = config
@@ -187,6 +204,7 @@ impl HostProfiles {
                 theme: config.get(&format!("{at}.theme")).map_err(e)?,
                 content,
                 realm,
+                admin,
             });
         }
         let default = match config.get::<String>("host.default").map_err(e)? {
@@ -223,6 +241,46 @@ impl HostProfiles {
             }
         }
         best.map(|(i, _)| i).or(self.default)
+    }
+}
+
+/// The core's authenticator with host profiles that have realms of their
+/// own: each request is authenticated by its profile's realm, so a session
+/// of one realm is no one on another profile. A host no profile names is a
+/// guest (the router answers it 421, or the default profile, whose realm
+/// then decides).
+pub struct HostAuth {
+    profiles: HostProfiles,
+    realms: Vec<std::sync::Arc<dyn wasp_core::Authenticator>>,
+}
+
+impl HostAuth {
+    /// One authenticator per profile, in the profiles' order.
+    #[must_use]
+    pub fn new(
+        profiles: HostProfiles,
+        realms: Vec<std::sync::Arc<dyn wasp_core::Authenticator>>,
+    ) -> HostAuth {
+        HostAuth { profiles, realms }
+    }
+}
+
+impl wasp_core::Authenticator for HostAuth {
+    fn authenticate(
+        &self,
+        request: wasp_core::RequestView<'_>,
+        profile: &wasp_core::Profile,
+        out: &mut wasp_core::AuthOut,
+    ) -> wasp_core::Authentication {
+        let host = request
+            .head()
+            .header("host")
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .unwrap_or("");
+        match self.profiles.pick(host).and_then(|i| self.realms.get(i)) {
+            Some(realm) => realm.authenticate(request, profile, out),
+            None => wasp_core::Authentication::Identified(wasp_core::Identity::guest()),
+        }
     }
 }
 
@@ -324,8 +382,16 @@ mod tests {
             ("[host.a]\nhosts = [\"bad host\"]\n", "not a host name"),
             ("[host.a]\nhost = [\"x.com\"]\n", "unknown key"),
             (
-                "[host.a]\nhosts = [\"x.com\"]\nrealm = \"own\"\n",
-                "only `shared`",
+                "[host.a]\nhosts = [\"x.com\"]\nrealm = \"Own\"\n",
+                "lower case",
+            ),
+            (
+                "[host.a]\nhosts = [\"x.com\"]\nrealm = \"users\"\n",
+                "not `users`",
+            ),
+            (
+                "[host.a]\nhosts = [\"x.com\"]\nadmin = \"a@x.com\"\n",
+                "realm of its own",
             ),
             ("[host]\ndefault = \"a\"\n", "no [host.<name>]"),
             (

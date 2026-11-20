@@ -299,6 +299,36 @@ fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
     ]
 }
 
+/// Makes the boot account `admin` in `auth`'s realm with the password from
+/// the environment, when there is none yet, and gives it back any of its
+/// roles it lacks. `key` names the setting in a refusal.
+#[cfg(feature = "store-nex")]
+fn boot_account(
+    auth: &nex::NexAuth,
+    admin: &str,
+    password: Option<&str>,
+    key: &str,
+) -> Result<(), String> {
+    let roles = [nex::MEMBER_ROLE, nex::EDITOR_ROLE, nex::ADMIN_ROLE];
+    // The password is needed only to make the account: once it exists, a
+    // boot without it starts as usual.
+    match password {
+        Some(password) => {
+            auth.ensure_account(admin, password, &roles)
+                .map_err(|e| e.to_string())?;
+        }
+        None if auth
+            .ensure_roles(admin, &roles)
+            .map_err(|e| e.to_string())? => {}
+        None => {
+            return Err(format!(
+                "{key} `{admin}` has no account yet: put its password in {ADMIN_PASSWORD_ENV} for the start that makes it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The gates the site signs in through.
 #[derive(Clone)]
 enum Gates {
@@ -509,6 +539,10 @@ fn wire_with(
     let auth_policy: Option<policy::PolicyReload>;
     #[cfg(feature = "store-nex")]
     let boot: Option<String>;
+    // One authenticator per host profile, when a profile has a realm of its
+    // own (empty otherwise).
+    #[cfg(feature = "store-nex")]
+    let nex_realms: Vec<nex::NexAuth>;
     let (builder, gates): (wasp_core::CoreBuilder, Gates) = match auth_store.as_str() {
         #[cfg(feature = "gatekeeper")]
         "gatekeeper" => {
@@ -516,6 +550,16 @@ fn wire_with(
             #[cfg(feature = "store-nex")]
             {
                 boot = None;
+                nex_realms = Vec::new();
+            }
+            if profiles
+                .as_ref()
+                .is_some_and(|p| p.profiles.iter().any(|x| x.realm != "shared"))
+            {
+                return Err(
+                    "a host profile's realm of its own needs nex-db accounts: set auth.store = \"nex\""
+                        .to_owned(),
+                );
             }
             if policy::any_set(config) {
                 return Err(
@@ -539,41 +583,73 @@ fn wire_with(
                 cfg!(feature = "mfa"),
             )?);
             let a = nex::NexAuth::new(db.clone()).with_policy(cell.clone());
-            a.apply_lockout().map_err(|e| e.to_string())?;
-            let applied = a.clone();
+            // A host profile with a realm of its own signs in there: one
+            // authenticator per profile, picked by host in the core.
+            nex_realms = match &profiles {
+                Some(p) if p.profiles.iter().any(|x| x.realm != "shared") => p
+                    .profiles
+                    .iter()
+                    .map(|x| {
+                        let realm = if x.realm == "shared" {
+                            nex::DEFAULT_REALM
+                        } else {
+                            x.realm.as_str()
+                        };
+                        a.clone().in_realm(realm)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?,
+                _ => Vec::new(),
+            };
+            let every: Vec<nex::NexAuth> = std::iter::once(a.clone())
+                .chain(nex_realms.iter().cloned())
+                .collect();
+            for auth in &every {
+                auth.apply_lockout().map_err(|e| e.to_string())?;
+            }
             auth_policy = Some(policy::PolicyReload::new(
                 cell,
                 cfg!(feature = "mfa"),
                 move |_| {
-                    if let Err(e) = applied.apply_lockout() {
-                        events::warn(format!("the new lockout settings were not written: {e}"));
+                    for auth in &every {
+                        if let Err(e) = auth.apply_lockout() {
+                            events::warn(format!(
+                                "the new lockout settings were not written to realm {}: {e}",
+                                auth.realm()
+                            ));
+                        }
                     }
                 },
             ));
             let admin: Option<String> = config.get("auth.admin").map_err(|e| e.to_string())?;
             boot = admin.clone();
-            if let Some(admin) = admin {
-                let roles = [nex::MEMBER_ROLE, nex::EDITOR_ROLE, nex::ADMIN_ROLE];
-                // The password is needed only to make the account: once it
-                // exists, a boot without it starts as usual (and gives back
-                // any of its roles it lacks).
-                match admin_password {
-                    Some(password) => {
-                        a.ensure_account(&admin, password, &roles)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    None if a.ensure_roles(&admin, &roles).map_err(|e| e.to_string())? => {}
-                    None => {
-                        return Err(format!(
-                            "auth.admin `{admin}` has no account yet: put its password in {ADMIN_PASSWORD_ENV} for the start that makes it"
-                        ));
+            if let Some(admin) = &admin {
+                boot_account(&a, admin, admin_password, "auth.admin")?;
+            }
+            if let Some(p) = &profiles {
+                for (x, auth) in p.profiles.iter().zip(&nex_realms) {
+                    if let Some(admin) = &x.admin {
+                        boot_account(
+                            auth,
+                            admin,
+                            admin_password,
+                            &format!("host.{}.admin", x.name),
+                        )?;
                     }
                 }
             }
-            (
-                builder.authenticator(a.clone()).provider(Arc::new(db)),
-                Gates::Nex(a),
-            )
+            let builder = if nex_realms.is_empty() {
+                builder.authenticator(a.clone())
+            } else {
+                builder.authenticator(hosts::HostAuth::new(
+                    profiles.clone().ok_or("host profiles")?,
+                    nex_realms
+                        .iter()
+                        .map(|r| Arc::new(r.clone()) as Arc<dyn wasp_core::Authenticator>)
+                        .collect(),
+                ))
+            };
+            (builder.provider(Arc::new(db)), Gates::Nex(a))
         }
         #[cfg(not(feature = "store-nex"))]
         "nex" => return Err(NO_NEX.to_owned()),
@@ -633,8 +709,8 @@ fn wire_with(
     // One site per host profile, or the one site `[site]` describes: its
     // settings, its content site, and its own `[host.<name>.errors]` table
     // when it has one.
-    let plans: Vec<(site::SiteSettings, String, Option<String>)> = match &profiles {
-        None => vec![(settings.clone(), DEFAULT_CONTENT.to_owned(), None)],
+    let plans: Vec<(site::SiteSettings, String, Option<String>, Option<String>)> = match &profiles {
+        None => vec![(settings.clone(), DEFAULT_CONTENT.to_owned(), None, None)],
         Some(p) => p
             .profiles
             .iter()
@@ -655,6 +731,7 @@ fn wire_with(
                     s,
                     x.content.clone(),
                     Some(format!("host.{}.errors", x.name)),
+                    x.admin.clone(),
                 )
             })
             .collect(),
@@ -662,7 +739,9 @@ fn wire_with(
     let mut sites: Vec<Box<dyn gateway_io::WebService>> = Vec::new();
     let mut watchers = Vec::new();
     let mut renders = None;
-    for (s, label, own_errors) in plans {
+    for (i, (s, label, own_errors, own_admin)) in plans.into_iter().enumerate() {
+        #[cfg(not(feature = "store-nex"))]
+        let _ = (i, &own_admin);
         let store = stores
             .iter()
             .find(|(l, _)| *l == label)
@@ -702,15 +781,24 @@ fn wire_with(
             #[cfg(feature = "gatekeeper")]
             Gates::Keeper(gk) => Box::new(site::build(gk, manifest, engine, &s, ready)?),
             #[cfg(feature = "store-nex")]
-            Gates::Nex(a) => Box::new(site_nex::build(
-                a,
-                core.access().clone(),
-                manifest,
-                engine,
-                &s,
-                site_keys(config, secret_dir, boot.clone())?,
-                ready,
-            )?),
+            Gates::Nex(a) => {
+                // The profile's realm, and its boot account when it has one
+                // of its own.
+                let realm = nex_realms.get(i).cloned();
+                let own = realm
+                    .as_ref()
+                    .is_some_and(|r| r.realm() != nex::DEFAULT_REALM);
+                let boot = if own { own_admin } else { boot.clone() };
+                Box::new(site_nex::build(
+                    realm.unwrap_or(a),
+                    core.access().clone(),
+                    manifest,
+                    engine,
+                    &s,
+                    site_keys(config, secret_dir, boot)?,
+                    ready,
+                )?)
+            }
         };
         sites.push(site);
     }

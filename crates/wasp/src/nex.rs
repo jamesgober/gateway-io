@@ -44,6 +44,9 @@ const SITE: &str = nex_db::DEFAULT_SITE;
 /// administrator list accounts.
 const DIRECTORY: &str = "wasp-accounts";
 
+/// nex-db's default realm.
+pub const DEFAULT_REALM: &str = "users";
+
 /// The directory's entity type.
 const DIRECTORY_KIND: &str = "account";
 
@@ -492,6 +495,11 @@ pub struct NexAuth {
     checked: Arc<Checked>,
     policy: PolicyCell,
     failures: Arc<accounts::Failures>,
+    /// The realm its accounts and sessions are in (`users`, nex-db's
+    /// default, or a host profile's own).
+    realm: Arc<str>,
+    /// The realm's account directory (a content site of its own).
+    directory: Arc<str>,
     /// Sessions are issued under their account's stripe, so the new one is
     /// told apart from the others exactly (see `open_session`).
     issuing: Arc<[std::sync::Mutex<()>; 64]>,
@@ -572,7 +580,44 @@ impl NexAuth {
             checked: Arc::default(),
             policy: PolicyCell::default(),
             failures: Arc::default(),
+            realm: Arc::from(DEFAULT_REALM),
+            directory: Arc::from(DIRECTORY),
             issuing: Arc::new(std::array::from_fn(|_| std::sync::Mutex::new(()))),
+        }
+    }
+
+    /// The same authenticator over the realm `name` (made when it is not
+    /// there yet): its own accounts, sessions, keys and account directory,
+    /// apart from every other realm's. `users` is nex-db's default realm.
+    pub fn in_realm(mut self, name: &str) -> Result<NexAuth, StoreError> {
+        if name != DEFAULT_REALM {
+            match self.db.db().define_realm(name, nex_db::RealmPolicy::new()) {
+                Ok(()) | Err(nex_db::Error::AlreadyExists { .. }) => {}
+                Err(e) => return Err(nex(e)),
+            }
+            self.directory = Arc::from(format!("{DIRECTORY}-{name}"));
+        } else {
+            self.directory = Arc::from(DIRECTORY);
+        }
+        self.realm = Arc::from(name);
+        // Every call goes through `auth`, which fails rather than fall back
+        // to another realm.
+        let _ = self.auth()?;
+        Ok(self)
+    }
+
+    /// The realm's name.
+    #[must_use]
+    pub fn realm(&self) -> &str {
+        &self.realm
+    }
+
+    /// The realm's auth engine.
+    fn auth(&self) -> Result<nex_db::Auth<'_>, StoreError> {
+        if &*self.realm == DEFAULT_REALM {
+            Ok(self.db.db().auth())
+        } else {
+            self.db.db().auth_realm(&self.realm).map_err(nex)
         }
     }
 
@@ -596,7 +641,7 @@ impl NexAuth {
         self.db
             .db()
             .set_realm_policy(
-                "users",
+                &self.realm,
                 nex_db::RealmPolicy::new().lockout(l.attempts, l.window, l.duration),
             )
             .map_err(nex)
@@ -604,7 +649,7 @@ impl NexAuth {
 
     /// The permission bits the account's roles grant, and the roles' names.
     fn roles_of(&self, account: nex_db::AccountId) -> Result<(PermSet, Vec<String>), StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let mut bits = 0u64;
         let mut names = Vec::new();
         for id in auth.roles(account).map_err(nex)? {
@@ -628,7 +673,7 @@ impl NexAuth {
 
     /// The role ids for `roles`, defined when missing.
     fn role_ids(&self, roles: &[&str]) -> Result<Vec<nex_db::RoleId>, StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let mut ids = Vec::with_capacity(roles.len());
         for role in roles {
             ids.push(match auth.role_named(role) {
@@ -641,7 +686,7 @@ impl NexAuth {
 
     /// Gives `account` every role in `ids` it lacks.
     fn grant(&self, account: nex_db::AccountId, ids: &[nex_db::RoleId]) -> Result<(), StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let held = auth.roles(account).map_err(nex)?;
         if ids.iter().any(|id| !held.contains(id)) {
             let mut all = held;
@@ -672,7 +717,7 @@ impl NexAuth {
             self.grant(account_of(user), &ids)?;
             return Ok(None);
         }
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let verified = |auth: &nex_db::Auth<'_>| match auth.verify_password(identifier, password) {
             Ok(PasswordCheck::Verified(a) | PasswordCheck::NeedsSecondFactor { account: a }) => {
                 Some(a)
@@ -721,11 +766,15 @@ impl NexAuth {
     fn record(&self, identifier: &str, account: nex_db::AccountId) -> Result<(), StoreError> {
         let content = self.db.db().content();
         let path = format!("/{}", hex_of(account));
-        if content.resolve(DIRECTORY, &path).map_err(nex)?.is_some() {
+        if content
+            .resolve(&self.directory, &path)
+            .map_err(nex)?
+            .is_some()
+        {
             return Ok(());
         }
         let entity = Entity::new(DIRECTORY_KIND)
-            .site(DIRECTORY)
+            .site(self.directory.as_ref())
             .path(path)
             .field("identifier", identifier.trim().to_lowercase());
         match content.put(entity) {
@@ -739,10 +788,14 @@ impl NexAuth {
     /// identifier.
     pub fn accounts(&self) -> Result<Vec<(String, UserId)>, StoreError> {
         let content = self.db.db().content();
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let mut out = Vec::new();
         let mut page = content
-            .list(&Listing::latest(DIRECTORY_KIND).site(DIRECTORY).limit(1000))
+            .list(
+                &Listing::latest(DIRECTORY_KIND)
+                    .site(self.directory.as_ref())
+                    .limit(1000),
+            )
             .map_err(nex)?;
         loop {
             for e in page.items() {
@@ -806,7 +859,7 @@ impl NexAuth {
         identifier: &str,
         password: &str,
     ) -> Result<PasswordStep, StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         match auth.verify_password(identifier, password).map_err(nex)? {
             PasswordCheck::Verified(account) => {
                 // An account made before the directory, or by another tool,
@@ -846,7 +899,7 @@ impl NexAuth {
             .recheck_after(policy.recheck)
             .payload(&perms.0.to_le_bytes())
             .map_err(nex)?;
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let stripe = usize::try_from(user.0 % 64).unwrap_or(0);
         let _issuing = self.issuing[stripe]
             .lock()
@@ -899,7 +952,7 @@ impl NexAuth {
 
     /// Ends the session `token` names; the cookie value that clears it.
     pub fn sign_out(&self, token: &str) -> Result<String, StoreError> {
-        let _ = self.db.db().auth().revoke(token).map_err(nex)?;
+        let _ = self.auth()?.revoke(token).map_err(nex)?;
         Ok(clear_cookie())
     }
 }
@@ -982,7 +1035,9 @@ impl Authenticator for NexAuth {
         let Some(token) = header.and_then(|h| cookie(h, SESSION_COOKIE)) else {
             return guest(out);
         };
-        let auth = self.db.db().auth();
+        let Ok(auth) = self.auth() else {
+            return Authentication::Unavailable;
+        };
         let session = match auth.validate(token) {
             Ok(Validation::Valid(s)) => s,
             Ok(_) => {
