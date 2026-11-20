@@ -107,9 +107,17 @@ fn content_in_nex_db_is_served_and_kept() {
     let (door, addr) = open_site(&conf);
     assert_eq!(send(addr, "/posts/hello-world", None).0, 200, "seeded");
     assert_eq!(send(addr, "/ready", None).0, 200, "the database is ready");
-    // One database per folder: a second instance is refused.
+    // One database per folder: a second instance is refused (at once with
+    // `lock_wait = "0s"`), naming the lock it found.
+    let t = Instant::now();
     let err = wasp::wire(&conf).expect_err("second instance");
-    assert!(err.contains("another instance"), "{err}");
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "refused without waiting"
+    );
+    assert!(err.contains("in use by another process"), "{err}");
+    assert!(err.contains("probably still running"), "{err}");
+    assert!(err.contains("LOCK"), "names the lock file: {err}");
     door.close(Duration::from_secs(2));
 
     {
@@ -302,6 +310,47 @@ fn a_new_boot_account_needs_a_long_password() {
         .expect("again"),
         None
     );
+}
+
+#[test]
+fn the_boot_account_needs_its_password_only_to_be_made() {
+    let data = temp_dir("boot-once");
+    let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    let conf = Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[auth]\nstore = \"nex\"\nadmin = \"Boot@Example.com\"\n\n[nex]\npath = \"{}\"\n",
+        slash(&theme),
+        slash(&data.0.join("nex"))
+    ))
+    .expect("config");
+    // No account yet and no password: refused, saying what to do.
+    let err = wasp::wire(&conf).expect_err("no account, no password");
+    assert!(err.contains("has no account yet"), "{err}");
+    {
+        let auth = NexAuth::new(reopen(&data.0.join("nex")));
+        assert!(auth.known("boot@example.com").expect("known").is_none());
+        auth.ensure_account(
+            "Boot@Example.com",
+            "a long enough password",
+            &["member", "editor"],
+        )
+        .expect("made");
+        assert!(auth.known(" boot@example.COM ").expect("known").is_some());
+        assert_eq!(auth.accounts().expect("accounts").len(), 1);
+    }
+    // Made: every later boot starts without the password.
+    let t = Instant::now();
+    loop {
+        match wasp::wire(&conf) {
+            Ok(_) => break,
+            Err(e)
+                if e.contains("in use by another process")
+                    && t.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("boot without the password: {e}"),
+        }
+    }
 }
 
 #[test]

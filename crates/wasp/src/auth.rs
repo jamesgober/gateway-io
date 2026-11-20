@@ -15,7 +15,6 @@
 //!
 //! The password is never read from configuration or written to the log.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,43 +97,19 @@ fn keys(secret: Option<&Path>) -> Result<GateKeys, String> {
     let raw = match secret {
         Some(path) => {
             if !path.exists() {
-                create_secret(path)?;
+                crate::secret::create(path)?;
             }
             FileFetch::new(path)
                 .fetch(&FetchContext::new("gate/master"))
                 .map_err(|e| format!("auth.secret {}: {e}", path.display()))?
         }
-        None => RawKey::new(fresh()?.to_vec()),
+        None => RawKey::new(crate::secret::fresh()?.to_vec()),
     };
     let vault = KeyVaultBuilder::new().build();
     let handle = vault
         .register("gate/master", raw)
         .map_err(|e| format!("key vault: {e}"))?;
     keys_from_vault(&vault, handle).map_err(|e| format!("gate keys: {e}"))
-}
-
-fn fresh() -> Result<crypt_io::Zeroizing<[u8; 32]>, String> {
-    crypt_io::generate_key().map_err(|e| format!("random master secret: {e}"))
-}
-
-/// Writes a new 32-byte secret to `path`, owner-only on Unix. Never replaces
-/// an existing file.
-fn create_secret(path: &Path) -> Result<(), String> {
-    let fail = |e: std::io::Error| format!("auth.secret {}: {e}", path.display());
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(fail)?;
-    }
-    let secret = fresh()?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(fail)?;
-    file.write_all(&secret[..]).map_err(fail)?;
-    file.sync_all().map_err(fail)
 }
 
 #[cfg(test)]

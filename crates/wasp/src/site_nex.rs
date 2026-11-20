@@ -369,13 +369,13 @@ pub fn build(
     content: Content,
     engine: SiteEngine,
     settings: &SiteSettings,
+    csrf_key: crypt_io::Zeroizing<[u8; 32]>,
     ready: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<NexApp, String> {
     let pages = Pages::new(settings, content);
-    // Tokens are keyed for this run of the process; a form rendered before a
-    // restart is refused once and rendered again.
-    let key = crypt_io::generate_key().map_err(|e| format!("csrf key: {e}"))?;
-    let csrf = web_net::csrf_sec::Csrf::new(*key).map_err(|e| format!("csrf: {e}"))?;
+    // The key outlives a restart (`crate::secret`): a form opened before it
+    // still posts after it.
+    let csrf = web_net::csrf_sec::Csrf::new(*csrf_key).map_err(|e| format!("csrf: {e}"))?;
     let builder = configure(
         App::with_gate(NexGate { access }).render(engine).csrf(csrf),
         settings,

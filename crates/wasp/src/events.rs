@@ -9,6 +9,7 @@
 //!
 //! Until [`connect`] runs (tests, tools) every event is dropped.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, SyncSender};
 
@@ -31,6 +32,8 @@ enum Line {
     },
     #[cfg(feature = "store-nex")]
     Security(&'static str),
+    #[cfg(feature = "store-nex")]
+    Warn(String),
 }
 
 static QUEUE_TX: OnceLock<SyncSender<Line>> = OnceLock::new();
@@ -41,8 +44,9 @@ fn push(line: Line) {
     }
 }
 
-/// Writes every event to `foundation`'s log from now on: failures at warn,
-/// refusals, denials and security events at info. The first call wins.
+/// Writes every event to `foundation`'s log from now on: server failures
+/// and panics at warn, a missing page at debug, other refusals, denials and
+/// security events at info. The first call wins.
 pub fn connect(foundation: &Foundation) {
     let (tx, rx) = mpsc::sync_channel::<Line>(QUEUE);
     if QUEUE_TX.set(tx).is_err() {
@@ -62,7 +66,19 @@ pub fn connect(foundation: &Foundation) {
                         code,
                         cause,
                     } => {
-                        if kind == "failed" || kind == "panicked" {
+                        if kind == "failed" && status == 404 {
+                            // A missing page (a browser's /favicon.ico, an
+                            // old link) is not the site failing.
+                            log::debug!(
+                                f.log(),
+                                "site",
+                                event = kind,
+                                reference = reference.as_str(),
+                                route = route.as_str(),
+                                status = u64::from(status),
+                                code = code
+                            );
+                        } else if kind == "panicked" || (kind == "failed" && status >= 500) {
                             log::warn!(
                                 f.log(),
                                 "site",
@@ -89,17 +105,67 @@ pub fn connect(foundation: &Foundation) {
                     Line::Security(what) => {
                         log::info!(f.log(), "security", event = what);
                     }
+                    #[cfg(feature = "store-nex")]
+                    Line::Warn(message) => {
+                        log::warn!(f.log(), "store", detail = message.as_str());
+                    }
                 }
             }
         });
+}
+
+/// A warning from a store while the process boots or runs (a database
+/// another process holds), in the log.
+#[cfg(feature = "store-nex")]
+pub fn warn(message: String) {
+    push(Line::Warn(message));
 }
 
 /// web-net's events, for the site's builder.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SiteEvents;
 
+thread_local! {
+    /// The reference of the request web-net just refused for its CSRF
+    /// token, on this thread: web-net reports the refusal, then renders its
+    /// error page on the same thread, and the page names no code.
+    static EXPIRED_FORM: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Whether web-net refused the request `reference` names for its form's
+/// token (expired, from before a key change, missing), so its error page
+/// can say so instead of reading like a permissions error. Asked once.
+pub fn form_expired(reference: &str) -> bool {
+    EXPIRED_FORM.with(|r| {
+        let mut r = r.borrow_mut();
+        let hit = !r.is_empty() && *r == reference;
+        r.clear();
+        hit
+    })
+}
+
+/// A refusal of the token itself, not of where the request came from (a
+/// cross-site post stays a plain refusal).
+fn token_refused(code: &str) -> bool {
+    matches!(
+        code,
+        "csrf.missing"
+            | "csrf.malformed"
+            | "csrf.unknown_key"
+            | "csrf.bad_mac"
+            | "csrf.stale_session"
+            | "csrf.expired"
+            | "csrf.not_yet_valid"
+            | "csrf.wrong_scope"
+    )
+}
+
 impl web_net::Events for SiteEvents {
     fn event(&self, e: &web_net::Event<'_>) {
+        if e.kind == web_net::EventKind::Denied && token_refused(e.code) {
+            let reference = e.id.to_string();
+            EXPIRED_FORM.with(|r| *r.borrow_mut() = reference);
+        }
         if QUEUE_TX.get().is_none() {
             return;
         }

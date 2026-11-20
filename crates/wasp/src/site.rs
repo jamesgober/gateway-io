@@ -139,6 +139,7 @@ impl Pages {
                 account: format!("{base}/account"),
                 admin: format!("{base}/admin"),
                 css: format!("{base}/theme/site.css"),
+                icon: format!("{base}/theme/favicon.svg"),
             }),
             content: Arc::new(content),
         }

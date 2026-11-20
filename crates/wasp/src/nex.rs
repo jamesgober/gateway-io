@@ -33,6 +33,16 @@ use crate::content::{ContentStore, StoreError, StoreErrorKind, Stored};
 /// The site in nex-db's routes.
 const SITE: &str = nex_db::DEFAULT_SITE;
 
+/// The content site wasp keeps its account directory on: one entity per
+/// account it made or saw sign in, at `/<account id>`, holding the
+/// identifier. nex-db finds an account by its identifier only with its
+/// password; the directory lets a boot know the boot account exists, and an
+/// administrator list accounts.
+const DIRECTORY: &str = "wasp-accounts";
+
+/// The directory's entity type.
+const DIRECTORY_KIND: &str = "account";
+
 /// The session cookie (`__Host-`: secure, whole site, no domain).
 pub const SESSION_COOKIE: &str = "__Host-nex";
 
@@ -85,8 +95,19 @@ const RECHECK: Duration = Duration::from_secs(60);
 /// The most entries read from one listing at boot.
 const MAX_ENTRIES: usize = 100_000;
 
-/// How long a boot waits for another process to let go of the database.
+/// How long a boot waits for another process to let go of the database
+/// (`nex.lock_wait`): a restart can overlap the old process's drain.
 pub const LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// ` (pid N)` when the database's lock file names the process holding it,
+/// else nothing.
+fn holder(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("LOCK"))
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .map(|pid| format!(" (pid {pid})"))
+        .unwrap_or_default()
+}
 
 /// Makes `dir` (and any missing parent) and keeps it to its owner: on Unix,
 /// mode 0700, tightened when it is open to the group or others.
@@ -161,6 +182,7 @@ impl NexDb {
         private_folder(dir)
             .map_err(|e| StoreError::unavailable(format!("nex-db {}: {e}", dir.display())))?;
         let until = std::time::Instant::now() + wait;
+        let mut warned = false;
         let db = loop {
             match nex_db::Database::builder(dir)
                 .observer(crate::events::StoreEvents)
@@ -168,12 +190,28 @@ impl NexDb {
             {
                 Ok(db) => break db,
                 Err(nex_db::Error::Locked) if std::time::Instant::now() < until => {
+                    if !warned {
+                        warned = true;
+                        crate::events::warn(format!(
+                            "{} is locked by another process{}; waiting up to {} s for it to finish",
+                            dir.display(),
+                            holder(dir),
+                            wait.as_secs()
+                        ));
+                    }
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Err(nex_db::Error::Locked) => {
+                    let waited = if wait.is_zero() {
+                        String::new()
+                    } else {
+                        format!(", still after {} s", wait.as_secs())
+                    };
                     return Err(StoreError::unavailable(format!(
-                        "nex-db {} is open in another process: is another instance running on this data folder?",
-                        dir.display()
+                        "the database {} is in use by another process{}{waited} (its lock file is {}): another wasp is probably still running on this data folder; stop it, or give this one its own `nex.path`",
+                        dir.display(),
+                        holder(dir),
+                        dir.join("LOCK").display()
                     )));
                 }
                 Err(other) => {
@@ -521,10 +559,12 @@ impl NexAuth {
         match auth.sign_up(identifier, password) {
             Ok(account) => {
                 auth.assign_roles(account, &ids).map_err(nex)?;
+                self.record(identifier, account)?;
                 Ok(Some(user_of(account)))
             }
             Err(nex_db::Error::AlreadyExists { .. }) => {
                 if let Some(account) = verified(&auth) {
+                    self.record(identifier, account)?;
                     let held = auth.roles(account).map_err(nex)?;
                     if ids.iter().any(|id| !held.contains(id)) {
                         let mut all = held;
@@ -540,6 +580,74 @@ impl NexAuth {
             }
             Err(e) => Err(nex(e)),
         }
+    }
+
+    /// Puts `identifier`'s account in the directory, when it is not there.
+    fn record(&self, identifier: &str, account: nex_db::AccountId) -> Result<(), StoreError> {
+        let content = self.db.db().content();
+        let path = format!("/{}", hex_of(account));
+        if content.resolve(DIRECTORY, &path).map_err(nex)?.is_some() {
+            return Ok(());
+        }
+        let entity = Entity::new(DIRECTORY_KIND)
+            .site(DIRECTORY)
+            .path(path)
+            .field("identifier", identifier.trim().to_lowercase());
+        match content.put(entity) {
+            // Two sign-ins of a new account at once: the other one wrote it.
+            Ok(_) | Err(nex_db::Error::AlreadyExists { .. } | nex_db::Error::Conflict) => Ok(()),
+            Err(e) => Err(nex(e)),
+        }
+    }
+
+    /// Every account in the directory that still exists, with its
+    /// identifier.
+    pub fn accounts(&self) -> Result<Vec<(String, UserId)>, StoreError> {
+        let content = self.db.db().content();
+        let auth = self.db.db().auth();
+        let mut out = Vec::new();
+        let mut page = content
+            .list(&Listing::latest(DIRECTORY_KIND).site(DIRECTORY).limit(1000))
+            .map_err(nex)?;
+        loop {
+            for e in page.items() {
+                let Some(identifier) = e.field("identifier").and_then(nex_db::Value::as_text)
+                else {
+                    continue;
+                };
+                let Some(account) = e
+                    .route()
+                    .and_then(|(_, p)| account_of_hex(p.trim_start_matches('/')))
+                else {
+                    continue;
+                };
+                if auth.account(account).map_err(nex)?.is_some() {
+                    out.push((identifier.to_owned(), user_of(account)));
+                }
+                if out.len() > MAX_ENTRIES {
+                    return Err(StoreError::other(format!(
+                        "more than {MAX_ENTRIES} accounts"
+                    )));
+                }
+            }
+            let next = match page.next() {
+                Some(cursor) => content.next_page(cursor).map_err(nex)?,
+                None => break,
+            };
+            page = next;
+        }
+        Ok(out)
+    }
+
+    /// The account `identifier` names, when the directory knows it and it
+    /// still exists.
+    pub fn known(&self, identifier: &str) -> Result<Option<UserId>, StoreError> {
+        let want = identifier.trim().to_lowercase();
+        Ok(self
+            .accounts()?
+            .into_iter()
+            .find(|(i, _)| *i == want)
+            .map(|(_, u)| u))
     }
 
     /// Bans the account: every session it holds ends in the same commit.
@@ -563,6 +671,9 @@ impl NexAuth {
         else {
             return Ok(None);
         };
+        // An account made before the directory, or by another tool, joins
+        // it the first time it signs in.
+        self.record(identifier, account)?;
         let perms = self.perms_of(account)?;
         let spec = SessionSpec::web()
             .idle(IDLE)
@@ -604,6 +715,20 @@ pub fn cookie<'a>(header: &'a [u8], want: &str) -> Option<&'a str> {
         }
     }
     found
+}
+
+/// An account id as 32 lowercase hex digits.
+fn hex_of(account: nex_db::AccountId) -> String {
+    format!("{:032x}", u128::from_be_bytes(*account.as_bytes()))
+}
+
+/// The account id 32 hex digits spell.
+fn account_of_hex(hex: &str) -> Option<nex_db::AccountId> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let n = u128::from_str_radix(hex, 16).ok()?;
+    Some(nex_db::AccountId::from_bytes(n.to_be_bytes()))
 }
 
 fn user_of(account: nex_db::AccountId) -> UserId {

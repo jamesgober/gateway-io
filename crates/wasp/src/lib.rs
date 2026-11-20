@@ -9,6 +9,8 @@ pub mod events;
 pub mod import;
 #[cfg(feature = "store-nex")]
 pub mod nex;
+#[cfg(any(feature = "gatekeeper", feature = "store-nex"))]
+pub mod secret;
 // The parts both sites share are unused in a build with neither.
 #[cfg_attr(
     not(any(feature = "gatekeeper", feature = "store-nex")),
@@ -77,6 +79,23 @@ struct Shared {
     /// run only.
     #[cfg(feature = "store-nex")]
     temporary: bool,
+}
+
+/// The CSRF tokens' key, derived from the master secret (`auth.secret`,
+/// default `<data folder>/gate.key`) so a form opened before a restart
+/// still posts after it; without a data folder (tests, tools), for this run
+/// only.
+#[cfg(feature = "store-nex")]
+fn csrf_key(
+    config: &Config,
+    secret_dir: Option<&std::path::Path>,
+) -> Result<crypt_io::Zeroizing<[u8; 32]>, String> {
+    let named: Option<std::path::PathBuf> = config.get("auth.secret").map_err(|e| e.to_string())?;
+    let master = match named.or_else(|| secret_dir.map(|d| d.join("gate.key"))) {
+        Some(path) => secret::read_or_create(&path)?,
+        None => secret::fresh()?,
+    };
+    secret::derive(&master, "wasp csrf v1")
 }
 
 /// The nex-db database (`[nex] path`, default `<data_dir>/nex`), opened once
@@ -404,11 +423,20 @@ fn wire_with(
             let a = nex::NexAuth::new(db.clone());
             let admin: Option<String> = config.get("auth.admin").map_err(|e| e.to_string())?;
             if let Some(admin) = admin {
-                let password = admin_password.ok_or_else(|| {
-                    format!("auth.admin is set: put its password in {ADMIN_PASSWORD_ENV}")
-                })?;
-                a.ensure_account(&admin, password, &[nex::MEMBER_ROLE, nex::EDITOR_ROLE])
-                    .map_err(|e| e.to_string())?;
+                // The password is needed only to make the account: once it
+                // exists, a boot without it starts as usual.
+                match admin_password {
+                    Some(password) => {
+                        a.ensure_account(&admin, password, &[nex::MEMBER_ROLE, nex::EDITOR_ROLE])
+                            .map_err(|e| e.to_string())?;
+                    }
+                    None if a.known(&admin).map_err(|e| e.to_string())?.is_some() => {}
+                    None => {
+                        return Err(format!(
+                            "auth.admin `{admin}` has no account yet: put its password in {ADMIN_PASSWORD_ENV} for the start that makes it"
+                        ));
+                    }
+                }
             }
             (
                 builder.authenticator(a.clone()).provider(Arc::new(db)),
@@ -487,6 +515,7 @@ fn wire_with(
             manifest,
             engine,
             &settings,
+            csrf_key(config, secret_dir)?,
             ready,
         )?),
     };
