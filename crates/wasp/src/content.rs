@@ -604,13 +604,10 @@ impl Manifest {
     /// A draft that passed validation, prepared: the body escaped and split
     /// into paragraphs, the URL made for this site's base.
     fn prepare(&self, draft: &Draft<'_>) -> Entry {
-        let mut body = String::with_capacity(draft.body.len() + 32);
-        for para in draft
-            .body
-            .split("\n\n")
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
+        // A browser sends a textarea's line breaks as CRLF.
+        let text = unix_newlines(draft.body);
+        let mut body = String::with_capacity(text.len() + 32);
+        for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
             body.push_str("<p>");
             escape_into(&mut body, para);
             body.push_str("</p>");
@@ -627,7 +624,7 @@ impl Manifest {
             summary: draft.summary.to_owned(),
             body,
             date: draft.date.to_owned(),
-            text: draft.body.to_owned(),
+            text: text.into_owned(),
         }
     }
 
@@ -917,9 +914,41 @@ fn sample_drafts() -> [Draft<'static>; 4] {
     ]
 }
 
+/// `text` with every CRLF and lone CR as LF.
+fn unix_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_breaks_from_a_browser_make_paragraphs() {
+        let mut m = Manifest::sample();
+        m.save(&Draft {
+            kind: Kind::Post,
+            slug: "crlf",
+            title: "From a browser",
+            summary: "",
+            body: "First line\r\nstill first.\r\n\r\nSecond.\r\rThird, from an old Mac.",
+            date: "2026-11-19",
+        })
+        .expect("save");
+        let e = m.get(Kind::Post, "crlf").expect("entry");
+        assert_eq!(
+            e.body,
+            "<p>First line\nstill first.</p><p>Second.</p><p>Third, from an old Mac.</p>"
+        );
+        assert!(
+            !e.text.contains('\r'),
+            "the text kept for editing has no CR"
+        );
+    }
 
     #[test]
     fn save_prepares_escaped_paragraphs_and_lists_posts_newest_first() {
