@@ -105,6 +105,36 @@ Each entry also has optional search and sharing fields, under "Search and sharin
 
 A site path is under the site's base, and becomes absolute (`https://` and the first of `site.hosts`) in the page. The search title, the two descriptions and the sharing title are the text a reader sees, so they will be translated with the title and summary when translations arrive; the others stay the same in every language.
 
+### Custom fields
+
+A site can give posts and pages fields of its own, declared in the configuration:
+
+```toml
+[content.fields.post.author]
+type = "text"
+label = "Author"
+required = true
+help = "As it should appear under the title"
+order = 1
+
+[content.fields.post.size]
+type = "select"
+options = ["small", "large"]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `type` | required | `text` (one line), `textarea`, `url`, `number`, `bool`, `date` (`YYYY-MM-DD`), `select`, or `media` (a site path or an `https://` address, for now) |
+| `label` | the name | what the editor shows |
+| `required` | false | a save without a value is refused (a `bool` must be checked) |
+| `help` | none | a line under the field in the editor |
+| `options` | none | a `select`'s choices (needed there, refused elsewhere) |
+| `order` | 0 | where the editor shows it, then by name |
+
+A name is lower case letters, digits and `_`, starting with a letter. Each kind (`post`, `page`) takes up to 32 fields. Every save and every load checks each value against its type, as for the built-in fields. A required field is checked only at save, so adding one to a site with content doesn't stop the boot. Declarations are read at start.
+
+The editor shows the fields of the entry's kind. A theme reads them in `page.entry.fields`, each with `name`, `label`, `kind` and `value`, in the declared order. The default theme lists the filled ones under the body. Stores keep them as `f_<name>`, and an older record reads them as empty.
+
 ## Accounts
 
 With nex-db, every signed-in account has `/account/security`:
@@ -173,7 +203,7 @@ With a durable store (`content.store = "bison"`), posts and pages come in from f
 <folder>/pages/<slug>.md     title, summary; a blank line; the body
 ```
 
-The search and sharing fields are header lines too, by the names above (`description: One line for search results.`).
+The search and sharing fields are header lines too, by the names above (`description: One line for search results.`), and so are the custom fields, with `f_` in front of the name (`f_author: Ann`).
 
 ```bash
 cargo run -p wasp -- import ./content

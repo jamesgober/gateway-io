@@ -25,13 +25,16 @@
 //! `description`, `og_title`, `og_description`, `canonical`, `robots`,
 //! `og_image`, `twitter_card`.
 //!
+//! A declared custom field is a header line too, its name with `f_` in
+//! front (`f_author: Ann`); one nothing declares is refused.
+//!
 //! A file whose slug, header, or fields do not pass is reported and skipped;
 //! the rest are saved. An entry with a slug already in the store is
 //! replaced.
 
 use std::path::Path;
 
-use crate::content::{Draft, Kind, Manifest, Meta};
+use crate::content::{Draft, FIELD_PREFIX, Kind, Manifest, Meta};
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -55,6 +58,7 @@ struct Parsed {
     summary: String,
     body: String,
     meta: Meta,
+    fields: Vec<(String, String)>,
 }
 
 fn parse(text: &str) -> Result<Parsed, String> {
@@ -65,6 +69,7 @@ fn parse(text: &str) -> Result<Parsed, String> {
         summary: String::new(),
         body: String::new(),
         meta: Meta::default(),
+        fields: Vec::new(),
     };
     let mut lines = text.lines();
     for line in lines.by_ref() {
@@ -79,6 +84,13 @@ fn parse(text: &str) -> Result<Parsed, String> {
             "title" => parsed.title = value,
             "date" => parsed.date = value,
             "summary" => parsed.summary = value,
+            other if other.starts_with(FIELD_PREFIX) => {
+                let name = &other[FIELD_PREFIX.len()..];
+                if parsed.fields.iter().any(|(n, _)| n == name) {
+                    return Err(format!("header `{other}` is given twice"));
+                }
+                parsed.fields.push((name.to_owned(), value));
+            }
             other => match parsed.meta.get_mut(other) {
                 Some(field) => *field = value,
                 None => {
@@ -165,6 +177,7 @@ pub fn import_into(manifest: &mut Manifest, from: &Path) -> Result<Report, Strin
                 body: &parsed.body,
                 date: &parsed.date,
                 meta: parsed.meta.clone(),
+                fields: parsed.fields.clone(),
             };
             match manifest.save(&draft) {
                 Ok(()) => report.saved.push(slug),

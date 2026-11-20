@@ -28,7 +28,7 @@ use wasp_core::{
     RequestView, SessionId, Standing, UserId,
 };
 
-use crate::content::{ContentStore, Meta, StoreError, StoreErrorKind, Stored};
+use crate::content::{ContentStore, FIELD_PREFIX, Meta, StoreError, StoreErrorKind, Stored};
 use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
 
 mod accounts;
@@ -358,6 +358,13 @@ impl ContentStore for NexStore {
                         body: text("body"),
                         date: text("date"),
                         meta,
+                        fields: e
+                            .fields()
+                            .filter_map(|(k, v)| {
+                                let name = k.strip_prefix(FIELD_PREFIX)?;
+                                Some((name.to_owned(), v.as_text()?.to_owned()))
+                            })
+                            .collect(),
                     };
                     let at = e.updated_at();
                     match changed.get(&stored.slug).copied() {
@@ -400,6 +407,14 @@ impl ContentStore for NexStore {
         ];
         for name in Meta::FIELDS {
             fields.push((name, entry.meta.get(name).unwrap_or("")));
+        }
+        let custom: Vec<(String, &str)> = entry
+            .fields
+            .iter()
+            .map(|(n, v)| (format!("{FIELD_PREFIX}{n}"), v.as_str()))
+            .collect();
+        for (name, value) in &custom {
+            fields.push((name.as_str(), value));
         }
         match content.resolve(SITE, &path).map_err(nex)? {
             Some(route) => {
