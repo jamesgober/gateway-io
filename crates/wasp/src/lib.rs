@@ -9,6 +9,9 @@ pub mod events;
 pub mod import;
 #[cfg(feature = "store-nex")]
 pub mod nex;
+// Read by the nex-db site; other builds only refuse its tables.
+#[cfg_attr(not(feature = "store-nex"), allow(dead_code))]
+pub mod policy;
 #[cfg(any(feature = "gatekeeper", feature = "store-nex"))]
 pub mod secret;
 // The parts both sites share are unused in a build with neither.
@@ -17,6 +20,8 @@ pub mod secret;
     allow(dead_code)
 )]
 pub mod site;
+#[cfg(feature = "store-nex")]
+pub mod site_account;
 #[cfg(feature = "store-nex")]
 pub mod site_nex;
 pub mod theme;
@@ -48,6 +53,9 @@ pub struct Wiring {
     pub nex: Option<nex::NexDb>,
     /// The theme watcher (a kernel subsystem; start it before the gateway).
     pub theme: theme::ThemeWatcher,
+    /// The sign-in settings' reload (a kernel subsystem), with nex-db
+    /// accounts.
+    pub auth_policy: Option<policy::PolicyReload>,
     /// The core's guest output cache, purged whenever the content changes.
     pub guest_pages: Arc<wasp_core::GuestPages>,
     /// How many times the site rendered a page or an error page.
@@ -81,15 +89,17 @@ struct Shared {
     temporary: bool,
 }
 
-/// The CSRF tokens' key, derived from the master secret (`auth.secret`,
-/// default `gate.key` in the folder that holds the database: beside
-/// `nex.path`, else the data folder) so a form opened before a restart still
-/// posts after it; with neither (tests, tools), for this run only.
+/// The site's keys, derived from the master secret (`auth.secret`, default
+/// `gate.key` in the folder that holds the database: beside `nex.path`,
+/// else the data folder), so a form or a half-done sign-in from before a
+/// restart still works after it, and a remembered device stays remembered;
+/// with neither (tests, tools), for this run only.
 #[cfg(feature = "store-nex")]
-fn csrf_key(
+fn site_keys(
     config: &Config,
     secret_dir: Option<&std::path::Path>,
-) -> Result<crypt_io::Zeroizing<[u8; 32]>, String> {
+    boot: Option<String>,
+) -> Result<site_nex::SiteKeys, String> {
     let named: Option<std::path::PathBuf> = config.get("auth.secret").map_err(|e| e.to_string())?;
     // Beside the database, so it follows the site (and its backups) and two
     // sites never share it.
@@ -106,7 +116,14 @@ fn csrf_key(
         Some(path) => secret::read_or_create(&path)?,
         None => secret::fresh()?,
     };
-    secret::derive(&master, "wasp csrf v1")
+    Ok(site_nex::SiteKeys {
+        csrf: secret::derive(&master, "wasp csrf v1")?,
+        cookies: site_account::CookieKeys::new(
+            secret::derive(&master, "wasp sign-in step v1")?,
+            secret::derive(&master, "wasp device v1")?,
+        ),
+        boot,
+    })
 }
 
 /// The nex-db database (`[nex] path`, default `<data_dir>/nex`), opened once
@@ -239,6 +256,8 @@ fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
         LaneRule::exact(&at("/ready"), Lane::CRITICAL),
         LaneRule::under(&at("/admin"), Lane::ADMIN),
         LaneRule::exact(&at("/sign-in"), Lane::AUTH),
+        LaneRule::exact(&at("/sign-in/code"), Lane::AUTH),
+        LaneRule::exact(&at("/sign-in/setup"), Lane::AUTH),
         LaneRule::exact(&at("/sign-out"), Lane::AUTH).method("POST"),
     ]
 }
@@ -303,7 +322,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("content", &["path", "recovery", "store"]),
-    ("auth", &["admin", "origin", "secret", "store"]),
+    (
+        "auth",
+        &[
+            "admin", "lockout", "mfa", "origin", "password", "role", "secret", "session", "store",
+        ],
+    ),
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
     ("jobs", &["queue", "threads"]),
@@ -418,9 +442,24 @@ fn wire_with(
         .get_or("auth.store", DEFAULT_AUTH_STORE.to_owned())
         .map_err(|e| e.to_string())?;
     let builder = Core::builder();
+    // Set by the arm that does not return.
+    let auth_policy: Option<policy::PolicyReload>;
+    #[cfg(feature = "store-nex")]
+    let boot: Option<String>;
     let (builder, gates): (wasp_core::CoreBuilder, Gates) = match auth_store.as_str() {
         #[cfg(feature = "gatekeeper")]
         "gatekeeper" => {
+            auth_policy = None;
+            #[cfg(feature = "store-nex")]
+            {
+                boot = None;
+            }
+            if policy::any_set(config) {
+                return Err(
+                    "[auth.password], [auth.mfa], [auth.session], [auth.lockout] and [auth.role] are for nex-db accounts: set auth.store = \"nex\", or remove them"
+                        .to_owned(),
+                );
+            }
             let auth_settings =
                 auth::AuthSettings::from_config(config, secret_dir, &settings.hosts)?;
             let gk = auth::gatekeeper(&auth_settings, admin_password)?;
@@ -432,17 +471,35 @@ fn wire_with(
         #[cfg(feature = "store-nex")]
         "nex" => {
             let db = nex_db(config, data_dir, &mut shared)?;
-            let a = nex::NexAuth::new(db.clone());
+            let cell = policy::PolicyCell::new(policy::Policy::from_config(
+                config,
+                cfg!(feature = "mfa"),
+            )?);
+            let a = nex::NexAuth::new(db.clone()).with_policy(cell.clone());
+            a.apply_lockout().map_err(|e| e.to_string())?;
+            let applied = a.clone();
+            auth_policy = Some(policy::PolicyReload::new(
+                cell,
+                cfg!(feature = "mfa"),
+                move |_| {
+                    if let Err(e) = applied.apply_lockout() {
+                        events::warn(format!("the new lockout settings were not written: {e}"));
+                    }
+                },
+            ));
             let admin: Option<String> = config.get("auth.admin").map_err(|e| e.to_string())?;
+            boot = admin.clone();
             if let Some(admin) = admin {
+                let roles = [nex::MEMBER_ROLE, nex::EDITOR_ROLE, nex::ADMIN_ROLE];
                 // The password is needed only to make the account: once it
-                // exists, a boot without it starts as usual.
+                // exists, a boot without it starts as usual (and gives back
+                // any of its roles it lacks).
                 match admin_password {
                     Some(password) => {
-                        a.ensure_account(&admin, password, &[nex::MEMBER_ROLE, nex::EDITOR_ROLE])
+                        a.ensure_account(&admin, password, &roles)
                             .map_err(|e| e.to_string())?;
                     }
-                    None if a.known(&admin).map_err(|e| e.to_string())?.is_some() => {}
+                    None if a.ensure_roles(&admin, &roles).map_err(|e| e.to_string())? => {}
                     None => {
                         return Err(format!(
                             "auth.admin `{admin}` has no account yet: put its password in {ADMIN_PASSWORD_ENV} for the start that makes it"
@@ -528,7 +585,7 @@ fn wire_with(
             manifest,
             engine,
             &settings,
-            csrf_key(config, secret_dir)?,
+            site_keys(config, secret_dir, boot)?,
             ready,
         )?),
     };
@@ -540,6 +597,7 @@ fn wire_with(
         #[cfg(feature = "store-nex")]
         nex: shared.nex,
         theme: watcher,
+        auth_policy,
         guest_pages,
         renders,
         stages,

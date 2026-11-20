@@ -23,6 +23,13 @@ store = "nex"
 # WASP_ADMIN_PASSWORD environment variable, never from this file.
 admin = "you@example.com"
 
+# The sign-in rules have safe defaults; the README's "Sign-in settings"
+# lists every key. For example, longer passwords and shorter sessions:
+# [auth.password]
+# min_length = 14
+# [auth.session]
+# idle = "1d"
+
 [nex]
 # The database, inside the application folder's data folder.
 path = "data/nex"

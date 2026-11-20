@@ -32,6 +32,12 @@ Rust 1.89 or newer. On Windows, set `AWS_LC_SYS_PREBUILT_NASM=1` so the crypto d
 cargo build --release -p wasp
 ```
 
+Two-step sign-in (TOTP) for nex-db accounts is the `mfa` feature. It builds the same C crypto backend as the default gatekeeper, so the static musl build (`--no-default-features --features store-nex`) leaves it out:
+
+```bash
+cargo build --release -p wasp --features store-nex,mfa
+```
+
 ## Run
 
 ```bash
@@ -75,13 +81,70 @@ The site: `/`, `/posts/:slug`, `/about` and every other page at `/:slug` (from t
 
 A start can now refuse a folder that other users of the machine can read, such as a log folder an older build made at mode 0755. The message names the folder and the fix, for example `run: chmod 700 /home/you/.local/share/wasp/logs`. Run it (or delete the folder so it is made again, private) and start again.
 
-The configuration file is checked the same way: one that other accounts can change is refused. On Windows that includes a file on a drive that keeps no permissions (FAT or exFAT, often a second drive or a USB disk): keep `wasp.conf` on an NTFS drive; the data folder can stay where it is.
+The configuration file is checked the same way: one that other accounts can change is refused. On Windows a file on a drive that keeps no permissions (FAT or exFAT, often a second drive or a USB disk) still loads, with a warning to move it to an NTFS drive.
+
+A custom admin theme (`admin.custom_theme`) now needs five more pages: `security`, `two-factor`, `codes`, `code` and `accounts`. Copy them from `crates/wasp/admin/pages/`.
 
 A stop signal that was already ignored when wasp started stays ignored: SIGHUP under `nohup`, and SIGINT for a job a shell script started in the background with `&`. A script that stops wasp with `kill -INT` should send SIGTERM instead.
 
 ## Edit content
 
-On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member` and `editor` roles. The editor's pages are never cached, and every form carries a CSRF token.
+On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member`, `editor` and `admin` roles at every start. The editor's pages are never cached, and every form carries a CSRF token.
+
+## Accounts
+
+With nex-db, every signed-in account has `/account/security`:
+
+- **Password.** Change it with the current one. Every other session ends.
+- **Sign out everywhere.** Ends every session of the account, this one too.
+- **Two-step sign-in.** Turn it on with an authenticator app. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off and "Forget remembered devices" undo that.
+
+An account with the `admin` role has `/admin/accounts`. It lists every account with its roles and standing, and disables, enables or removes one. Disabling ends its sessions. Neither your own account nor the boot account can be changed there.
+
+Every one of these writes an `audit` line to the log: who, what, and which account.
+
+These pages come from the admin theme, so a site theme can't change them, and they are never cached.
+
+### Sign-in settings
+
+Every key here is read again on a reload. A value under its floor stops the boot, or refuses the reload (the running settings stay).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `auth.password.min_length` | 12 | the shortest password (at least 8) |
+| `auth.password.max_length` | 128 | the longest password (the minimum to 1024) |
+| `auth.password.require_upper`, `require_lower`, `require_digit`, `require_symbol` | false | a password must hold that kind of character |
+| `auth.mfa.enabled` | false | two-step sign-in is offered (needs the `mfa` feature) |
+| `auth.mfa.mode` | `optional` | `off` (not offered), `optional`, or `required` (set up at the next sign-in; needs `enabled`) |
+| `auth.mfa.methods` | `["totp"]` | the second steps; `totp` is the only one |
+| `auth.mfa.remember_device` | `30d` | how long "don't ask on this device" lasts; `0` never offers it (at most `400d`) |
+| `auth.mfa.every_login` | false | a code at every sign-in, even on a remembered device |
+| `auth.mfa.recovery_codes` | 10 | recovery codes shown when two-step sign-in is turned on (0 to 10) |
+| `auth.session.idle` | `7d` | a session ends after this long unused; `0` for no idle limit (else at least `1m`) |
+| `auth.session.absolute` | `30d` | a session ends this long after sign-in (`1m` to `400d`) |
+| `auth.session.max_concurrent` | 0 | the most sessions an account holds; a new sign-in past it ends the oldest (0: no cap) |
+| `auth.session.recheck` | `1m` | how often a session's roles and standing are read again (`1s` to `1h`) |
+| `auth.lockout.attempts` | 10 | wrong passwords or codes for one account within `window` that lock it (1 to 1000; never off) |
+| `auth.lockout.window` | `15m` | the window `attempts` are counted in |
+| `auth.lockout.duration` | `15m` | how long a lockout lasts |
+| `auth.lockout.address_attempts` | 10 | sign-in attempts one address may make within `address_window` |
+| `auth.lockout.address_window` | `10m` | the window `address_attempts` are counted in |
+
+A role can have its own password, two-step and session keys (all but `recheck`) in `[auth.role.<role>]`, for `member`, `editor` and `admin`. An account with several roles gets the strictest value of each:
+
+```toml
+[auth.mfa]
+enabled = true
+
+[auth.role.admin.mfa]
+mode = "required"
+remember_device = "0"
+
+[auth.role.admin.session]
+idle = "1h"
+```
+
+Times take `s`, `m`, `h` or `d`. With `auth.store = "gatekeeper"` these tables stop the boot: they are for nex-db accounts.
 
 Guests' copies of the content pages (`/`, posts and pages) are kept in memory and answered before the site runs, for up to 60 seconds, and every save, rename or removal, and every theme reload, drops them at once. Signed-in visitors, queries and pages with a form are always served fresh.
 
@@ -151,7 +214,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `auth.store` | `gatekeeper` (`nex` in a build without it) | the site's accounts and sessions: `gatekeeper` (feature `gatekeeper`, on by default; in memory: a restart signs everyone out) or `nex` (feature `store-nex`; nex-db: durable) |
 | `nex.path` | `<data folder>/nex` | the nex-db database, shared by `auth.store = "nex"` and `content.store = "nex"`; one process at a time |
 | `nex.lock_wait` | `15s` | how long a boot waits for another process (a restart overlapping the old one's stop) to let go of the database; it warns when it starts waiting and names the process when it can. `0s` refuses at once |
-| `auth.admin` | none | an account made at boot (given the `member` and `editor` roles with nex-db); its password from `WASP_ADMIN_PASSWORD`, needed with nex-db only until the account exists |
+| `auth.admin` | none | an account made at boot (given the `member`, `editor` and `admin` roles with nex-db, at every start); its password from `WASP_ADMIN_PASSWORD`, needed with nex-db only until the account exists |
 | `auth.secret` | `gate.key` beside `nex.path` with nex-db, else `<data folder>/gate.key` | the site's 32-byte master secret, made on the first run (owner-only on Unix), kept with the site's database so it follows the site and its backups: the gatekeeper's keys and, with nex-db, the forms' CSRF key come from it, so a form opened before a restart still posts after it. Move the file away (while stopped) to change it; open forms are then refused once |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
@@ -160,7 +223,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 
 Under heavy load the gateway sheds on its own: when replies to page views get slow or the passports run short, page views are answered with 503 and a short `Retry-After`, while health checks, the content editor and sign-in are still served. It stops by itself once the load has passed (about two seconds of calm), and it never lowers a shed someone else set.
 
-A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt` and `gateway.drain` at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
+A reload (SIGHUP on Linux, or `System::reload`) applies `door.ban`, `door.exempt`, `gateway.drain` and the sign-in settings at once; the listener and pool settings take effect at the next start. The door's decisions (bans added and lifted, banned sources refused, egress blocked) are written to the log.
 
 ## Check
 

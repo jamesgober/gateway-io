@@ -1,0 +1,26 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.title }}</h1>
+{% if page.security.error %}<p class="error" role="alert">{{ page.security.error }}</p>{% endif %}
+{% if page.security.notice %}<p class="notice" role="status">{{ page.security.notice }}</p>{% endif %}
+<table class="entries">
+<thead><tr><th>Email</th><th>Roles</th><th>Standing</th><th>Two-step</th><th></th></tr></thead>
+<tbody>
+{%- for a in page.security.accounts %}
+<tr><td>{{ a.identifier }}</td><td>{{ a.roles }}</td><td>{{ a.standing }}</td><td>{% if a.totp %}on{% else %}off{% endif %}</td>
+<td>{% if a.managed %}
+{%- if a.standing == "active" or a.standing == "pending" %}
+<form class="inline" method="post" action="{{ page.security.disable }}"><input type="hidden" name="csrf_token" value="{{ page.security.csrf }}"><input type="hidden" name="account" value="{{ a.id }}"><button type="submit">Disable</button></form>
+{%- else %}
+<form class="inline" method="post" action="{{ page.security.enable }}"><input type="hidden" name="csrf_token" value="{{ page.security.csrf }}"><input type="hidden" name="account" value="{{ a.id }}"><button type="submit">Enable</button></form>
+{%- endif %}
+<form class="inline" method="post" action="{{ page.security.remove }}"><input type="hidden" name="csrf_token" value="{{ page.security.csrf }}"><input type="hidden" name="account" value="{{ a.id }}"><label class="check"><input type="checkbox" name="confirm" value="on" required> sure</label> <button class="danger" type="submit">Remove</button></form>
+{%- endif %}</td></tr>
+{%- else %}
+<tr><td colspan="5">No accounts.</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+</article>
+{% endblock %}

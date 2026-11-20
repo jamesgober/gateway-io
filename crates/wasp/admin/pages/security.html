@@ -1,0 +1,59 @@
+{% extends "base" %}
+{% block content %}
+<article>
+<h1>{{ page.title }}</h1>
+<p>Signed in as <strong>{{ page.security.identifier }}</strong>.</p>
+{% if page.security.error %}<p class="error" role="alert">{{ page.security.error }}</p>{% endif %}
+{% if page.security.notice %}<p class="notice" role="status">{{ page.security.notice }}</p>{% endif %}
+
+<section>
+<h2>Password</h2>
+<form class="stack" method="post" action="{{ page.security.password }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+<label>New password <input type="password" name="new" autocomplete="new-password" minlength="{{ page.security.min_length }}" required></label>
+<label>New password again <input type="password" name="again" autocomplete="new-password" minlength="{{ page.security.min_length }}" required></label>
+<p class="muted">At least {{ page.security.min_length }} characters. Changing it signs you out everywhere else.</p>
+<button type="submit">Change password</button>
+</form>
+</section>
+
+<section>
+<h2>Two-step sign-in</h2>
+{% if page.security.totp %}
+<p>On: signing in asks for a code from your authenticator app.</p>
+<form class="stack" method="post" action="{{ page.security.new_codes }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+<button type="submit">Make new recovery codes</button>
+</form>
+{% if not page.security.required %}
+<form class="stack" method="post" action="{{ page.security.two_factor_off }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+<button class="danger" type="submit">Turn two-step sign-in off</button>
+</form>
+{% endif %}
+{% elif page.security.offered %}
+<p>Off. With it on, signing in also asks for a code from an authenticator app on your phone.</p>
+<p><a href="{{ page.security.two_factor }}">Turn on two-step sign-in</a></p>
+{% else %}
+<p>Off.</p>
+{% endif %}
+</section>
+
+<section>
+<h2>Sessions</h2>
+<form method="post" action="{{ page.security.everywhere }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<button type="submit">Sign out everywhere</button>
+</form>
+{% if page.security.totp %}
+<form method="post" action="{{ page.security.devices }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<button type="submit">Forget remembered devices</button>
+</form>
+{% endif %}
+</section>
+</article>
+{% endblock %}

@@ -34,6 +34,12 @@ enum Line {
     Security(&'static str),
     #[cfg(feature = "store-nex")]
     Warn(String),
+    #[cfg(feature = "store-nex")]
+    Audit {
+        by: String,
+        action: &'static str,
+        account: String,
+    },
 }
 
 static QUEUE_TX: OnceLock<SyncSender<Line>> = OnceLock::new();
@@ -109,6 +115,20 @@ pub fn connect(foundation: &Foundation) {
                     Line::Warn(message) => {
                         log::warn!(f.log(), "store", detail = message.as_str());
                     }
+                    #[cfg(feature = "store-nex")]
+                    Line::Audit {
+                        by,
+                        action,
+                        account,
+                    } => {
+                        log::info!(
+                            f.log(),
+                            "audit",
+                            by = by.as_str(),
+                            action = action,
+                            account = account.as_str()
+                        );
+                    }
                 }
             }
         });
@@ -119,6 +139,20 @@ pub fn connect(foundation: &Foundation) {
 #[cfg(feature = "store-nex")]
 pub fn warn(message: String) {
     push(Line::Warn(message));
+}
+
+/// An account action, in the log as an `audit` line: who did it (an
+/// email), what (`password_changed`, `signed_out_everywhere`,
+/// `two_step_on`, `two_step_off`, `recovery_codes_made`,
+/// `recovery_code_used`, `devices_forgotten`, `account_disabled`,
+/// `account_enabled`, `account_removed`), and to which account.
+#[cfg(feature = "store-nex")]
+pub fn audit(by: &str, action: &'static str, account: &str) {
+    push(Line::Audit {
+        by: by.to_owned(),
+        action,
+        account: account.to_owned(),
+    });
 }
 
 /// web-net's events, for the site's builder.

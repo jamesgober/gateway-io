@@ -29,6 +29,10 @@ use wasp_core::{
 };
 
 use crate::content::{ContentStore, StoreError, StoreErrorKind, Stored};
+use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
+
+mod accounts;
+pub use accounts::{AccountRow, CodeCheck};
 
 /// The site in nex-db's routes.
 const SITE: &str = nex_db::DEFAULT_SITE;
@@ -55,6 +59,9 @@ pub const MEMBER_ROLE: &str = "member";
 
 /// The role that may edit the content.
 pub const EDITOR_ROLE: &str = "editor";
+
+/// The role that manages the accounts.
+pub const ADMIN_ROLE: &str = "admin";
 
 /// What the authenticator keeps for the web service: the value CSRF tokens
 /// are bound to (the session's id, or a guest's pre-session cookie; empty
@@ -88,9 +95,6 @@ impl NexToken {
         &self.binding[..usize::from(self.len)]
     }
 }
-
-/// How often a session's account standing is read again.
-const RECHECK: Duration = Duration::from_secs(60);
 
 /// The most entries read from one listing at boot.
 const MAX_ENTRIES: usize = 100_000;
@@ -436,18 +440,24 @@ impl ContentStore for NexStore {
 /// `Identity::user`: the account (`AccountId`'s 128 bits as `UserId`), the
 /// session (a digest of the token as `SessionId`), and the permission bits
 /// written into the session at sign-in. The account's standing is read
-/// again once a minute (`recheck_at`): a ban refuses the request (403), a
-/// suspension marks the identity. Any other token is a guest whose cookie is
-/// cleared.
+/// again every `auth.session.recheck` (`recheck_at`): a ban refuses the
+/// request (403), a suspension marks the identity, and an account whose
+/// roles now require two-step sign-in it has not set up is signed out. Any
+/// other token is a guest whose cookie is cleared.
+///
+/// The sign-in settings (`[auth.*]`, see [`crate::policy`]) are read from a
+/// [`PolicyCell`] a configuration reload swaps.
 #[derive(Clone, Debug)]
 pub struct NexAuth {
     db: NexDb,
     roles: Arc<[(Box<str>, u64)]>,
     checked: Arc<Checked>,
+    policy: PolicyCell,
+    failures: Arc<accounts::Failures>,
 }
 
 /// What a session's last recheck read (its account's permissions and
-/// standing), so the store is read at most once per [`RECHECK`] per session.
+/// standing), so the store is read at most once per recheck per session.
 #[derive(Debug, Default)]
 struct Checked(
     std::sync::Mutex<std::collections::HashMap<SessionId, (std::time::Instant, PermSet, Standing)>>,
@@ -457,23 +467,23 @@ struct Checked(
 const CHECKED: usize = 100_000;
 
 impl Checked {
-    fn get(&self, session: SessionId) -> Option<(PermSet, Standing)> {
+    fn get(&self, session: SessionId, recheck: Duration) -> Option<(PermSet, Standing)> {
         let map = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&session)
-            .filter(|(at, _, _)| at.elapsed() < RECHECK)
+            .filter(|(at, _, _)| at.elapsed() < recheck)
             .map(|(_, p, s)| (*p, *s))
     }
 
-    fn put(&self, session: SessionId, perms: PermSet, standing: Standing) {
+    fn put(&self, session: SessionId, perms: PermSet, standing: Standing, recheck: Duration) {
         let mut map = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.len() >= CHECKED {
-            map.retain(|_, (at, _, _)| at.elapsed() < RECHECK);
+            map.retain(|_, (at, _, _)| at.elapsed() < recheck);
             if map.len() >= CHECKED {
                 map.clear();
             }
@@ -483,18 +493,33 @@ impl Checked {
 }
 
 /// The shortest boot account password made from `WASP_ADMIN_PASSWORD`, in
-/// characters.
+/// characters, under the default settings (the `admin` role's
+/// `[auth.password]` rules apply).
 pub const MIN_ADMIN_PASSWORD: usize = 12;
 
-/// How long a session lasts without a request.
+/// How long a session lasts without a request, under the default settings.
 pub const IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// What a matching password leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordStep {
+    /// Signed in: open the session.
+    Done(UserId),
+    /// The account has two-step sign-in on: ask for a code.
+    Code(UserId),
+    /// The account's roles require two-step sign-in it has not set up.
+    Setup(UserId),
+    /// Wrong identifier or password, or the account may not sign in.
+    Refused,
+}
 
 impl NexAuth {
     /// The authenticator over `db`, with `member` granting permission bit 0
-    /// (the site's account page) and `editor` bit 1 (the content editor).
+    /// (the site's account page), `editor` bit 1 (the content editor), and
+    /// `admin` bit 2 (the accounts), under the default sign-in settings.
     #[must_use]
     pub fn new(db: NexDb) -> NexAuth {
-        NexAuth::with_roles(db, &[(MEMBER_ROLE, 1), (EDITOR_ROLE, 2)])
+        NexAuth::with_roles(db, &[(MEMBER_ROLE, 1), (EDITOR_ROLE, 2), (ADMIN_ROLE, 4)])
     }
 
     /// The authenticator over `db`, with a role-to-permission-bits table.
@@ -504,13 +529,42 @@ impl NexAuth {
             db,
             roles: roles.iter().map(|(n, b)| (Box::from(*n), *b)).collect(),
             checked: Arc::default(),
+            policy: PolicyCell::default(),
+            failures: Arc::default(),
         }
     }
 
-    /// The permission bits the account's roles grant.
-    fn perms_of(&self, account: nex_db::AccountId) -> Result<PermSet, StoreError> {
+    /// The same authenticator, reading its settings from `policy`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: PolicyCell) -> NexAuth {
+        self.policy = policy;
+        self
+    }
+
+    /// The sign-in settings in force.
+    #[must_use]
+    pub fn policy(&self) -> Arc<Policy> {
+        self.policy.get()
+    }
+
+    /// Writes the lockout settings into the database (they apply to every
+    /// sign-in from now on).
+    pub fn apply_lockout(&self) -> Result<(), StoreError> {
+        let l = self.policy().lockout;
+        self.db
+            .db()
+            .set_realm_policy(
+                "users",
+                nex_db::RealmPolicy::new().lockout(l.attempts, l.window, l.duration),
+            )
+            .map_err(nex)
+    }
+
+    /// The permission bits the account's roles grant, and the roles' names.
+    fn roles_of(&self, account: nex_db::AccountId) -> Result<(PermSet, Vec<String>), StoreError> {
         let auth = self.db.db().auth();
         let mut bits = 0u64;
+        let mut names = Vec::new();
         for id in auth.roles(account).map_err(nex)? {
             if let Some(role) = auth.role(id) {
                 for (name, b) in self.roles.iter() {
@@ -518,24 +572,20 @@ impl NexAuth {
                         bits |= *b;
                     }
                 }
+                names.push(role.name().to_owned());
             }
         }
-        Ok(PermSet(bits))
+        Ok((PermSet(bits), names))
     }
 
-    /// Makes `identifier` an account with `password` holding `roles`, when
-    /// there is none yet (the boot account): the new account's id, or `None`
-    /// when it existed already. A new account's password must be at least
-    /// [`MIN_ADMIN_PASSWORD`] characters. When the account exists and
-    /// `password` is still its password, any of `roles` it lacks is given
-    /// back (a boot stopped between making the account and giving it its
-    /// roles); otherwise it is left as it is.
-    pub fn ensure_account(
-        &self,
-        identifier: &str,
-        password: &str,
-        roles: &[&str],
-    ) -> Result<Option<UserId>, StoreError> {
+    /// The sign-in rules for `user` (its roles' strictest).
+    pub fn rules(&self, user: UserId) -> Result<Rules, StoreError> {
+        let (_, names) = self.roles_of(account_of(user))?;
+        Ok(self.policy().rules_for(names.iter().map(String::as_str)))
+    }
+
+    /// The role ids for `roles`, defined when missing.
+    fn role_ids(&self, roles: &[&str]) -> Result<Vec<nex_db::RoleId>, StoreError> {
         let auth = self.db.db().auth();
         let mut ids = Vec::with_capacity(roles.len());
         for role in roles {
@@ -544,17 +594,58 @@ impl NexAuth {
                 None => auth.define_role(nex_db::Role::new(*role)).map_err(nex)?,
             });
         }
+        Ok(ids)
+    }
+
+    /// Gives `account` every role in `ids` it lacks.
+    fn grant(&self, account: nex_db::AccountId, ids: &[nex_db::RoleId]) -> Result<(), StoreError> {
+        let auth = self.db.db().auth();
+        let held = auth.roles(account).map_err(nex)?;
+        if ids.iter().any(|id| !held.contains(id)) {
+            let mut all = held;
+            all.extend(
+                ids.iter()
+                    .filter(|id| !all.contains(id))
+                    .collect::<Vec<_>>(),
+            );
+            auth.assign_roles(account, &all).map_err(nex)?;
+        }
+        Ok(())
+    }
+
+    /// Makes `identifier` an account with `password` holding `roles`, when
+    /// there is none yet (the boot account): the new account's id, or `None`
+    /// when it existed already. A new account's password must keep the
+    /// `[auth.password]` rules of `roles`. When the account exists, any of
+    /// `roles` it lacks is given back (the boot account names its roles in
+    /// the configuration, whatever its password is now).
+    pub fn ensure_account(
+        &self,
+        identifier: &str,
+        password: &str,
+        roles: &[&str],
+    ) -> Result<Option<UserId>, StoreError> {
+        let ids = self.role_ids(roles)?;
+        if let Some(user) = self.known(identifier)? {
+            self.grant(account_of(user), &ids)?;
+            return Ok(None);
+        }
+        let auth = self.db.db().auth();
         let verified = |auth: &nex_db::Auth<'_>| match auth.verify_password(identifier, password) {
-            Ok(PasswordCheck::Verified(a)) => Some(a),
+            Ok(PasswordCheck::Verified(a) | PasswordCheck::NeedsSecondFactor { account: a }) => {
+                Some(a)
+            }
             _ => None,
         };
-        if password.chars().count() < MIN_ADMIN_PASSWORD && verified(&auth).is_none() {
-            return Err(StoreError::new(
-                StoreErrorKind::Invalid,
-                format!(
-                    "the boot account's password must be at least {MIN_ADMIN_PASSWORD} characters"
-                ),
-            ));
+        let rules = self.policy().rules_for(roles.iter().copied());
+        if let Some(why) = rules.refuse(password) {
+            // An account another tool made with this password still joins.
+            if verified(&auth).is_none() {
+                return Err(StoreError::new(
+                    StoreErrorKind::Invalid,
+                    format!("the boot account's password: {why}"),
+                ));
+            }
         }
         match auth.sign_up(identifier, password) {
             Ok(account) => {
@@ -565,21 +656,23 @@ impl NexAuth {
             Err(nex_db::Error::AlreadyExists { .. }) => {
                 if let Some(account) = verified(&auth) {
                     self.record(identifier, account)?;
-                    let held = auth.roles(account).map_err(nex)?;
-                    if ids.iter().any(|id| !held.contains(id)) {
-                        let mut all = held;
-                        all.extend(
-                            ids.iter()
-                                .filter(|id| !all.contains(id))
-                                .collect::<Vec<_>>(),
-                        );
-                        auth.assign_roles(account, &all).map_err(nex)?;
-                    }
+                    self.grant(account, &ids)?;
                 }
                 Ok(None)
             }
             Err(e) => Err(nex(e)),
         }
+    }
+
+    /// Gives the account `identifier` names every role in `roles` it lacks;
+    /// `false` when the directory does not know it.
+    pub fn ensure_roles(&self, identifier: &str, roles: &[&str]) -> Result<bool, StoreError> {
+        let Some(user) = self.known(identifier)? else {
+            return Ok(false);
+        };
+        let ids = self.role_ids(roles)?;
+        self.grant(account_of(user), &ids)?;
+        Ok(true)
     }
 
     /// Puts `identifier`'s account in the directory, when it is not there.
@@ -652,39 +745,88 @@ impl NexAuth {
 
     /// Bans the account: every session it holds ends in the same commit.
     pub fn ban(&self, user: UserId) -> Result<(), StoreError> {
-        let account = nex_db::AccountId::from_bytes(user.0.to_be_bytes());
         self.db
             .db()
             .auth()
-            .set_standing(account, nex_db::Standing::Banned { reason: 1 }, None)
+            .set_standing(
+                account_of(user),
+                nex_db::Standing::Banned { reason: 1 },
+                None,
+            )
             .map_err(nex)
     }
 
-    /// Signs `identifier` in with `password`: on success, the session
-    /// cookie's value (`__Host-nex=<token>; ...`) holding `perms`. `None` for
-    /// any refusal (wrong password, unknown account, locked out): the same
-    /// answer for each.
-    pub fn sign_in(&self, identifier: &str, password: &str) -> Result<Option<String>, StoreError> {
+    /// The first step of a sign-in: `identifier` and `password`. Every
+    /// refusal (wrong password, unknown account, locked out) is the same
+    /// answer.
+    pub fn check_password(
+        &self,
+        identifier: &str,
+        password: &str,
+    ) -> Result<PasswordStep, StoreError> {
         let auth = self.db.db().auth();
-        let PasswordCheck::Verified(account) =
-            auth.verify_password(identifier, password).map_err(nex)?
-        else {
-            return Ok(None);
-        };
-        // An account made before the directory, or by another tool, joins
-        // it the first time it signs in.
-        self.record(identifier, account)?;
-        let perms = self.perms_of(account)?;
-        let spec = SessionSpec::web()
-            .idle(IDLE)
-            .recheck_after(RECHECK)
+        match auth.verify_password(identifier, password).map_err(nex)? {
+            PasswordCheck::Verified(account) => {
+                // An account made before the directory, or by another tool,
+                // joins it the first time it signs in.
+                self.record(identifier, account)?;
+                let user = user_of(account);
+                if self.rules(user)?.mfa == MfaMode::Required && !self.totp_on(user)? {
+                    return Ok(PasswordStep::Setup(user));
+                }
+                Ok(PasswordStep::Done(user))
+            }
+            PasswordCheck::NeedsSecondFactor { account } => {
+                self.record(identifier, account)?;
+                Ok(PasswordStep::Code(user_of(account)))
+            }
+            _ => Ok(PasswordStep::Refused),
+        }
+    }
+
+    /// Opens a session for `user` (its password, and its code when it needs
+    /// one, already checked): the session cookie's value. Past the account's
+    /// session cap, its oldest sessions end.
+    pub fn open_session(&self, user: UserId) -> Result<String, StoreError> {
+        let account = account_of(user);
+        let policy = self.policy();
+        let (perms, names) = self.roles_of(account)?;
+        let rules = policy.rules_for(names.iter().map(String::as_str));
+        let spec = SessionSpec::new(rules.absolute)
+            .map_err(nex)?
+            .idle(rules.idle)
+            .recheck_after(policy.recheck)
             .payload(&perms.0.to_le_bytes())
             .map_err(nex)?;
+        let auth = self.db.db().auth();
         let token = auth.issue_session(account, spec).map_err(nex)?;
-        Ok(Some(format!(
-            "{SESSION_COOKIE}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=2592000",
-            token.as_str()
-        )))
+        if rules.max_sessions > 0 {
+            let mut sessions = auth.sessions(account).map_err(nex)?;
+            let cap = usize::try_from(rules.max_sessions).unwrap_or(usize::MAX);
+            if sessions.len() > cap {
+                // Oldest first; the one just issued is the newest.
+                sessions.sort_by_key(nex_db::SessionInfo::created_at);
+                let over = sessions.len() - cap;
+                for s in sessions.iter().take(over) {
+                    let _ = auth.revoke_session(account, s.id()).map_err(nex)?;
+                }
+            }
+        }
+        Ok(format!(
+            "{SESSION_COOKIE}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+            token.as_str(),
+            rules.absolute.as_secs()
+        ))
+    }
+
+    /// Signs `identifier` in with `password`, when no second step is
+    /// needed: the session cookie's value. `None` for any refusal, and for
+    /// an account that needs a code or two-step set-up first.
+    pub fn sign_in(&self, identifier: &str, password: &str) -> Result<Option<String>, StoreError> {
+        match self.check_password(identifier, password)? {
+            PasswordStep::Done(user) => self.open_session(user).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Ends the session `token` names; the cookie value that clears it.
@@ -729,6 +871,10 @@ fn account_of_hex(hex: &str) -> Option<nex_db::AccountId> {
     }
     let n = u128::from_str_radix(hex, 16).ok()?;
     Some(nex_db::AccountId::from_bytes(n.to_be_bytes()))
+}
+
+fn account_of(user: UserId) -> nex_db::AccountId {
+    nex_db::AccountId::from_bytes(user.0.to_be_bytes())
 }
 
 fn user_of(account: nex_db::AccountId) -> UserId {
@@ -785,11 +931,12 @@ impl Authenticator for NexAuth {
         // The permissions written at sign-in, until the first recheck; from
         // then on the account's roles and standing as read at most a minute
         // ago, so a removed role or a suspension reaches open sessions.
+        let recheck = self.policy().recheck;
         let (perms, standing) = if session
             .recheck_at()
             .is_some_and(|at| SystemTime::now() >= at)
         {
-            if let Some(known) = self.checked.get(id) {
+            if let Some(known) = self.checked.get(id, recheck) {
                 known
             } else {
                 let standing = match auth.standing(account) {
@@ -810,10 +957,26 @@ impl Authenticator for NexAuth {
                     // on what it last said.
                     Err(_) => return Authentication::Unavailable,
                 };
-                let Ok(perms) = self.perms_of(account) else {
+                let Ok((perms, names)) = self.roles_of(account) else {
                     return Authentication::Unavailable;
                 };
-                self.checked.put(id, perms, standing);
+                // Two-step sign-in now required of a role the account holds,
+                // and not set up: signed out, to set it up at the next
+                // sign-in.
+                let rules = self.policy().rules_for(names.iter().map(String::as_str));
+                if rules.mfa == MfaMode::Required {
+                    match self.totp_on(user_of(account)) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = auth.revoke(token);
+                            let a = guest(out);
+                            out.set_cookie(clear_cookie().as_bytes());
+                            return a;
+                        }
+                        Err(_) => return Authentication::Unavailable,
+                    }
+                }
+                self.checked.put(id, perms, standing, recheck);
                 (perms, standing)
             }
         } else {

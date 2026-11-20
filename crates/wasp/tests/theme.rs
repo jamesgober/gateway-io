@@ -247,6 +247,7 @@ fn error_pages_for_404_405_and_500() {
             message: "fine".into(),
             form: None,
             editor: None,
+            security: None,
         })
     })
     .public()

@@ -4,6 +4,7 @@
 <h1>{{ page.title }}</h1>
 <p>Signed in as <strong>{{ page.form.user }}</strong>.</p>
 {% if page.form.editor %}<p><a href="{{ page.site.admin }}">Edit the content</a></p>{% endif %}
+<p><a href="{{ page.site.account }}/security">Password, two-step sign-in and sessions</a></p>
 <form method="post" action="{{ page.form.action }}">
 <input type="hidden" name="csrf_token" value="{{ page.form.csrf }}">
 <button type="submit">Sign out</button>
