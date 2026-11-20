@@ -25,6 +25,11 @@ use wasp_core::suite::System;
 use wasp_core::suite::log;
 
 fn main() -> ExitCode {
+    // The parent that started this process, read before anything else: a
+    // front end that dies while the boot runs must still be noticed.
+    #[cfg(unix)]
+    let parent = std::os::unix::process::parent_id();
+
     // PHASE 0: the foundation and the kernel. Nothing is open yet.
     // No single-instance lock: a restart behind an application server
     // overlaps the old process's drain, and the database has its own lock.
@@ -120,7 +125,7 @@ fn main() -> ExitCode {
 
     #[cfg(unix)]
     if std::env::var_os("PORT").is_some() {
-        stop_with_front_end(boot.foundation());
+        stop_with_front_end(boot.foundation(), parent);
     }
 
     let system = match boot.ready() {
@@ -218,9 +223,11 @@ fn watch_providers(
 /// Behind an application server: asks for the same clean stop a SIGTERM
 /// would when standard input closes (only when it is a pipe or a socket: a
 /// terminal or `/dev/null` is not a front end) or when the parent process
-/// is gone (the process was handed to another parent).
+/// is gone (the process was handed to another parent). `parent` is the one
+/// read when the process started, so a parent that died during the boot
+/// stops it too.
 #[cfg(unix)]
-fn stop_with_front_end(foundation: &wasp_core::suite::Foundation) {
+fn stop_with_front_end(foundation: &wasp_core::suite::Foundation, parent: u32) {
     use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
 
@@ -247,7 +254,6 @@ fn stop_with_front_end(foundation: &wasp_core::suite::Foundation) {
                     .request_supervisor_stop("standard input closed (the front end let go)");
             });
     }
-    let parent = std::os::unix::process::parent_id();
     if parent > 1 {
         let f = foundation.clone();
         let _ = std::thread::Builder::new()
