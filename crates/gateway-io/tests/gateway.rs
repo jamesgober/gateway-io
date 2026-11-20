@@ -625,3 +625,64 @@ fn the_access_log_writes_a_line_per_request_without_the_query() {
         .expect("normal");
     let _ = open.close(Duration::from_secs(1));
 }
+
+/// Counts the bouncer's strikes.
+#[derive(Default)]
+struct Strikes(std::sync::atomic::AtomicUsize);
+
+impl bouncer_io::EventSink for Strikes {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::STRIKE {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn open_counting_strikes() -> (Door, SocketAddr, Arc<Strikes>) {
+    let strikes = Arc::new(Strikes::default());
+    let open = Door::open_with(
+        core(),
+        &settings(1, 4),
+        UrgentLine::detached(),
+        gateway_io::WebServices::new(),
+        gateway_io::Extras {
+            events: Some(strikes.clone()),
+            ..gateway_io::Extras::default()
+        },
+    )
+    .expect("gateway opens");
+    let addr = open.local_addr().expect("addr");
+    (open, addr, strikes)
+}
+
+/// Past net-io's 5 s grace for the inbound rate.
+const PAST_GRACE: Duration = Duration::from_secs(7);
+
+#[test]
+fn a_keep_alive_connection_idle_after_a_full_exchange_is_no_strike() {
+    let (open, addr, strikes) = open_counting_strikes();
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write");
+    let mut buf = [0u8; 4096];
+    let n = s.read(&mut buf).expect("reply");
+    assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "a full exchange");
+    thread::sleep(PAST_GRACE);
+    assert_eq!(strikes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(s);
+    let _ = open.close(Duration::from_secs(1));
+}
+
+/// A browser opens a spare connection ahead of need and may never use it:
+/// it closes at the head deadline, never as a slow peer the bouncer strikes.
+#[test]
+fn a_connection_that_never_sends_a_byte_is_no_strike() {
+    let (open, addr, strikes) = open_counting_strikes();
+    let s = TcpStream::connect(addr).expect("connect");
+    thread::sleep(PAST_GRACE);
+    assert_eq!(strikes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(s);
+    let _ = open.close(Duration::from_secs(1));
+}
