@@ -253,6 +253,36 @@ Every page view has `page.head`, with the search and sharing fields already fill
 
 The admin pages (`/admin` and below) have their own theme, built into the binary, so they work whatever the site theme is, and a site theme can neither restyle them nor put anything into them. They are sent with a stricter content security policy than the site's (nothing inline, nothing from another origin, never framed). An install that wants its own admin theme sets `[admin] custom_theme = true` and names a folder in `[admin] theme`, shaped like the built-in one (`crates/wasp/admin/`: `pages/` with `base`, `list`, `edit`, and `static/`, served under `/admin/static/`). The sign-in form and the account page stay with the site theme: every visitor sees them. The security pages (password, two-step sign-in, the second sign-in step) use the admin theme.
 
+## Error pages
+
+A theme's error pages are `errors/error.html` and `errors/error/<status>.html` (`errors/error/404.html`). An error page reads `error`:
+- `status`, `title`, `message` and `reference` (what a visitor quotes when they report it);
+- `base`;
+- `code`, the application's error code (`admin.unknown`, `content.unavailable`).
+
+`[errors]` sets, per status, the message a visitor reads and the template that shows it:
+
+```toml
+[errors.404]
+message = "Nothing lives at this address."
+template = "error/gone"          # themes/<theme>/errors/error/gone.html
+
+[errors.5xx]
+message = "Something broke on our side. Please try again in a minute."
+```
+
+A key is a status from 400 to 599, or `4xx` or `5xx`, and a status's own entry wins over its class. A key for any other code, an unknown setting, or a template the theme doesn't have stops the boot, or refuses the reload. The table is read again on every reload.
+
+A request under `/admin` always gets the admin theme's error page (built in, or `errors/` in a custom admin theme), never the site theme's.
+
+A handler sends any status from 400 to 599 with its own message in one call. The message replaces the configured one for that request, and the code and message go to the log:
+
+```rust
+return Err(site::fail(cx, 410, "content.gone", "This post was taken down."));
+```
+
+A status outside 400 to 599 there is a 500 with the code `site.bad_status`.
+
 ## Configuration
 
 A key wasp does not know, in any section, refuses the boot with its name, so a typo never leaves a setting at its default.

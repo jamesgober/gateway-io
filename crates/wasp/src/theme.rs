@@ -25,13 +25,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use luminess::Engine;
-use luminess::web::{ErrorView, Theme};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::lifecycle::{Commit, Deadline, Failure, Link, Subsystem};
 use wasp_core::suite::log;
@@ -63,6 +62,9 @@ const ADMIN_PAGES: &[(&str, &str)] = &[
     ("code", include_str!("../admin/pages/code.html")),
     ("accounts", include_str!("../admin/pages/accounts.html")),
 ];
+
+/// The built-in admin theme's error page (`errors/error.html`).
+const ADMIN_ERRORS: &[(&str, &str)] = &[("error", include_str!("../admin/errors/error.html"))];
 
 /// The built-in admin theme's stylesheet, served at `/admin/static/admin.css`.
 pub const ADMIN_CSS: &str = include_str!("../admin/static/admin.css");
@@ -440,8 +442,233 @@ luminess::view!(Page as "page" {
     security: object(Security),
 });
 
-/// The theme: what the watcher reloads.
-pub type SiteTheme = Theme<Page>;
+/// What an error page template reads, as `error`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorView {
+    /// The status (`404`).
+    pub status: u16,
+    /// Its title (`Not Found`).
+    pub title: String,
+    /// The message: the handler's own, else the configured one
+    /// (`[errors."404"] message`), else the generic one.
+    pub message: String,
+    /// The request's reference, as the visitor quotes it.
+    pub reference: String,
+    /// The site's base path (`""` at the root).
+    pub base: String,
+    /// The application's error code (`content.unavailable`), or empty.
+    pub code: String,
+}
+
+luminess::view!(ErrorView as "error" {
+    status: int,
+    title: text,
+    message: text,
+    reference: text,
+    base: text,
+    code: text,
+});
+
+/// The theme: its pages and its error pages, what the watcher reloads.
+/// Clones share them: a reload reaches every clone.
+#[derive(Clone)]
+pub struct SiteTheme {
+    pages: Engine<Page>,
+    errors: Engine<ErrorView>,
+}
+
+impl SiteTheme {
+    /// The page templates.
+    #[must_use]
+    pub fn pages(&self) -> &Engine<Page> {
+        &self.pages
+    }
+
+    /// The error page templates.
+    #[must_use]
+    pub fn error_pages(&self) -> &Engine<ErrorView> {
+        &self.errors
+    }
+}
+
+impl std::fmt::Debug for SiteTheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SiteTheme(..)")
+    }
+}
+
+/// What `[errors."<code>"]` sets for a status: the message a visitor reads,
+/// and the error page template.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorRule {
+    /// Shown instead of the generic message.
+    pub message: Option<String>,
+    /// An error page template (`error/gone`), instead of `error/<status>`.
+    pub template: Option<String>,
+}
+
+/// Every `[errors.*]` rule: by exact status, then by class.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorRules {
+    exact: std::collections::BTreeMap<u16, ErrorRule>,
+    client: Option<ErrorRule>,
+    server: Option<ErrorRule>,
+}
+
+/// The longest configured error message, in characters.
+pub const ERROR_MESSAGE_MAX: usize = 500;
+
+impl ErrorRules {
+    /// The rules `[errors.*]` sets. A key is a status from 400 to 599, or
+    /// `4xx` or `5xx`; any other is refused, and so is an unknown key.
+    pub fn from_config(config: &Config) -> Result<ErrorRules, String> {
+        let mut out = ErrorRules::default();
+        for key in config.keys("errors") {
+            let at = format!("errors.\"{key}\"");
+            let place = format!("errors.{key}");
+            if let Some(k) = config
+                .keys(&place)
+                .into_iter()
+                .find(|k| !matches!(*k, "message" | "template"))
+            {
+                return Err(format!(
+                    "unknown key `{k}` in [{at}]: the keys are message and template"
+                ));
+            }
+            let message: Option<String> = config
+                .get(&format!("{place}.message"))
+                .map_err(|e| e.to_string())?;
+            if let Some(m) = &message
+                && (m.trim().is_empty()
+                    || m.chars().count() > ERROR_MESSAGE_MAX
+                    || m.chars().any(char::is_control))
+            {
+                return Err(format!(
+                    "[{at}] message must be one line of 1 to {ERROR_MESSAGE_MAX} characters"
+                ));
+            }
+            let template: Option<String> = config
+                .get(&format!("{place}.template"))
+                .map_err(|e| e.to_string())?;
+            if let Some(t) = &template {
+                let ok = !t.is_empty()
+                    && t.split('/').all(|part| {
+                        !part.is_empty()
+                            && part.bytes().all(|b| {
+                                b.is_ascii_lowercase()
+                                    || b.is_ascii_digit()
+                                    || b == b'-'
+                                    || b == b'_'
+                            })
+                    });
+                if !ok {
+                    return Err(format!(
+                        "[{at}] template `{t}` must name an error page, like `error/gone` (errors/error/gone.html)"
+                    ));
+                }
+            }
+            let rule = ErrorRule { message, template };
+            match key {
+                "4xx" => out.client = Some(rule),
+                "5xx" => out.server = Some(rule),
+                code => match code.parse::<u16>() {
+                    Ok(n) if (400..=599).contains(&n) && code.len() == 3 => {
+                        out.exact.insert(n, rule);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "[{at}]: an error page is set for a status from 400 to 599, or `4xx` or `5xx`"
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rule for `status`: its own, else its class's.
+    #[must_use]
+    pub fn for_status(&self, status: u16) -> Option<&ErrorRule> {
+        self.exact.get(&status).or(match status {
+            400..=499 => self.client.as_ref(),
+            500..=599 => self.server.as_ref(),
+            _ => None,
+        })
+    }
+
+    /// Refuses a rule naming a template the theme's error pages lack.
+    pub fn check(&self, errors: &Engine<ErrorView>) -> Result<(), String> {
+        let all = self
+            .exact
+            .iter()
+            .map(|(k, r)| (k.to_string(), r))
+            .chain(self.client.iter().map(|r| ("4xx".to_owned(), r)))
+            .chain(self.server.iter().map(|r| ("5xx".to_owned(), r)));
+        for (key, rule) in all {
+            if let Some(t) = &rule.template
+                && !errors.contains(t)
+            {
+                return Err(format!(
+                    "[errors.\"{key}\"] template `{t}`: the theme has no errors/{t}.html"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_rule_tests {
+    use super::*;
+
+    fn rules(text: &str) -> Result<ErrorRules, String> {
+        ErrorRules::from_config(&Config::from_text(text).expect("toml"))
+    }
+
+    #[test]
+    fn statuses_and_classes_are_checked_and_an_exact_one_wins() {
+        for (text, says) in [
+            ("[errors.399]\nmessage = \"x\"\n", "400 to 599"),
+            ("[errors.600]\nmessage = \"x\"\n", "400 to 599"),
+            ("[errors.3xx]\nmessage = \"x\"\n", "400 to 599"),
+            ("[errors.404]\nmesage = \"x\"\n", "unknown key"),
+            (
+                "[errors.404]\ntemplate = \"../secret\"\n",
+                "must name an error page",
+            ),
+            ("[errors.404]\nmessage = \" \"\n", "one line"),
+        ] {
+            let e = rules(text).expect_err(text);
+            assert!(e.contains(says), "{text}: {e}");
+        }
+        let r = rules(
+            "[errors.404]\nmessage = \"Nothing here.\"\n[errors.4xx]\nmessage = \"Your request.\"\n[errors.5xx]\ntemplate = \"error/oops\"\n",
+        )
+        .expect("rules");
+        assert_eq!(
+            r.for_status(404).and_then(|x| x.message.as_deref()),
+            Some("Nothing here.")
+        );
+        assert_eq!(
+            r.for_status(410).and_then(|x| x.message.as_deref()),
+            Some("Your request.")
+        );
+        assert_eq!(
+            r.for_status(503).and_then(|x| x.template.as_deref()),
+            Some("error/oops")
+        );
+        assert!(r.for_status(200).is_none());
+        let errors = Engine::<ErrorView>::builder()
+            .template("error", "{{ error.message }}")
+            .build()
+            .expect("engine");
+        let e = r.check(&errors).expect_err("no error/oops");
+        assert!(e.contains("errors/error/oops.html"), "{e}");
+    }
+}
+
+/// The error rules in force, swapped whole by a reload.
+pub type ErrorRulesCell = Arc<RwLock<Arc<ErrorRules>>>;
 
 /// How many times the engine rendered, since the site was built: one
 /// relaxed add per render.
@@ -560,8 +787,12 @@ pub const FORM_EXPIRED_TITLE: &str = "Form expired";
 /// The error page's message when a form's token was refused.
 pub const FORM_EXPIRED: &str = "This form expired. Reload the page and try again. If you typed a lot, go back first and copy it.";
 
-/// The admin pages' engine.
-pub type AdminTheme = Engine<Page>;
+/// The admin pages' engines: its pages and its error pages.
+#[derive(Clone)]
+pub struct AdminTheme {
+    pages: Engine<Page>,
+    errors: Engine<ErrorView>,
+}
 
 /// Where the admin theme comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -577,23 +808,38 @@ pub fn load_admin(source: &AdminSource) -> Result<AdminTheme, ThemeError> {
     match source {
         AdminSource::Builtin => compile_admin(
             "built-in admin theme",
-            ADMIN_PAGES
-                .iter()
-                .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
-                .collect(),
+            owned(ADMIN_PAGES),
+            owned(ADMIN_ERRORS),
         ),
         AdminSource::Folder(dir) => {
             let mut budget = MAX_THEME_BYTES;
             let mut files = 0;
             let pages = sources(&dir.join("pages"), &mut budget, &mut files)?;
-            compile_admin(&dir.display().to_string(), pages)
+            // A custom admin theme without error pages uses the built-in one.
+            let errors = if dir.join("errors").is_dir() {
+                sources(&dir.join("errors"), &mut budget, &mut files)?
+            } else {
+                owned(ADMIN_ERRORS)
+            };
+            compile_admin(&dir.display().to_string(), pages, errors)
         }
     }
 }
 
+fn owned(templates: &[(&str, &str)]) -> Vec<(String, String)> {
+    templates
+        .iter()
+        .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+        .collect()
+}
+
 /// Compiles an admin theme on its own thread with a large stack, as a site
 /// theme is.
-fn compile_admin(shown: &str, pages: Vec<(String, String)>) -> Result<AdminTheme, ThemeError> {
+fn compile_admin(
+    shown: &str,
+    pages: Vec<(String, String)>,
+    errors: Vec<(String, String)>,
+) -> Result<AdminTheme, ThemeError> {
     let name = shown.to_owned();
     let worker = std::thread::Builder::new()
         .name("theme-compile".into())
@@ -613,7 +859,20 @@ fn compile_admin(shown: &str, pages: Vec<(String, String)>) -> Result<AdminTheme
                         )));
                     }
                 }
-                Ok(engine)
+                let errors = errors
+                    .into_iter()
+                    .fold(Engine::<ErrorView>::builder(), |b, (n, s)| b.template(n, s))
+                    .build()
+                    .map_err(|e| ThemeError(format!("admin theme {name} errors: {e}")))?;
+                if !errors.contains("error") {
+                    return Err(ThemeError(format!(
+                        "admin theme {name}: errors/error.html is missing"
+                    )));
+                }
+                Ok(AdminTheme {
+                    pages: engine,
+                    errors,
+                })
             })
             .unwrap_or(Err(failed))
         })
@@ -631,18 +890,31 @@ const ADMIN_TEMPLATE: u32 = 1 << 31;
 
 /// The site theme and the admin theme as one engine: a template named
 /// `admin/<name>` is the admin theme's `<name>`, and every other name is
-/// the site theme's. Error pages are the site theme's.
+/// the site theme's. A request under `/admin` gets the admin theme's error
+/// page, any other the site theme's, as `[errors.*]` says.
 #[derive(Clone)]
 pub struct SiteRender {
     site: SiteTheme,
     admin: AdminTheme,
+    rules: ErrorRulesCell,
 }
 
 impl SiteRender {
-    /// The site theme with its admin theme.
+    /// The site theme with its admin theme, and no `[errors.*]` rules.
     #[must_use]
     pub fn new(site: SiteTheme, admin: AdminTheme) -> SiteRender {
-        SiteRender { site, admin }
+        SiteRender {
+            site,
+            admin,
+            rules: Arc::default(),
+        }
+    }
+
+    /// The same engine, following the `[errors.*]` rules in `rules`.
+    #[must_use]
+    pub fn with_rules(mut self, rules: ErrorRulesCell) -> SiteRender {
+        self.rules = rules;
+        self
     }
 
     /// The site theme with the built-in admin theme.
@@ -656,12 +928,11 @@ impl web_net::Render for SiteRender {
 
     fn template(&self, name: &str) -> Option<web_net::TemplateId> {
         match name.strip_prefix("admin/") {
-            Some(admin) => web_net::Render::template(&self.admin, admin)
+            Some(admin) => web_net::Render::template(&self.admin.pages, admin)
                 .filter(|t| t.0 & ADMIN_TEMPLATE == 0)
                 .map(|t| web_net::TemplateId(t.0 | ADMIN_TEMPLATE)),
-            None => {
-                web_net::Render::template(&self.site, name).filter(|t| t.0 & ADMIN_TEMPLATE == 0)
-            }
+            None => web_net::Render::template(&self.site.pages, name)
+                .filter(|t| t.0 & ADMIN_TEMPLATE == 0),
         }
     }
 
@@ -673,10 +944,10 @@ impl web_net::Render for SiteRender {
         out: &mut web_net::Output<'_>,
     ) -> Result<(), web_net::RenderError> {
         if template.0 & ADMIN_TEMPLATE == 0 {
-            web_net::Render::render(&self.site, template, view, out)
+            web_net::Render::render(&self.site.pages, template, view, out)
         } else {
             let id = web_net::TemplateId(template.0 & !ADMIN_TEMPLATE);
-            web_net::Render::render(&self.admin, id, view, out)
+            web_net::Render::render(&self.admin.pages, id, view, out)
         }
     }
 
@@ -685,7 +956,59 @@ impl web_net::Render for SiteRender {
         page: &web_net::ErrorPage<'_>,
         out: &mut web_net::Output<'_>,
     ) -> Result<bool, web_net::RenderError> {
-        web_net::Render::error_page(&self.site, page, out)
+        let admin = gateway_io::note::path_under(&format!("{}/admin", page.base));
+        let rules = self
+            .rules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let rule = rules.for_status(page.status);
+        let own = crate::events::failed_message(page.reference);
+        // The handler's own message, then an expired form's, then the
+        // configured one, then the generic one.
+        let message = match own {
+            Some(m) => m,
+            None if page.title == FORM_EXPIRED_TITLE => page.message.to_owned(),
+            None => rule
+                .and_then(|r| r.message.clone())
+                .unwrap_or_else(|| page.message.to_owned()),
+        };
+        let view = ErrorView {
+            status: page.status,
+            title: page.title.to_owned(),
+            message,
+            reference: page.reference.to_owned(),
+            base: page.base.to_owned(),
+            code: crate::events::code_of(page.reference)
+                .unwrap_or_default()
+                .to_owned(),
+        };
+        let (engine, configured) = if admin {
+            (&self.admin.errors, None)
+        } else {
+            (&self.site.errors, rule.and_then(|r| r.template.clone()))
+        };
+        let buf = out.buffer();
+        let start = buf.len();
+        let names = configured
+            .into_iter()
+            .chain([format!("error/{}", page.status), "error".to_owned()]);
+        for name in names {
+            match engine.render_into(&name, &view, buf) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.kind() == luminess::ErrorKind::NotFound => {}
+                Err(e) => {
+                    buf.truncate(start);
+                    let code = if e.kind() == luminess::ErrorKind::TooLarge {
+                        "luminess.too_large"
+                    } else {
+                        "luminess.render"
+                    };
+                    return Err(web_net::RenderError::new(code).with_detail(e.to_string()));
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -836,17 +1159,17 @@ fn compile_sources(
 /// Loads the theme in `dir`.
 pub fn load(dir: &Path) -> Result<SiteTheme, ThemeError> {
     let (pages, errors) = compile(dir)?;
-    Ok(Theme::new(pages).with_error_pages(errors))
+    Ok(SiteTheme { pages, errors })
 }
 
 /// Compiles the theme in `dir` again and swaps it into `theme` (every clone,
-/// so the running site). On any error nothing changes.
-pub fn reload(theme: &SiteTheme, dir: &Path) -> Result<(), ThemeError> {
+/// so the running site). A theme that lacks an error page `rules` names is
+/// refused. On any error nothing changes.
+pub fn reload(theme: &SiteTheme, dir: &Path, rules: &ErrorRules) -> Result<(), ThemeError> {
     let (pages, errors) = compile(dir)?;
+    rules.check(&errors).map_err(ThemeError)?;
     theme.pages().replace(pages);
-    if let Some(e) = theme.error_pages() {
-        e.replace(errors);
-    }
+    theme.error_pages().replace(errors);
     Ok(())
 }
 
@@ -892,6 +1215,9 @@ pub struct ThemeWatcher {
     link: Option<Link>,
     /// Called after every reload that took (to drop cached pages).
     changed: Arc<dyn Fn() + Send + Sync>,
+    /// The `[errors.*]` rules: read again on a configuration reload, and
+    /// checked against every theme reload.
+    rules: ErrorRulesCell,
 }
 
 impl ThemeWatcher {
@@ -908,7 +1234,15 @@ impl ThemeWatcher {
             thread: None,
             link: None,
             changed: Arc::new(|| {}),
+            rules: Arc::default(),
         }
+    }
+
+    /// The same watcher, keeping `rules` (shared with the site's engine).
+    #[must_use]
+    pub fn with_rules(mut self, rules: ErrorRulesCell) -> ThemeWatcher {
+        self.rules = rules;
+        self
     }
 
     /// The same watcher, calling `f` after every reload that took (to drop
@@ -922,7 +1256,7 @@ impl ThemeWatcher {
     /// Compiles the theme folder again and swaps it in, as the watcher does
     /// when the folder changes. On any error nothing changes.
     pub fn reload_now(&self) -> Result<(), ThemeError> {
-        reload(&self.theme, &self.dir)?;
+        reload(&self.theme, &self.dir, &current(&self.rules))?;
         (self.changed)();
         Ok(())
     }
@@ -940,14 +1274,23 @@ impl ThemeWatcher {
     }
 }
 
+/// The rules in force now.
+fn current(rules: &ErrorRulesCell) -> Arc<ErrorRules> {
+    rules
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 fn reload_and_log(
     theme: &SiteTheme,
     dir: &Path,
+    rules: &ErrorRulesCell,
     changed: &(dyn Fn() + Send + Sync),
     link: &Link,
     why: &str,
 ) {
-    match reload(theme, dir) {
+    match reload(theme, dir, &current(rules)) {
         Ok(()) => {
             changed();
             log::info!(link.foundation().log(), "theme reloaded", cause = why);
@@ -980,6 +1323,7 @@ impl Subsystem for ThemeWatcher {
             self.seen,
             self.changed.clone(),
         );
+        let rules = self.rules.clone();
         let thread = std::thread::Builder::new()
             .name("theme-watch".into())
             .spawn(move || {
@@ -994,7 +1338,14 @@ impl Subsystem for ThemeWatcher {
                         let now = fingerprint(&dir);
                         if now != seen {
                             seen = now;
-                            reload_and_log(&theme, &dir, &*changed, &link, "theme folder changed");
+                            reload_and_log(
+                                &theme,
+                                &dir,
+                                &rules,
+                                &*changed,
+                                &link,
+                                "theme folder changed",
+                            );
                         }
                     }));
                     if turn.is_err() {
@@ -1020,15 +1371,22 @@ impl Subsystem for ThemeWatcher {
 
     /// A configuration reload recompiles the theme too (the folder may have
     /// changed without the watcher, when polling is off).
-    fn reload(&mut self, _config: &Config) -> Result<Commit, Failure> {
+    /// A configuration reload reads `[errors.*]` again and recompiles the
+    /// theme (the folder may have changed without the watcher, when polling
+    /// is off); a rule naming a template the theme lacks refuses it.
+    fn reload(&mut self, config: &Config) -> Result<Commit, Failure> {
+        let rules = ErrorRules::from_config(config).map_err(Failure::new)?;
         let (pages, errors) = compile(&self.dir)?;
+        rules.check(&errors).map_err(Failure::new)?;
         let theme = self.theme.clone();
         let changed = self.changed.clone();
+        let cell = self.rules.clone();
         Ok(Commit::new(move || {
             theme.pages().replace(pages);
-            if let Some(e) = theme.error_pages() {
-                e.replace(errors);
-            }
+            theme.error_pages().replace(errors);
+            *cell
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(rules);
             changed();
         }))
     }

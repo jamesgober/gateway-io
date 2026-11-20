@@ -805,6 +805,73 @@ lock_wait = \"0s\"
 }
 
 #[test]
+fn error_pages_follow_the_errors_table_and_admin_errors_use_the_admin_theme() {
+    let data = temp_dir("errors");
+    let theme = data.0.join("theme");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default"),
+        &theme,
+    );
+    std::fs::write(
+        theme.join("errors/error/gone.html"),
+        "<p>gone: {{ error.status }} {{ error.message }} [{{ error.code }}]</p>",
+    )
+    .expect("template");
+    let conf = Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n\
+         [errors.404]\nmessage = \"Nothing lives at this address.\"\ntemplate = \"error/gone\"\n\
+         [errors.4xx]\nmessage = \"That request was not right.\"\n",
+        slash(&theme),
+        slash(&data.0.join("nex"))
+    ))
+    .expect("config");
+    let (door, addr) = open(&conf);
+
+    // The site: the configured template and message.
+    let missing = get(addr, "/no/such/page", &[]);
+    assert_eq!(missing.status, 404);
+    assert!(
+        missing
+            .body
+            .contains("gone: 404 Nothing lives at this address."),
+        "{}",
+        missing.body
+    );
+
+    // Under /admin: the admin theme's error page, with the handler's own
+    // message and its code.
+    let ed = sign_in_as(addr, EDITOR);
+    let unknown = get(addr, "/admin/edit/no-such-entry", &[&ed]);
+    assert_eq!(unknown.status, 404, "{unknown:?}");
+    assert!(
+        unknown.body.contains("/admin/static/admin.css"),
+        "{}",
+        unknown.body
+    );
+    assert!(
+        !unknown.body.contains("gone:"),
+        "never the site theme's page"
+    );
+    assert!(
+        unknown.body.contains("No post or page has that slug."),
+        "{}",
+        unknown.body
+    );
+    assert!(unknown.body.contains("(admin.unknown)"), "{}", unknown.body);
+    let _ = door.close(Duration::from_secs(2));
+
+    // A rule naming a page the theme lacks stops the boot.
+    let bad = Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n[errors.5xx]\ntemplate = \"error/oops\"\n",
+        slash(&theme),
+        slash(&data.0.join("nex2"))
+    ))
+    .expect("config");
+    let e = wasp::wire(&bad).expect_err("missing template");
+    assert!(e.contains("errors/error/oops.html"), "{e}");
+}
+
+#[test]
 fn a_site_theme_cannot_replace_the_admin_pages() {
     let data = temp_dir("admin-split");
     let site = data.0.join("site-theme");

@@ -410,6 +410,51 @@ fn encode(exit: &Exit, out: &mut HttpReply) -> bool {
     reply.closes()
 }
 
+impl Pipeline {
+    /// [`HttpService::call`], between the note's start and end.
+    fn call_noted(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
+        let tag = TicketTag::from_raw(env.user_word());
+        let worker = env.worker().get();
+        // A later part of a reply in parts: the request was authorized when
+        // its first part ran. No passport, customs, or authentication again,
+        // and nothing here can refuse into a body already on the wire (a
+        // revocation is serve-net's checkpoint, which aborts the connection).
+        if let Some(h) = self.tickets.unpark(worker, tag) {
+            return self.continue_web(h, req, env, tag, reply);
+        }
+        let mut marks = self.stages.enabled().then(Stamps::start);
+        let mut loan = Loan {
+            pool: &self.pool,
+            worker: env.worker().get(),
+            out: false,
+        };
+        let outcome = match self.request(req, env, tag, reply, &mut marks, &mut loan) {
+            Flow::Exit(exit) => {
+                let o = self.respond(exit, tag, reply);
+                loan.out = false;
+                o
+            }
+            Flow::Web(exit, outcome) => {
+                let o = self.respond_web(exit, outcome);
+                loan.out = false;
+                o
+            }
+            Flow::Parked(outcome) => outcome,
+            Flow::NoPassport => {
+                reply
+                    .text(503, wasp_core::refusal_text(503))
+                    .retry_after(Duration::from_secs(1));
+                Outcome::Done
+            }
+        };
+        if let Some(mut m) = marks {
+            m.respond = Some(Instant::now());
+            self.tickets.set_stamps(env.worker().get(), tag, m);
+        }
+        outcome
+    }
+}
+
 impl HttpService for Pipeline {
     /// The head is complete: the request's bouncer ticket, under the
     /// connection's, is taken and held until `done`. A connection the door
@@ -456,44 +501,11 @@ impl HttpService for Pipeline {
     }
 
     fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
-        let tag = TicketTag::from_raw(env.user_word());
-        let worker = env.worker().get();
-        // A later part of a reply in parts: the request was authorized when
-        // its first part ran. No passport, customs, or authentication again,
-        // and nothing here can refuse into a body already on the wire (a
-        // revocation is serve-net's checkpoint, which aborts the connection).
-        if let Some(h) = self.tickets.unpark(worker, tag) {
-            return self.continue_web(h, req, env, tag, reply);
-        }
-        let mut marks = self.stages.enabled().then(Stamps::start);
-        let mut loan = Loan {
-            pool: &self.pool,
-            worker: env.worker().get(),
-            out: false,
-        };
-        let outcome = match self.request(req, env, tag, reply, &mut marks, &mut loan) {
-            Flow::Exit(exit) => {
-                let o = self.respond(exit, tag, reply);
-                loan.out = false;
-                o
-            }
-            Flow::Web(exit, outcome) => {
-                let o = self.respond_web(exit, outcome);
-                loan.out = false;
-                o
-            }
-            Flow::Parked(outcome) => outcome,
-            Flow::NoPassport => {
-                reply
-                    .text(503, wasp_core::refusal_text(503))
-                    .retry_after(Duration::from_secs(1));
-                Outcome::Done
-            }
-        };
-        if let Some(mut m) = marks {
-            m.respond = Some(Instant::now());
-            self.tickets.set_stamps(env.worker().get(), tag, m);
-        }
+        // The path, for a web service on this thread that asks where it is
+        // (`note::path_under`); what it notes is taken when the call ends.
+        crate::note::begin(req.path());
+        let outcome = self.call_noted(req, env, reply);
+        let _ = crate::note::end();
         outcome
     }
 

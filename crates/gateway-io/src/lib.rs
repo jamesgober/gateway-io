@@ -26,6 +26,7 @@ pub mod events;
 pub mod gatekeeper;
 pub mod gateway;
 pub mod load;
+pub mod note;
 pub mod observe;
 pub mod pipeline;
 pub mod settings;
