@@ -19,6 +19,30 @@
 <label>Summary <input name="summary" value="{{ page.editor.summary }}"></label>
 <label>Date <input type="date" name="date" value="{{ page.editor.date }}"></label>
 <label>Body <textarea name="body" rows="18">{{ page.editor.body }}</textarea></label>
+<fieldset class="stack wide">
+<legend>Search and sharing</legend>
+<p class="muted">All optional. Left empty, the title and summary are used.</p>
+<label>Search title <input name="seo_title" value="{{ page.editor.meta.seo_title }}" maxlength="200"></label>
+<label>Meta description <textarea name="description" rows="2" maxlength="500">{{ page.editor.meta.description }}</textarea></label>
+<label>Canonical address <input name="canonical" value="{{ page.editor.meta.canonical }}" placeholder="/path or https://..."></label>
+<label>Robots <select name="robots">
+<option value=""{% if not page.editor.meta.robots %} selected{% endif %}>Default (index, follow)</option>
+<option value="noindex"{% if page.editor.meta.robots == "noindex" %} selected{% endif %}>noindex</option>
+<option value="nofollow"{% if page.editor.meta.robots == "nofollow" %} selected{% endif %}>nofollow</option>
+<option value="noindex, nofollow"{% if page.editor.meta.robots == "noindex, nofollow" %} selected{% endif %}>noindex, nofollow</option>
+<option value="noindex, follow"{% if page.editor.meta.robots == "noindex, follow" %} selected{% endif %}>noindex, follow</option>
+<option value="index, nofollow"{% if page.editor.meta.robots == "index, nofollow" %} selected{% endif %}>index, nofollow</option>
+<option value="index, follow"{% if page.editor.meta.robots == "index, follow" %} selected{% endif %}>index, follow</option>
+</select></label>
+<label>Sharing title <input name="og_title" value="{{ page.editor.meta.og_title }}" maxlength="200"></label>
+<label>Sharing description <textarea name="og_description" rows="2" maxlength="500">{{ page.editor.meta.og_description }}</textarea></label>
+<label>Sharing image <input name="og_image" value="{{ page.editor.meta.og_image }}" placeholder="/static/card.png or https://..."></label>
+<label>Card <select name="twitter_card">
+<option value=""{% if not page.editor.meta.twitter_card %} selected{% endif %}>Default (large when there is an image)</option>
+<option value="summary"{% if page.editor.meta.twitter_card == "summary" %} selected{% endif %}>summary</option>
+<option value="summary_large_image"{% if page.editor.meta.twitter_card == "summary_large_image" %} selected{% endif %}>summary_large_image</option>
+</select></label>
+</fieldset>
 <button type="submit">Save</button>
 </form>
 {% if page.editor.existing %}

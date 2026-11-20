@@ -19,6 +19,8 @@ input, textarea, select { font: inherit; padding: 0.4rem 0.5rem; border: 1px sol
 button { font: inherit; padding: 0.4rem 1rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: #fff; cursor: pointer; justify-self: start; }
 button.danger { background: var(--danger); border-color: var(--danger); margin-top: 1rem; }
 p.error { color: var(--danger); }
+fieldset { border: 1px solid var(--line); border-radius: 4px; padding: 0.75rem; }
+legend { font-weight: 600; padding: 0 0.25rem; }
 p.notice { color: var(--accent); }
 .muted { color: var(--muted); }
 section { margin-top: 1.5rem; }

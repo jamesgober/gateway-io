@@ -53,6 +53,7 @@ fn main() {
         black_box(Page {
             site: site.clone(),
             title: "The passport".into(),
+            head: std::sync::Arc::default(),
             entry: entry.clone(),
             posts: manifest.posts(),
             message: String::new(),
@@ -64,6 +65,7 @@ fn main() {
     let page = Page {
         site: site.clone(),
         title: "The passport".into(),
+        head: std::sync::Arc::default(),
         entry: entry.clone(),
         posts: manifest.posts(),
         message: String::new(),

@@ -50,6 +50,197 @@ pub struct Entry {
     pub date: String,
     /// The body as the author wrote it (plain text), for the editor.
     pub text: String,
+    /// The search and sharing fields, as the author set them (empty: the
+    /// page head falls back to the title and summary).
+    pub meta: Meta,
+}
+
+/// An entry's search and sharing fields. Each is optional; the page head
+/// falls back to the title and summary (see `crate::site`).
+///
+/// The first four are text a reader sees and are translated with the title
+/// and summary when translations arrive: each translation will carry its
+/// own. The other four are the entry's, whatever the language.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Meta {
+    /// The title for search results and the browser tab (default: the
+    /// title).
+    pub seo_title: String,
+    /// The meta description (default: the summary).
+    pub description: String,
+    /// The title when shared (default: the search title).
+    pub og_title: String,
+    /// The description when shared (default: the meta description).
+    pub og_description: String,
+    /// The canonical address: a site path (`/about`) or an absolute
+    /// `https://` URL (default: the entry's own address).
+    pub canonical: String,
+    /// The robots directive: `index, follow`, `noindex`, `nofollow`,
+    /// `noindex, nofollow`, `noindex, follow`, or `index, nofollow`
+    /// (default: none, which search engines read as `index, follow`).
+    pub robots: String,
+    /// The image when shared: a site path or an absolute `https://` URL.
+    pub og_image: String,
+    /// The card when shared on X: `summary` or `summary_large_image`
+    /// (default: the large one when there is an image).
+    pub twitter_card: String,
+}
+
+/// The robots directives an entry may set.
+pub const ROBOTS: &[&str] = &[
+    "index, follow",
+    "noindex",
+    "nofollow",
+    "noindex, nofollow",
+    "noindex, follow",
+    "index, nofollow",
+];
+
+/// The card kinds an entry may set.
+pub const TWITTER_CARDS: &[&str] = &["summary", "summary_large_image"];
+
+/// The longest search or sharing title, in characters.
+pub const META_TITLE_MAX: usize = 200;
+
+/// The longest description, in characters.
+pub const META_DESCRIPTION_MAX: usize = 500;
+
+/// The longest address, in bytes.
+pub const META_URL_MAX: usize = 2000;
+
+impl Meta {
+    /// The fields, by the names the stores and the editor's form use.
+    pub const FIELDS: [&'static str; 8] = [
+        "seo_title",
+        "description",
+        "og_title",
+        "og_description",
+        "canonical",
+        "robots",
+        "og_image",
+        "twitter_card",
+    ];
+
+    /// The field `name`, or `None` for a name that is not one.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        Some(match name {
+            "seo_title" => &self.seo_title,
+            "description" => &self.description,
+            "og_title" => &self.og_title,
+            "og_description" => &self.og_description,
+            "canonical" => &self.canonical,
+            "robots" => &self.robots,
+            "og_image" => &self.og_image,
+            "twitter_card" => &self.twitter_card,
+            _ => return None,
+        })
+    }
+
+    /// The field `name` to write, or `None` for a name that is not one.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut String> {
+        Some(match name {
+            "seo_title" => &mut self.seo_title,
+            "description" => &mut self.description,
+            "og_title" => &mut self.og_title,
+            "og_description" => &mut self.og_description,
+            "canonical" => &mut self.canonical,
+            "robots" => &mut self.robots,
+            "og_image" => &mut self.og_image,
+            "twitter_card" => &mut self.twitter_card,
+            _ => return None,
+        })
+    }
+
+    /// The same fields with runs of whitespace (line breaks too) made one
+    /// space and the ends trimmed; the robots directive and the card kind
+    /// in lower case with one space after each comma.
+    #[must_use]
+    pub fn cleaned(&self) -> Meta {
+        let one_line = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let robots = self
+            .robots
+            .split(',')
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Meta {
+            seo_title: one_line(&self.seo_title),
+            description: one_line(&self.description),
+            og_title: one_line(&self.og_title),
+            og_description: one_line(&self.og_description),
+            canonical: self.canonical.trim().to_owned(),
+            robots,
+            og_image: self.og_image.trim().to_owned(),
+            twitter_card: self.twitter_card.trim().to_lowercase(),
+        }
+    }
+
+    /// Why these fields (cleaned) are refused, in words for the author.
+    pub fn check(&self) -> Result<(), Invalid> {
+        let m = self.cleaned();
+        for (name, value, max) in [
+            ("search title", &m.seo_title, META_TITLE_MAX),
+            ("meta description", &m.description, META_DESCRIPTION_MAX),
+            ("sharing title", &m.og_title, META_TITLE_MAX),
+            (
+                "sharing description",
+                &m.og_description,
+                META_DESCRIPTION_MAX,
+            ),
+        ] {
+            if value.chars().count() > max {
+                return Err(Invalid(format!(
+                    "the {name} is longer than {max} characters"
+                )));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(Invalid(format!("the {name} has a control character")));
+            }
+        }
+        for (name, value) in [
+            ("canonical address", &m.canonical),
+            ("sharing image", &m.og_image),
+        ] {
+            if !value.is_empty() && !address_ok(value) {
+                return Err(Invalid(format!(
+                    "the {name} must be a site path starting with `/`, or an `https://` or `http://` address, with no spaces"
+                )));
+            }
+        }
+        if !m.robots.is_empty() && !ROBOTS.contains(&m.robots.as_str()) {
+            return Err(Invalid(format!(
+                "robots must be one of: {}",
+                ROBOTS.join("; ")
+            )));
+        }
+        if !m.twitter_card.is_empty() && !TWITTER_CARDS.contains(&m.twitter_card.as_str()) {
+            return Err(Invalid(
+                "the card must be `summary` or `summary_large_image`".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A site path (`/about`, never `//host`) or an `http(s)://` address, with
+/// nothing that could leave an attribute.
+fn address_ok(value: &str) -> bool {
+    if value.len() > META_URL_MAX
+        || value.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`')
+        })
+    {
+        return false;
+    }
+    if let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    {
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    value.starts_with('/') && !value.starts_with("//")
 }
 
 /// What an editor saves.
@@ -67,6 +258,8 @@ pub struct Draft<'a> {
     pub body: &'a str,
     /// The date, for posts.
     pub date: &'a str,
+    /// The search and sharing fields.
+    pub meta: Meta,
 }
 
 /// Why a draft was refused (the editor sees it; nothing is saved).
@@ -139,6 +332,8 @@ pub struct Stored {
     pub body: String,
     /// The date, for posts.
     pub date: String,
+    /// The search and sharing fields (missing in an older record: empty).
+    pub meta: Meta,
 }
 
 /// What kind of failure a store reports, whatever the backend: a file, an
@@ -307,7 +502,7 @@ mod bison_store {
     use bison_db::{Db, DbOptions, Document, RecoveryMode, SyncPolicy, Value};
     use wasp_core::{Provider, ProviderError};
 
-    use super::{ContentStore, StoreError, StoreErrorKind, Stored};
+    use super::{ContentStore, Meta, StoreError, StoreErrorKind, Stored};
 
     /// Content in a bison-db file: one document per entry, keyed by slug. Every
     /// write is synced to disk (content is written rarely and must survive a
@@ -459,6 +654,12 @@ mod bison_store {
                         .unwrap_or("")
                         .to_owned()
                 };
+                let mut meta = Meta::default();
+                for name in Meta::FIELDS {
+                    if let Some(f) = meta.get_mut(name) {
+                        *f = text(name);
+                    }
+                }
                 out.push(Stored {
                     kind: text("kind"),
                     slug: text("slug"),
@@ -466,6 +667,7 @@ mod bison_store {
                     summary: text("summary"),
                     body: text("body"),
                     date: text("date"),
+                    meta,
                 });
             }
             Ok(out)
@@ -483,6 +685,12 @@ mod bison_store {
             ];
             for (name, value) in FIELDS.iter().zip(values) {
                 doc.set(*name, value.as_str());
+            }
+            for name in Meta::FIELDS {
+                let value = entry.meta.get(name).unwrap_or("");
+                if !value.is_empty() {
+                    doc.set(name, value);
+                }
             }
             self.failing((|| {
                 let mut db = self
@@ -568,6 +776,7 @@ impl Manifest {
                     summary: entry.summary.clone(),
                     body: draft.body.to_owned(),
                     date: entry.date.clone(),
+                    meta: entry.meta.clone(),
                 })
                 .map_err(SaveError::Store)?;
         }
@@ -598,7 +807,10 @@ impl Manifest {
                 draft.slug
             )));
         }
-        Ok(())
+        draft
+            .meta
+            .check()
+            .map_err(|e| Invalid(format!("`{}`: {}", draft.slug, e.0)))
     }
 
     /// A draft that passed validation, prepared: the body escaped and split
@@ -625,6 +837,7 @@ impl Manifest {
             body,
             date: draft.date.to_owned(),
             text: text.into_owned(),
+            meta: draft.meta.cleaned(),
         }
     }
 
@@ -671,6 +884,7 @@ impl Manifest {
                 summary: &s.summary,
                 body: &s.body,
                 date: &s.date,
+                meta: s.meta.clone(),
             };
             m.validate(&draft).map_err(|e| StoreError::invalid(e.0))?;
             let entry = Arc::new(m.prepare(&draft));
@@ -886,6 +1100,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             summary: "The first page through the gateway, the core, and the web service.",
             body: "This page came in through the gateway, was identified by the core, routed by the web service, and rendered by the theme.\n\nEvery value on it was read through a view, never through JSON.",
             date: "2026-11-08",
+            meta: Meta::default(),
         },
         Draft {
             kind: Kind::Post,
@@ -894,6 +1109,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             summary: "One per request, from the pool to the reply and back.",
             body: "Every request carries one from the pool to the reply, and back, wiped.",
             date: "2026-11-09",
+            meta: Meta::default(),
         },
         Draft {
             kind: Kind::Post,
@@ -902,6 +1118,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             summary: "A title with markup in it, written as text.",
             body: "<b>Not bold.</b> & not a tag either.",
             date: "2026-11-10",
+            meta: Meta::default(),
         },
         Draft {
             kind: Kind::Page,
@@ -910,6 +1127,7 @@ fn sample_drafts() -> [Draft<'static>; 4] {
             summary: "What this site is.",
             body: "A site in memory, themed from a folder, on the platform's walking skeleton.",
             date: "",
+            meta: Meta::default(),
         },
     ]
 }
@@ -928,6 +1146,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn meta_fields_are_cleaned_and_checked() {
+        let m = Meta {
+            seo_title: "  A\r\n title  ".into(),
+            robots: "NoIndex ,NOFOLLOW".into(),
+            twitter_card: " Summary ".into(),
+            ..Meta::default()
+        };
+        let c = m.cleaned();
+        assert_eq!(c.seo_title, "A title");
+        assert_eq!(c.robots, "noindex, nofollow");
+        assert_eq!(c.twitter_card, "summary");
+        assert!(m.check().is_ok());
+        for bad in [
+            Meta {
+                canonical: "javascript:alert(1)".into(),
+                ..Meta::default()
+            },
+            Meta {
+                canonical: "//evil.example/".into(),
+                ..Meta::default()
+            },
+            Meta {
+                og_image: "https://".into(),
+                ..Meta::default()
+            },
+            Meta {
+                og_image: "/a\"b.png".into(),
+                ..Meta::default()
+            },
+            Meta {
+                robots: "noarchive".into(),
+                ..Meta::default()
+            },
+            Meta {
+                twitter_card: "player".into(),
+                ..Meta::default()
+            },
+            Meta {
+                description: "x".repeat(META_DESCRIPTION_MAX + 1),
+                ..Meta::default()
+            },
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        assert!(
+            Meta {
+                canonical: "https://example.com/about".into(),
+                og_image: "/static/card.png".into(),
+                ..Meta::default()
+            }
+            .check()
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn line_breaks_from_a_browser_make_paragraphs() {
         let mut m = Manifest::sample();
         m.save(&Draft {
@@ -937,6 +1211,7 @@ mod tests {
             summary: "",
             body: "First line\r\nstill first.\r\n\r\nSecond.\r\rThird, from an old Mac.",
             date: "2026-11-19",
+            meta: Meta::default(),
         })
         .expect("save");
         let e = m.get(Kind::Post, "crlf").expect("entry");
@@ -980,6 +1255,7 @@ mod tests {
                 summary: "Saved before the restart.",
                 body: "A <b>body</b>.",
                 date: "2026-11-11",
+                meta: Meta::default(),
             })
             .expect("save");
             assert!(m.remove("hello-world").expect("remove"));
@@ -1029,6 +1305,7 @@ mod tests {
             summary: "",
             body: "Write to us.",
             date: "",
+            meta: Meta::default(),
         };
         content.save(&draft, None).expect("new");
         assert!(before.find("contact").is_none(), "a snapshot never changes");
@@ -1068,6 +1345,7 @@ mod tests {
             summary: "",
             body: "",
             date: "2026-11-10",
+            meta: Meta::default(),
         };
         assert!(m.save(&bad).is_err());
         assert!(
@@ -1103,6 +1381,7 @@ mod tests {
                     summary: String::new(),
                     body: body.into(),
                     date: "2026-11-11".into(),
+                    meta: Meta::default(),
                 })
                 .expect("put");
         };

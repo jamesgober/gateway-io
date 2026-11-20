@@ -408,6 +408,126 @@ fn entry_body(kind: &str, slug: &str, was: &str, title: &str, body: &str, csrf: 
     )
 }
 
+/// The `content` of the `<meta>` tag `attr`, or the `href` of the
+/// canonical link, in a page.
+fn meta_of(body: &str, attr: &str) -> Option<String> {
+    let start = format!("{attr} content=\"");
+    let at = body.find(&start)? + start.len();
+    Some(body[at..at + body[at..].find('"')?].to_owned())
+}
+
+#[test]
+fn the_editor_sets_the_search_and_sharing_fields() {
+    let data = temp_dir("meta");
+    let conf = config(&data.0);
+    let (door, addr) = open(&conf);
+    let ed = sign_in_as(addr, EDITOR);
+    let csrf = get(addr, "/admin/new/post", &[&ed]).csrf();
+    let save = |slug: &str, meta: &str| {
+        post(
+            addr,
+            "/admin/save",
+            &[&ed],
+            "same-origin",
+            &format!(
+                "{}{meta}",
+                entry_body("post", slug, "", "Plain title", "Body.", &csrf)
+                    .replace("summary=&", "summary=The+summary&")
+            ),
+        )
+    };
+    let saved = save(
+        "with-meta",
+        "&seo_title=Search+title&description=A%0D%0Asearch+line&canonical=%2Felsewhere&robots=NoIndex+%2CNOFOLLOW&og_title=&og_description=&og_image=%2Fstatic%2Fcard.png&twitter_card=",
+    );
+    assert_eq!(saved.status, 303, "{saved:?}");
+    let page = get(addr, "/posts/with-meta", &[]).body;
+    assert!(page.contains("<title>Search title | "), "{page}");
+    assert_eq!(
+        meta_of(&page, "name=\"description\"").as_deref(),
+        Some("A search line")
+    );
+    assert!(
+        page.contains("<link rel=\"canonical\" href=\"/elsewhere\">"),
+        "{page}"
+    );
+    assert_eq!(
+        meta_of(&page, "name=\"robots\"").as_deref(),
+        Some("noindex, nofollow")
+    );
+    assert_eq!(
+        meta_of(&page, "property=\"og:type\"").as_deref(),
+        Some("article")
+    );
+    assert_eq!(
+        meta_of(&page, "property=\"og:title\"").as_deref(),
+        Some("Search title")
+    );
+    assert_eq!(
+        meta_of(&page, "property=\"og:description\"").as_deref(),
+        Some("A search line")
+    );
+    assert_eq!(
+        meta_of(&page, "property=\"og:image\"").as_deref(),
+        Some("/static/card.png")
+    );
+    assert_eq!(
+        meta_of(&page, "name=\"twitter:card\"").as_deref(),
+        Some("summary_large_image")
+    );
+    // The editor shows them again.
+    let form = get(addr, "/admin/edit/with-meta", &[&ed]).body;
+    assert!(form.contains("value=\"Search title\""), "{form}");
+    assert!(
+        form.contains("<option value=\"noindex, nofollow\" selected>"),
+        "{form}"
+    );
+
+    // Nothing set: the title and summary stand in, and the entry's own
+    // address is canonical.
+    assert_eq!(save("plain", "").status, 303);
+    let page = get(addr, "/posts/plain", &[]).body;
+    assert!(page.contains("<title>Plain title | "), "{page}");
+    assert_eq!(
+        meta_of(&page, "name=\"description\"").as_deref(),
+        Some("The summary")
+    );
+    assert!(
+        page.contains("<link rel=\"canonical\" href=\"/posts/plain\">"),
+        "{page}"
+    );
+    assert!(meta_of(&page, "name=\"robots\"").is_none(), "{page}");
+    assert_eq!(
+        meta_of(&page, "property=\"og:title\"").as_deref(),
+        Some("Plain title")
+    );
+    assert_eq!(
+        meta_of(&page, "name=\"twitter:card\"").as_deref(),
+        Some("summary")
+    );
+    // The home page names itself canonical.
+    assert!(
+        get(addr, "/", &[])
+            .body
+            .contains("<link rel=\"canonical\" href=\"/\">")
+    );
+
+    // A canonical address that is not one, or an unknown directive, is
+    // refused with the form kept.
+    for (bad, says) in [
+        ("&canonical=javascript%3Aalert(1)", "canonical address"),
+        ("&canonical=%2F%2Fevil.example", "canonical address"),
+        ("&og_image=%2Fa+b.png", "sharing image"),
+        ("&robots=noarchive", "robots must be"),
+        ("&twitter_card=player", "card must be"),
+    ] {
+        let refused = save("refused", bad);
+        assert_eq!(refused.status, 422, "{bad}: {refused:?}");
+        assert!(refused.body.contains(says), "{bad}: {}", refused.body);
+    }
+    drop(door);
+}
+
 #[test]
 fn the_editor_writes_renames_and_removes_content() {
     let data = temp_dir("editor");

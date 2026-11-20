@@ -31,7 +31,9 @@ use wasp_core::suite::config::Config;
 use web_net::{Assets, CachePolicy, Context, Route, get};
 
 use crate::content::{Content, Entry, Kind};
-use crate::theme::{ADMIN_CSS, AdminSource, Editor, Form, Page, Security, SiteEngine, SiteInfo};
+use crate::theme::{
+    ADMIN_CSS, AdminSource, Editor, Form, Head, Page, Security, SiteEngine, SiteInfo,
+};
 
 #[cfg(feature = "gatekeeper")]
 pub use gatekeeper_site::{SiteApp, SiteCx, SiteRoute, build};
@@ -149,6 +151,9 @@ impl SiteSettings {
 #[derive(Clone)]
 pub(crate) struct Pages {
     site: Arc<SiteInfo>,
+    /// `https://<first host>`, or empty on a development site: what makes a
+    /// canonical address or a sharing image absolute.
+    origin: String,
     pub(crate) content: Arc<Content>,
 }
 
@@ -165,8 +170,95 @@ impl Pages {
                 css: format!("{base}/theme/site.css"),
                 icon: format!("{base}/theme/favicon.svg"),
             }),
+            origin: settings
+                .hosts
+                .first()
+                .map(|h| format!("https://{h}"))
+                .unwrap_or_default(),
             content: Arc::new(content),
         }
+    }
+
+    /// `address` (a site path or an absolute URL) made absolute with the
+    /// site's origin, when it has one.
+    fn absolute(&self, address: &str) -> String {
+        if address.starts_with('/') {
+            format!("{}{address}", self.origin)
+        } else {
+            address.to_owned()
+        }
+    }
+
+    /// The head of a page showing `entry`, or of a page titled `title`
+    /// without one.
+    fn head(&self, title: &str, entry: Option<&Entry>) -> Head {
+        let Some(e) = entry else {
+            return Head {
+                title: title.to_owned(),
+                og_type: "website".to_owned(),
+                og_title: title.to_owned(),
+                twitter_card: "summary".to_owned(),
+                ..Head::default()
+            };
+        };
+        let m = &e.meta;
+        let or = |a: &str, b: &str| {
+            if a.is_empty() {
+                b.to_owned()
+            } else {
+                a.to_owned()
+            }
+        };
+        let head_title = or(&m.seo_title, &e.title);
+        let description = or(&m.description, &e.summary);
+        // A site path is under the site's base, like the entry's own address.
+        let base = self.site.home.trim_end_matches('/');
+        let canonical = if m.canonical.is_empty() {
+            self.absolute(&e.url)
+        } else if m.canonical.starts_with('/') {
+            self.absolute(&format!("{base}{}", m.canonical))
+        } else {
+            m.canonical.clone()
+        };
+        let og_image = if m.og_image.starts_with('/') {
+            self.absolute(&format!("{base}{}", m.og_image))
+        } else {
+            m.og_image.clone()
+        };
+        let twitter_card = if !m.twitter_card.is_empty() {
+            m.twitter_card.clone()
+        } else if og_image.is_empty() {
+            "summary".to_owned()
+        } else {
+            "summary_large_image".to_owned()
+        };
+        Head {
+            og_title: or(&m.og_title, &head_title),
+            og_description: or(&m.og_description, &description),
+            title: head_title,
+            description,
+            canonical,
+            robots: m.robots.clone(),
+            og_type: if e.kind == "post" {
+                "article"
+            } else {
+                "website"
+            }
+            .to_owned(),
+            og_image,
+            twitter_card,
+        }
+    }
+
+    /// The home page's view: a page without an entry, whose canonical
+    /// address is the site's root.
+    pub(crate) fn home(&self, title: &str) -> Page {
+        let mut page = self.page(title, None, "", None);
+        page.head = Arc::new(Head {
+            canonical: self.absolute(&self.site.home),
+            ..(*page.head).clone()
+        });
+        page
     }
 
     /// A page view.
@@ -179,6 +271,7 @@ impl Pages {
     ) -> Page {
         Page {
             site: self.site.clone(),
+            head: Arc::new(self.head(title, entry.as_deref())),
             title: title.to_owned(),
             entry,
             posts: self.content.snapshot().posts(),
@@ -270,7 +363,7 @@ pub(crate) fn content_routes<I: web_net::Identity, R: Send + Sync + 'static>(
 ) -> [Route<I, R, SiteEngine>; 4] {
     let p = pages.clone();
     let home = get("/", move |cx: &mut Context<'_, I, SiteEngine>| {
-        cx.render(&p.page("Home", None, "", None))
+        cx.render(&p.home("Home"))
     })
     .public()
     .cache(GUEST_PAGES)
@@ -528,5 +621,53 @@ mod gatekeeper_site {
             .route(sign_out)
             .build()
             .map_err(|e| format!("site: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::{Draft, Kind, Manifest, Meta};
+
+    fn pages(meta: Meta) -> (Pages, Arc<Entry>) {
+        let config = wasp_core::suite::config::Config::from_text(
+            "[site]\nhosts = [\"example.com\"]\nbase = \"/blog\"\n",
+        )
+        .expect("config");
+        let settings = SiteSettings::from_config(&config).expect("settings");
+        let mut manifest = Manifest::with_base("/blog");
+        manifest
+            .save(&Draft {
+                kind: Kind::Page,
+                slug: "about",
+                title: "About",
+                summary: "Who we are.",
+                body: "Text.",
+                date: "",
+                meta,
+            })
+            .expect("save");
+        let entry = manifest.get(Kind::Page, "about").expect("entry");
+        (Pages::new(&settings, Content::new(manifest)), entry)
+    }
+
+    #[test]
+    fn addresses_in_the_head_are_absolute_under_the_base() {
+        let (p, entry) = pages(Meta::default());
+        let head = p.page("About", Some(entry), "", None).head;
+        assert_eq!(head.canonical, "https://example.com/blog/about");
+        assert_eq!(head.description, "Who we are.");
+        assert_eq!(head.og_type, "website");
+        assert_eq!(p.home("Home").head.canonical, "https://example.com/blog/");
+
+        let (p, entry) = pages(Meta {
+            canonical: "/team".into(),
+            og_image: "https://cdn.example.net/card.png".into(),
+            ..Meta::default()
+        });
+        let head = p.page("About", Some(entry), "", None).head;
+        assert_eq!(head.canonical, "https://example.com/blog/team");
+        assert_eq!(head.og_image, "https://cdn.example.net/card.png");
+        assert_eq!(head.twitter_card, "summary_large_image");
     }
 }

@@ -27,7 +27,7 @@ use wasp_core::{Access, Decision, Identity, PermSet, Rule};
 use web_net::form_net;
 use web_net::{App, Context, Denial, Gate, Request, Route, get, post};
 
-use crate::content::{Content, Draft, Entry, Kind, SaveError, StoreError};
+use crate::content::{Content, Draft, Entry, Kind, Meta, SaveError, StoreError};
 use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
 use crate::site_account::{Accounts, CookieKeys};
@@ -123,8 +123,34 @@ form_net::form! {
         summary: String,
         date: String,
         body: String,
+        seo_title: Option<String>,
+        description: Option<String>,
+        og_title: Option<String>,
+        og_description: Option<String>,
+        canonical: Option<String>,
+        robots: Option<String>,
+        og_image: Option<String>,
+        twitter_card: Option<String>,
     }
     ignore = ["csrf_token"];
+}
+
+impl EntryForm {
+    /// The search and sharing fields as typed (a field the form left out
+    /// is empty).
+    fn meta(&self) -> Meta {
+        let f = |v: &Option<String>| v.clone().unwrap_or_default();
+        Meta {
+            seo_title: f(&self.seo_title),
+            description: f(&self.description),
+            og_title: f(&self.og_title),
+            og_description: f(&self.og_description),
+            canonical: f(&self.canonical),
+            robots: f(&self.robots),
+            og_image: f(&self.og_image),
+            twitter_card: f(&self.twitter_card),
+        }
+    }
 }
 
 form_net::form! {
@@ -165,6 +191,7 @@ fn filled(editor: Editor, entry: &Entry) -> Editor {
         summary: entry.summary.clone(),
         date: entry.date.clone(),
         body: entry.text.clone(),
+        meta: entry.meta.clone(),
         ..editor
     }
 }
@@ -244,6 +271,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
             summary: form.summary.trim(),
             body: &form.body,
             date: form.date.trim(),
+            meta: form.meta(),
         };
         let was = form.was.trim();
         match p.content.save(&draft, (!was.is_empty()).then_some(was)) {
@@ -260,6 +288,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
                     summary: form.summary.clone(),
                     date: form.date.clone(),
                     body: form.body.clone(),
+                    meta: form.meta(),
                     ..editor(cx, &p)?
                 };
                 cx.status(422);

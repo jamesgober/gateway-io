@@ -28,7 +28,7 @@ use wasp_core::{
     RequestView, SessionId, Standing, UserId,
 };
 
-use crate::content::{ContentStore, StoreError, StoreErrorKind, Stored};
+use crate::content::{ContentStore, Meta, StoreError, StoreErrorKind, Stored};
 use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
 
 mod accounts;
@@ -344,6 +344,12 @@ impl ContentStore for NexStore {
                             .unwrap_or("")
                             .to_owned()
                     };
+                    let mut meta = Meta::default();
+                    for name in Meta::FIELDS {
+                        if let Some(f) = meta.get_mut(name) {
+                            *f = text(name);
+                        }
+                    }
                     let stored = Stored {
                         kind: kind.to_owned(),
                         slug: text("slug"),
@@ -351,6 +357,7 @@ impl ContentStore for NexStore {
                         summary: text("summary"),
                         body: text("body"),
                         date: text("date"),
+                        meta,
                     };
                     let at = e.updated_at();
                     match changed.get(&stored.slug).copied() {
@@ -384,18 +391,19 @@ impl ContentStore for NexStore {
     fn put(&self, entry: &Stored) -> Result<(), StoreError> {
         let content = self.db.db().content();
         let path = path_of(&entry.kind, &entry.slug);
-        let fields = [
+        let mut fields: Vec<(&str, &str)> = vec![
             ("slug", &entry.slug),
             ("title", &entry.title),
             ("summary", &entry.summary),
             ("body", &entry.body),
             ("date", &entry.date),
         ];
+        for name in Meta::FIELDS {
+            fields.push((name, entry.meta.get(name).unwrap_or("")));
+        }
         match content.resolve(SITE, &path).map_err(nex)? {
             Some(route) => {
-                let patch = fields
-                    .iter()
-                    .fold(Patch::new(), |p, (k, v)| p.set(*k, v.as_str()));
+                let patch = fields.iter().fold(Patch::new(), |p, (k, v)| p.set(*k, *v));
                 content.save_draft(route.entity(), patch).map_err(nex)?;
                 content.publish(route.entity()).map_err(nex)?;
             }
@@ -403,7 +411,7 @@ impl ContentStore for NexStore {
                 let entity = fields
                     .iter()
                     .fold(Entity::new(entry.kind.as_str()), |e, (k, v)| {
-                        e.field(*k, v.as_str())
+                        e.field(*k, *v)
                     })
                     .path(path);
                 content.put(entity).map_err(nex)?;

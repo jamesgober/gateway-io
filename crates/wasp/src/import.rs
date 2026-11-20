@@ -14,11 +14,16 @@
 //! title: Hello from a file
 //! date: 2026-11-18
 //! summary: One line for the listing.
+//! description: The line search results show under the title.
 //!
 //! The first paragraph.
 //!
 //! The second.
 //! ```
+//!
+//! The search and sharing fields are header keys too: `seo_title`,
+//! `description`, `og_title`, `og_description`, `canonical`, `robots`,
+//! `og_image`, `twitter_card`.
 //!
 //! A file whose slug, header, or fields do not pass is reported and skipped;
 //! the rest are saved. An entry with a slug already in the store is
@@ -26,7 +31,7 @@
 
 use std::path::Path;
 
-use crate::content::{Draft, Kind, Manifest};
+use crate::content::{Draft, Kind, Manifest, Meta};
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -49,6 +54,7 @@ struct Parsed {
     date: String,
     summary: String,
     body: String,
+    meta: Meta,
 }
 
 fn parse(text: &str) -> Result<Parsed, String> {
@@ -58,6 +64,7 @@ fn parse(text: &str) -> Result<Parsed, String> {
         date: String::new(),
         summary: String::new(),
         body: String::new(),
+        meta: Meta::default(),
     };
     let mut lines = text.lines();
     for line in lines.by_ref() {
@@ -72,7 +79,15 @@ fn parse(text: &str) -> Result<Parsed, String> {
             "title" => parsed.title = value,
             "date" => parsed.date = value,
             "summary" => parsed.summary = value,
-            other => return Err(format!("unknown header `{other}` (title, date, summary)")),
+            other => match parsed.meta.get_mut(other) {
+                Some(field) => *field = value,
+                None => {
+                    return Err(format!(
+                        "unknown header `{other}` (title, date, summary, {})",
+                        Meta::FIELDS.join(", ")
+                    ));
+                }
+            },
         }
     }
     parsed.body = lines.collect::<Vec<_>>().join("\n");
@@ -149,6 +164,7 @@ pub fn import_into(manifest: &mut Manifest, from: &Path) -> Result<Report, Strin
                 summary: &parsed.summary,
                 body: &parsed.body,
                 date: &parsed.date,
+                meta: parsed.meta.clone(),
             };
             match manifest.save(&draft) {
                 Ok(()) => report.saved.push(slug),

@@ -242,6 +242,7 @@ fn error_pages_for_404_405_and_500() {
         cx.render(&Page {
             site: site.clone(),
             title: "Ok".into(),
+            head: Arc::default(),
             entry: None,
             posts: Arc::new(Vec::new()),
             message: "fine".into(),

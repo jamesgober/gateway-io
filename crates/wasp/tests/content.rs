@@ -115,6 +115,11 @@ mod bison {
                     summary: "Stored in bison-db.".into(),
                     body: "Still here.".into(),
                     date: "2026-11-11".into(),
+                    meta: wasp::content::Meta {
+                        description: "Kept, with its search line.".into(),
+                        robots: "noindex".into(),
+                        ..wasp::content::Meta::default()
+                    },
                 })
                 .expect("put");
         }
@@ -125,6 +130,15 @@ mod bison {
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("Kept across a restart"), "{body}");
         assert!(body.contains("<p>Still here.</p>"), "{body}");
+        // Its search and sharing fields came back with it.
+        assert!(
+            body.contains("<meta name=\"description\" content=\"Kept, with its search line.\">"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<meta name=\"robots\" content=\"noindex\">"),
+            "{body}"
+        );
         door.close(Duration::from_secs(5));
         let store = reopen(&dir.0.join("content.bison"));
         assert_eq!(store.load().expect("load").len(), 5);
@@ -171,6 +185,7 @@ mod bison {
                         summary: String::new(),
                         body: "x".repeat(200),
                         date: "2026-11-12".into(),
+                        meta: wasp::content::Meta::default(),
                     })
                     .expect("put");
             }
