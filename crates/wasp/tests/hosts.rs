@@ -358,8 +358,7 @@ fn a_realm_s_boot_account_takes_its_own_password_only() {
     );
     // The main password is never used for a realm of its own.
     let refused = wasp::wire_with_passwords(&conf, Some(MAIN_PASSWORD), &|_| None)
-        .err()
-        .expect("no realm password");
+        .expect_err("no realm password");
     assert!(refused.contains("WASP_ADMIN_PASSWORD_BLOG"), "{refused}");
     assert_eq!(wasp::admin_password_env("blog"), "WASP_ADMIN_PASSWORD_BLOG");
 

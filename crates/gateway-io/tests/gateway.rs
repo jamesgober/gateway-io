@@ -215,13 +215,16 @@ fn a_full_worker_answers_503_without_a_passport() {
         .pool()
         .admit_and_take(0)
         .expect("the worker's passport");
-    let started = Instant::now();
+    // The passport is given back only after the answer arrives: had the
+    // request waited for it, no answer would come at all. So a 503 here,
+    // with the passport still out, is a refusal that did not wait.
     let got = get(addr, "/").expect("a response");
     assert_eq!(got.status, 503);
     assert!(retry_after_spread(&got), "{}", got.head);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "refused at once"
+    assert_eq!(
+        open.pool().stats().in_use,
+        1,
+        "answered while the only passport was still held"
     );
     assert!(open.pool().stats().refused >= 1);
     open.pool().give_back_and_release(held.refuse(500));
