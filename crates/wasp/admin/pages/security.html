@@ -13,7 +13,7 @@
 <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
 <label>New password <input type="password" name="new" autocomplete="new-password" minlength="{{ page.security.min_length }}" required></label>
 <label>New password again <input type="password" name="again" autocomplete="new-password" minlength="{{ page.security.min_length }}" required></label>
-<p class="muted">At least {{ page.security.min_length }} characters. Changing it signs you out everywhere else.</p>
+<p class="muted">At least {{ page.security.min_length }} characters. Changing it signs you out everywhere else{% if page.security.api %} and revokes your API keys{% endif %}.</p>
 <button type="submit">Change password</button>
 </form>
 </section>
@@ -59,6 +59,7 @@
 </form>
 <form method="post" action="{{ page.security.everywhere }}">
 <input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+{% if page.security.api %}<p class="muted">Signing out everywhere also revokes your API keys.</p>{% endif %}
 <button type="submit">Sign out everywhere</button>
 </form>
 {% if page.security.totp %}
@@ -78,7 +79,7 @@
 <p><code class="key">{{ page.security.new_key }}</code></p>
 </div>
 {% endif %}
-<p class="muted">A program uses a key by sending it as <code>Authorization: Bearer &lt;key&gt;</code>. A key can do only what its scopes allow. It can never edit content, manage accounts or change this account. At most {{ page.security.max_keys }} keys.</p>
+<p class="muted">A program uses a key by sending it as <code>Authorization: Bearer &lt;key&gt;</code>. A key can do only what its scopes allow. It can never edit content, manage accounts or change this account. At most {{ page.security.max_keys }} keys. Changing your password or signing out everywhere revokes them all.</p>
 {% if page.security.keys %}
 <table class="entries">
 <thead><tr><th>Label</th><th>Scopes</th><th>Made</th><th>Expires</th><th></th></tr></thead>
@@ -103,6 +104,7 @@
 <label>Expires after <select name="days">
 {%- for c in page.security.expiries %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.value }} days</option>{% endfor -%}
 </select></label>
+<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
 <button type="submit">Make a key</button>
 </form>
 </section>

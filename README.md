@@ -209,9 +209,9 @@ The editor shows the fields of the entry's kind. A theme reads them in `page.ent
 
 With nex-db, every signed-in account has `/account/security`:
 
-- **Password.** Change it with the current one. Every other session ends.
+- **Password.** Change it with the current one. Every other session ends, and the account's API keys are revoked.
 - **Sessions.** Every session of the account, with the device and address it signed in from, when it signed in and when it was last used. Sign out any one of them, or all but this one.
-- **Sign out everywhere.** Ends every session of the account, this one too, and forgets its remembered devices.
+- **Sign out everywhere.** Ends every session of the account, this one too, forgets its remembered devices, and revokes its API keys.
 - **API keys.** With the API on, make a key for a program, with a label, its scopes and an expiry, and revoke it. See [API](#api).
 - **Two-step sign-in.** Turn it on with an authenticator app and your password. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off, signing out everywhere and "Forget remembered devices" undo that.
 
@@ -370,9 +370,9 @@ A browser is signed in by its session cookie. A program sends a key:
 curl -H "Authorization: Bearer <key>" https://example.com/api/v1/me
 ```
 
-Keys are made and revoked on `/account/security`. A key has a label, its scopes and an expiry of 30, 90 or 365 days. Its text is shown once, on the page that made it. wasp never logs it or keeps it, and nex-db keeps only a keyed digest. A key acts with its account's roles cut down to its scopes, so it reads only what it was made for. It never reaches the account pages, the content editor or the admin pages, even when its account could, and it can't make more keys. Public content needs no scope. An account holds at most 20 keys. Changing the password or signing out everywhere leaves keys alone, so revoke them one by one.
+Keys are made and revoked on `/account/security`, with your password. A key has a label, its scopes and an expiry of 30, 90 or 365 days. Its text is shown once, on the page that made it. wasp never logs it or keeps it, and nex-db keeps only a keyed digest. A key acts with its account's roles cut down to its scopes, so it reads only what it was made for. It never reaches the account pages, the content editor or the admin pages, even when its account could, and it can't make more keys. Public content needs no scope. An account holds at most 20 keys. Changing the password or signing out everywhere revokes them all.
 
-A request with a key is judged by the key alone. A key that is malformed, unknown, revoked or expired gets 401 `api.bad_key` on every API request, so a program knows at once that its key stopped working. A key whose account is disabled gets 403 `api.account_disabled`.
+A request with a key is judged by the key alone. A key that is malformed, unknown, revoked or expired gets 401 `api.bad_key` on every API request, so a program knows at once that its key stopped working. A key whose account is disabled gets 403 `api.account_disabled`, from the very next request; a ban stops it the same way. A lockout from wrong passwords does not, so no one can break your programs by failing to sign in as you.
 
 Errors are JSON, with the same code, message and reference an error page shows, and they go to the log the same way:
 
@@ -382,7 +382,7 @@ Errors are JSON, with the same code, message and reference an error page shows, 
 
 An unknown address under the prefix is 404 `api.not_found`, and any method but `GET` is 405 `api.method`. What the gateway refuses before the site runs (429, 503) is a plain answer.
 
-API requests run in the bulk lane, so under load they are refused before page views. Each caller has a budget of its own, `api.rate` requests a second in bursts of `api.burst`: a key, a signed-in browser, or a guest's address. Over it the answer is 429 with `Retry-After`, and no other caller slows down.
+API requests run in the bulk lane, so under load they are refused before page views. Each caller has a budget of its own, `api.rate` requests a second in bursts of `api.burst`: an account (all its keys and its browser sessions share one), or a guest's address. Over it the answer is 429 with `Retry-After`, and no other caller slows down.
 
 `[api] prefix` moves the API and `[api] enabled = false` turns it off. A host profile sets its own in `[host.<name>.api]`. With the gatekeeper there is no API.
 
@@ -432,7 +432,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `api.enabled` | true with nex-db accounts | the JSON API (none with the gatekeeper) |
 | `api.prefix` | `/api/v1` | where the API lives, under `site.base`; never a path the site uses (`/admin`, `/account`, `/posts`, ...) |
-| `api.rate` | 10 | API requests a second for each caller (a key, a browser's session, a guest's address); `0` for no budget. Read at boot |
+| `api.rate` | 10 | API requests a second for each caller (an account, all its keys and sessions together, or a guest's address); `0` for no budget. Read at boot |
 | `api.burst` | twice `api.rate` | the most at once after a quiet spell, at least `api.rate` |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |

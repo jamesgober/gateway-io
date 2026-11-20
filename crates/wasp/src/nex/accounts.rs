@@ -365,6 +365,8 @@ impl NexAuth {
         auth.set_password(account, &hashed).map_err(nex)?;
         let _ = auth.revoke_all(account).map_err(nex)?;
         self.forget_devices(user)?;
+        // A key made by whoever had the old password goes with it.
+        self.revoke_api_keys(user)?;
         self.open_session(user, from).map(Ok)
     }
 
@@ -486,11 +488,13 @@ impl NexAuth {
         Ok(ended)
     }
 
-    /// Ends every session `user` holds (this one too) and forgets its
-    /// remembered devices; how many sessions ended.
+    /// Ends every session `user` holds (this one too), forgets its
+    /// remembered devices and revokes its API keys; how many sessions
+    /// ended.
     pub fn sign_out_everywhere(&self, user: UserId) -> Result<u32, StoreError> {
         let ended = self.auth()?.revoke_all(account_of(user)).map_err(nex)?;
         self.forget_devices(user)?;
+        self.revoke_api_keys(user)?;
         Ok(ended)
     }
 

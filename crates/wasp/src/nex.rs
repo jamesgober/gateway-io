@@ -1198,33 +1198,25 @@ impl NexAuth {
             Err(_) => return Authentication::Unavailable,
         };
         let session = keys::key_session(id);
-        // The account's roles and standing, read at most `recheck` ago, so a
-        // removed role or a disabled account reaches its keys too.
-        let recheck = self.policy().recheck;
-        let (perms, standing) = if let Some(known) = self.checked.get(session, recheck) {
-            known
-        } else {
-            let standing = match auth.standing(account) {
-                Ok(Some(nex_db::Standing::Banned { .. })) => {
-                    return Authentication::Refused(wasp_core::Refusal::status(403));
-                }
-                Ok(Some(nex_db::Standing::Active | nex_db::Standing::PendingVerification)) => {
-                    Standing::Good
-                }
-                // Disabled, or locked out: no use of the account now.
-                Ok(Some(_)) => Standing::Suspended { until: None },
-                Ok(None) => return refused(out, Via::BadKey),
-                Err(_) => return Authentication::Unavailable,
-            };
-            let Ok((perms, _)) = self.roles_of(account) else {
-                return Authentication::Unavailable;
-            };
-            self.checked.put(session, perms, standing, recheck);
-            (perms, standing)
-        };
-        if standing != Standing::Good {
-            return refused(out, Via::KeyRefused);
+        // The account's standing and roles, read on every request with a
+        // key: a ban, a disable or a removed role stops its keys at once.
+        match auth.standing(account) {
+            Ok(Some(nex_db::Standing::Banned { .. })) => {
+                return Authentication::Refused(wasp_core::Refusal::status(403));
+            }
+            // Disabled by an administrator.
+            Ok(Some(nex_db::Standing::Suspended { .. })) => {
+                return refused(out, Via::KeyRefused);
+            }
+            // Locked out by wrong passwords: the key still works, so no
+            // one can stop an account's programs by failing to sign in.
+            Ok(Some(_)) => {}
+            Ok(None) => return refused(out, Via::BadKey),
+            Err(_) => return Authentication::Unavailable,
         }
+        let Ok((perms, _)) = self.roles_of(account) else {
+            return Authentication::Unavailable;
+        };
         out.keep(NexToken::by_key(Via::Key(scopes)));
         let perms = PermSet(perms.0 & scopes.perms().0);
         Authentication::Identified(Identity::user(user_of(account), session, perms))
