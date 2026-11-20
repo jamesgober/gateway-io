@@ -7,13 +7,15 @@
 //! | `POST /sign-in` | guests | the password; then a session, or the second step |
 //! | `GET`, `POST /sign-in/code` | guests mid sign-in | a code from the app, or a recovery code |
 //! | `GET`, `POST /sign-in/setup` | guests mid sign-in | two-step set-up a role requires |
-//! | `GET /account/security` | signed in | password, two-step sign-in, sessions |
+//! | `GET /account/security` | signed in | password, two-step sign-in, sessions, API keys |
 //! | `POST /account/password` | signed in | changes the password; every other session ends |
 //! | `POST /account/sign-out-everywhere` | signed in | ends every session of the account |
 //! | `POST /account/forget-devices` | signed in | remembered devices ask for a code again |
 //! | `GET`, `POST /account/two-factor` | signed in | turns two-step sign-in on (then the recovery codes) |
 //! | `POST /account/two-factor/off` | signed in | turns it off (with the password) |
 //! | `POST /account/recovery-codes` | signed in | new recovery codes (with the password) |
+//! | `POST /account/keys` | signed in, with the API on | makes an API key (its text shown once) |
+//! | `POST /account/keys/revoke` | signed in, with the API on | revokes one of the account's keys |
 //! | `GET /admin/accounts` | `admin` | every account |
 //! | `POST /admin/accounts/disable`, `enable`, `remove` | `admin` | never the viewer's own account or the boot account |
 //!
@@ -34,12 +36,12 @@ use web_net::form_net::{self, Secret};
 use web_net::{get, post};
 
 use crate::nex::{
-    CodeCheck, NexAuth, PRE_COOKIE, PasswordStep, SESSION_COOKIE, SignInFrom, cookie,
+    CodeCheck, NexAuth, PRE_COOKIE, PasswordStep, SESSION, SESSION_COOKIE, SignInFrom, cookie,
 };
 use crate::policy::MfaMode;
 use crate::site::{Pages, query_value};
 use crate::site_nex::{ADMIN, Attempts, EDITOR, NexCx, NexRoute, hash_slot};
-use crate::theme::{ADMIN_CSP, AccountView, Security, SessionView};
+use crate::theme::{ADMIN_CSP, AccountView, Choice, KeyView, ScopeView, Security, SessionView};
 
 /// The half-done sign-in's cookie.
 pub const STEP_COOKIE: &str = "__Host-nexstep";
@@ -53,11 +55,11 @@ const STEP_TTL: Duration = Duration::from_secs(5 * 60);
 /// Whether this build has two-step sign-in.
 const MFA_BUILT: bool = cfg!(feature = "mfa");
 
-/// Any signed-in account.
-const SIGNED_IN: Rule = Rule::needs(6, PermSet::NONE);
+/// Any account signed in with a session cookie (never an API key).
+const SIGNED_IN: Rule = Rule::needs(6, SESSION);
 
 /// The accounts page's rule.
-const ADMINING: Rule = Rule::needs(7, ADMIN);
+const ADMINING: Rule = Rule::needs(7, PermSet(ADMIN.0 | SESSION.0));
 
 const STEP_AAD: &[u8] = b"wasp sign-in step v1";
 const DEVICE_AAD: &[u8] = b"wasp device v1";
@@ -286,6 +288,80 @@ form_net::form! {
 }
 
 form_net::form! {
+    /// A key's revoke button.
+    struct KeyRevokeForm {
+        key: String,
+    }
+    ignore = ["csrf_token"];
+}
+
+/// The make-a-key form: a label, how many days, and any number of `scope`
+/// boxes (web-net checked its `csrf_token` before the handler).
+#[derive(Debug, Default)]
+struct KeyForm {
+    label: String,
+    days: String,
+    scopes: Vec<String>,
+}
+
+#[derive(Default)]
+struct KeyFormBuilder {
+    form: KeyForm,
+    seen: (bool, bool),
+}
+
+impl form_net::FormBuilder for KeyFormBuilder {
+    type Output = KeyForm;
+
+    fn text(&mut self, name: &str, value: &str) -> Result<(), form_net::FormError> {
+        use form_net::{ExtractError, FormError};
+        let refuse = |reason| FormError::Extract {
+            reason,
+            field: None,
+        };
+        match name {
+            "csrf_token" => {}
+            "label" if !self.seen.0 => {
+                self.seen.0 = true;
+                value.clone_into(&mut self.form.label);
+            }
+            "days" if !self.seen.1 => {
+                self.seen.1 = true;
+                value.clone_into(&mut self.form.days);
+            }
+            "scope" => {
+                if self.form.scopes.len() >= crate::nex::SCOPES.len() {
+                    return Err(refuse(ExtractError::Invalid("too many scopes")));
+                }
+                self.form.scopes.push(value.to_owned());
+            }
+            "label" | "days" => return Err(refuse(ExtractError::Duplicate)),
+            _ => return Err(refuse(ExtractError::Unknown)),
+        }
+        Ok(())
+    }
+
+    fn file(
+        &mut self,
+        _name: &str,
+        _file: form_net::FileValue<'_>,
+    ) -> Result<(), form_net::FormError> {
+        Err(form_net::FormError::Extract {
+            reason: form_net::ExtractError::WrongKind,
+            field: None,
+        })
+    }
+
+    fn finish(self) -> Result<KeyForm, form_net::FormError> {
+        Ok(self.form)
+    }
+}
+
+impl form_net::FromForm for KeyForm {
+    type Builder = KeyFormBuilder;
+}
+
+form_net::form! {
     /// An administrator's button on one account.
     struct AccountForm {
         account: String,
@@ -367,6 +443,8 @@ pub(crate) struct Accounts {
     pub(crate) show: ShowSignIn,
     /// The completed sign-in steps.
     pub(crate) spent: Arc<Spent>,
+    /// The site has the API: accounts make and revoke keys here.
+    pub(crate) api: bool,
 }
 
 impl Accounts {
@@ -418,6 +496,60 @@ impl Accounts {
             ),
             revoke: cx.url("/account/sessions/revoke")?,
             revoke_others: cx.url("/account/sessions/revoke-others")?,
+            ..self.keys_view(cx, user)?
+        })
+    }
+
+    /// The API keys part of the view (empty without the API).
+    fn keys_view(&self, cx: &NexCx<'_>, user: UserId) -> Result<Security, web_net::Error> {
+        if !self.api {
+            return Ok(Security::default());
+        }
+        let now = SystemTime::now();
+        Ok(Security {
+            api: true,
+            keys: Arc::new(
+                self.auth
+                    .api_keys(user)
+                    .map_err(store)?
+                    .into_iter()
+                    .map(|k| {
+                        Arc::new(KeyView {
+                            id: k.id,
+                            label: k.label,
+                            scopes: k.scopes.join(", "),
+                            created: when(k.created),
+                            expires: when(k.expires),
+                            expired: k.expires <= now,
+                        })
+                    })
+                    .collect(),
+            ),
+            key_create: cx.url("/account/keys")?,
+            key_revoke: cx.url("/account/keys/revoke")?,
+            scopes: Arc::new(
+                crate::nex::SCOPES
+                    .iter()
+                    .map(|s| {
+                        Arc::new(ScopeView {
+                            name: s.name.to_owned(),
+                            label: s.label.to_owned(),
+                        })
+                    })
+                    .collect(),
+            ),
+            expiries: Arc::new(
+                crate::nex::EXPIRIES
+                    .iter()
+                    .map(|d| {
+                        Arc::new(Choice {
+                            value: d.to_string(),
+                            selected: *d == crate::nex::DEFAULT_EXPIRY,
+                        })
+                    })
+                    .collect(),
+            ),
+            max_keys: i64::try_from(crate::nex::MAX_KEYS).unwrap_or(i64::MAX),
             ..Security::default()
         })
     }
@@ -914,7 +1046,93 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
 
     let mut routes = vec![page, password, everywhere, devices, revoke, others];
     routes.extend(two_factor_routes(acc));
+    if acc.api {
+        routes.extend(key_routes(acc));
+    }
     routes
+}
+
+/// Making and revoking API keys.
+fn key_routes(acc: &Accounts) -> Vec<NexRoute> {
+    let s = acc.clone();
+    let make: NexRoute = post("/account/keys", move |cx: &mut NexCx<'_>| {
+        let user = me(cx)?;
+        let form: KeyForm = cx.form()?;
+        let refused = |cx: &mut NexCx<'_>, why: &str| {
+            cx.status(422);
+            s.security_page(cx, user, why, "")
+        };
+        let scopes = match crate::nex::Scopes::parse(form.scopes.iter().map(String::as_str)) {
+            Ok(scopes) => scopes,
+            Err(why) => return refused(cx, &why),
+        };
+        let Ok(days) = form.days.trim().parse::<u32>() else {
+            return refused(cx, "Choose how long the key lasts.");
+        };
+        match s
+            .auth
+            .create_api_key(user, &form.label, scopes, days)
+            .map_err(store)?
+        {
+            Ok(new) => {
+                let who = s.who(user);
+                crate::events::audit_with(
+                    &who,
+                    "api_key_made",
+                    &who,
+                    &format!("{} {}", new.row.id, new.row.label),
+                );
+                guard(cx);
+                let view = Security {
+                    notice: format!(
+                        "Made the key {}. It works until {}.",
+                        new.row.label,
+                        when(new.row.expires)
+                    ),
+                    new_key: new.text.clone(),
+                    ..s.view(cx, user)?
+                };
+                cx.render_named("admin/security", &s.pages.security_page("Security", view))
+            }
+            Err(why) => refused(cx, &why),
+        }
+    })
+    .allow(SIGNED_IN)
+    .template("admin/security")
+    .name("account-key-make");
+
+    let s = acc.clone();
+    let revoke: NexRoute = post("/account/keys/revoke", move |cx: &mut NexCx<'_>| {
+        let user = me(cx)?;
+        let form: KeyRevokeForm = cx.form()?;
+        let id = form.key.trim();
+        match s.auth.revoke_api_key(user, id).map_err(store)? {
+            Some(label) => {
+                let who = s.who(user);
+                crate::events::audit_with(&who, "api_key_revoked", &who, &format!("{id} {label}"));
+                s.security_page(
+                    cx,
+                    user,
+                    "",
+                    &format!("Revoked the key {label}. It no longer works."),
+                )
+            }
+            None => {
+                cx.status(404);
+                s.security_page(
+                    cx,
+                    user,
+                    "That key is not one of yours, or it was revoked already.",
+                    "",
+                )
+            }
+        }
+    })
+    .allow(SIGNED_IN)
+    .template("admin/security")
+    .name("account-key-revoke");
+
+    vec![make, revoke]
 }
 
 /// Turning two-step sign-in on and off, and new recovery codes.

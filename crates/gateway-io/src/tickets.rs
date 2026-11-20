@@ -118,6 +118,21 @@ impl RequestTickets {
     }
 
     /// Keeps the stage marks of the request with `tag` (stage timing only).
+    /// Runs `f` on the ticket of request `tag` (to bind who authentication
+    /// found and charge its lane); `None` when the ticket is not held.
+    pub(crate) fn with_ticket<R>(
+        &self,
+        worker: u16,
+        tag: TicketTag,
+        f: impl FnOnce(&mut Ticket) -> R,
+    ) -> Option<R> {
+        let shelf = self.shelves.get(usize::from(worker))?;
+        let mut live = shelf.live.lock().ok()?;
+        live.iter_mut()
+            .find(|e| e.ticket.tag() == tag)
+            .map(|e| f(&mut e.ticket))
+    }
+
     pub(crate) fn set_stamps(&self, worker: u16, tag: TicketTag, stamps: Stamps) {
         if let Some(shelf) = self.shelves.get(usize::from(worker))
             && let Ok(mut live) = shelf.live.lock()

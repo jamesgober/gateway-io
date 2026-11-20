@@ -68,5 +68,44 @@
 </form>
 {% endif %}
 </section>
+{% if page.security.api %}
+
+<section>
+<h2>API keys</h2>
+{% if page.security.new_key %}
+<div class="notice" role="status">
+<p>Your new key. Copy it now: it is shown only this once.</p>
+<p><code class="key">{{ page.security.new_key }}</code></p>
+</div>
+{% endif %}
+<p class="muted">A program uses a key by sending it as <code>Authorization: Bearer &lt;key&gt;</code>. A key can do only what its scopes allow. It can never edit content, manage accounts or change this account. At most {{ page.security.max_keys }} keys.</p>
+{% if page.security.keys %}
+<table class="entries">
+<thead><tr><th>Label</th><th>Scopes</th><th>Made</th><th>Expires</th><th></th></tr></thead>
+<tbody>
+{%- for k in page.security.keys %}
+<tr><td>{{ k.label }}</td><td>{{ k.scopes }}</td><td>{{ k.created }}</td><td>{{ k.expires }}{% if k.expired %} <strong>(expired)</strong>{% endif %}</td>
+<td><form class="inline" method="post" action="{{ page.security.key_revoke }}"><input type="hidden" name="csrf_token" value="{{ page.security.csrf }}"><input type="hidden" name="key" value="{{ k.id }}"><button class="danger" type="submit">Revoke</button></form></td></tr>
+{%- endfor %}
+</tbody>
+</table>
+{% else %}
+<p>No keys yet.</p>
+{% endif %}
+<form class="stack" method="post" action="{{ page.security.key_create }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<label>Label <input type="text" name="label" maxlength="64" required></label>
+<fieldset><legend>Scopes</legend>
+{%- for s in page.security.scopes %}
+<label><input type="checkbox" name="scope" value="{{ s.name }}"> {{ s.name }}: {{ s.label }}</label>
+{%- endfor %}
+</fieldset>
+<label>Expires after <select name="days">
+{%- for c in page.security.expiries %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.value }} days</option>{% endfor -%}
+</select></label>
+<button type="submit">Make a key</button>
+</form>
+</section>
+{% endif %}
 </article>
 {% endblock %}

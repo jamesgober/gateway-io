@@ -28,7 +28,7 @@ use web_net::form_net;
 use web_net::{App, Context, Denial, Gate, Request, Route, get, post};
 
 use crate::content::{Content, Draft, Entry, Kind, Meta, SaveError, StoreError};
-use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
+use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION, SESSION_COOKIE, Via, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
 use crate::site_account::{Accounts, CookieKeys};
 use crate::theme::{Choice, Editor, FieldInput, Form, SiteEngine};
@@ -43,7 +43,10 @@ pub const EDITOR: PermSet = PermSet(2);
 pub const ADMIN: PermSet = PermSet(4);
 
 /// The editor's rule.
-const EDITING: Rule = Rule::needs(4, EDITOR);
+const EDITING: Rule = Rule::needs(4, PermSet(EDITOR.0 | SESSION.0));
+
+/// The account page's rule: a member, signed in with a session cookie.
+const MEMBER_PAGE: Rule = Rule::needs(2, PermSet(MEMBER.0 | SESSION.0));
 
 /// Who a request is from, as web-net sees it on this site.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +54,14 @@ pub struct NexWho {
     /// The core's identity stamp.
     pub identity: Identity,
     token: NexToken,
+}
+
+impl NexWho {
+    /// How the caller came in: a browser, or a program with an API key.
+    #[must_use]
+    pub fn via(&self) -> Via {
+        self.token.via()
+    }
 }
 
 impl web_net::Identity for NexWho {
@@ -574,7 +585,7 @@ pub fn build(
         };
         cx.render(&p.page("Account", None, "", Some(form)))
     })
-    .allow(Rule::needs(2, MEMBER))
+    .allow(MEMBER_PAGE)
     .template("account")
     .name("account");
 
@@ -654,6 +665,7 @@ pub fn build(
         boot,
         show: Arc::new(sign_in_form),
         spent: Arc::default(),
+        api: settings.api.enabled,
     };
     let a = auth;
     let sign_out: NexRoute = post("/sign-out", move |cx: &mut NexCx<'_>| {
@@ -669,7 +681,7 @@ pub fn build(
         }
         cx.redirect(303, "/")
     })
-    .allow(Rule::needs(3, PermSet::NONE))
+    .allow(Rule::needs(3, SESSION))
     .name("sign-out");
 
     let [home, post_page, about, page] = content_routes::<NexWho, Rule>(&pages);
@@ -689,6 +701,11 @@ pub fn build(
         .route(sign_out);
     for route in crate::site_account::routes(&accounts) {
         builder = builder.route(route);
+    }
+    if settings.api.enabled {
+        for route in crate::api::routes(&settings.api, &pages, &accounts.auth) {
+            builder = builder.route(route);
+        }
     }
     builder.build().map_err(|e| format!("site: {e}"))
 }

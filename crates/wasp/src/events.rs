@@ -39,6 +39,7 @@ enum Line {
         by: String,
         action: &'static str,
         account: String,
+        detail: String,
     },
 }
 
@@ -120,14 +121,26 @@ pub fn connect(foundation: &Foundation) {
                         by,
                         action,
                         account,
+                        detail,
                     } => {
-                        log::info!(
-                            f.log(),
-                            "audit",
-                            by = by.as_str(),
-                            action = action,
-                            account = account.as_str()
-                        );
+                        if detail.is_empty() {
+                            log::info!(
+                                f.log(),
+                                "audit",
+                                by = by.as_str(),
+                                action = action,
+                                account = account.as_str()
+                            );
+                        } else {
+                            log::info!(
+                                f.log(),
+                                "audit",
+                                by = by.as_str(),
+                                action = action,
+                                account = account.as_str(),
+                                detail = detail.as_str()
+                            );
+                        }
                     }
                 }
             }
@@ -145,13 +158,21 @@ pub fn warn(message: String) {
 /// email), what (`password_changed`, `signed_out_everywhere`,
 /// `two_step_on`, `two_step_off`, `recovery_codes_made`,
 /// `recovery_code_used`, `devices_forgotten`, `account_disabled`,
-/// `account_enabled`, `account_removed`), and to which account.
+/// `account_enabled`, `account_removed`, `api_key_made`,
+/// `api_key_revoked`), and to which account.
 #[cfg(feature = "store-nex")]
 pub fn audit(by: &str, action: &'static str, account: &str) {
+    audit_with(by, action, account, "");
+}
+
+/// [`audit`], with what it was done to (an API key's id and label).
+#[cfg(feature = "store-nex")]
+pub fn audit_with(by: &str, action: &'static str, account: &str, detail: &str) {
     push(Line::Audit {
         by: by.to_owned(),
         action,
         account: account.to_owned(),
+        detail: detail.to_owned(),
     });
 }
 

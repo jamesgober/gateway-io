@@ -185,7 +185,8 @@ impl Door {
                     Arc::new(web),
                     stages.clone(),
                 )
-                .with_access(access),
+                .with_access(access)
+                .with_lane_rates(&settings.lane_rates),
             )
             .map_err(|e| OpenError(e.to_string()))?;
         let load = Watcher::start(
@@ -299,6 +300,8 @@ pub struct Gateway {
     /// The access log and the log rules, with whether the access line is on
     /// (set at start; a reload swaps the rules).
     access: Option<(Arc<AccessLog>, bool)>,
+    /// Lane budgets per caller the application sets (wasp's API budget).
+    lane_rates: Vec<crate::settings::LaneRate>,
 }
 
 impl Gateway {
@@ -313,7 +316,16 @@ impl Gateway {
             applied: Arc::new(Mutex::new(Settings::default())),
             stages: None,
             access: None,
+            lane_rates: Vec::new(),
         }
+    }
+
+    /// Charges these lanes to each caller (a session, an API key, or a
+    /// guest's address); they take effect when the gateway opens.
+    #[must_use]
+    pub fn lane_rates(mut self, rates: Vec<crate::settings::LaneRate>) -> Gateway {
+        self.lane_rates = rates;
+        self
     }
 
     /// Records stage times into `stages` (shared with whatever else records
@@ -347,7 +359,10 @@ impl Subsystem for Gateway {
     }
 
     fn start(&mut self, link: &Link) -> Result<(), Failure> {
-        let settings = Settings::from_config(&link.foundation().config())?;
+        let settings = Settings {
+            lane_rates: self.lane_rates.clone(),
+            ..Settings::from_config(&link.foundation().config())?
+        };
         let web = self
             .web
             .take()
@@ -559,6 +574,7 @@ impl Subsystem for Gateway {
                     driver: running.driver,
                     stage_timing: running.stage_timing,
                     ingress: running.ingress,
+                    lane_rates: running.lane_rates,
                     ban: applied_ban,
                     exempt: if exempt_applied {
                         next.exempt

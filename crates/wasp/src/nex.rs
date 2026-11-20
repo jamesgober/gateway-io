@@ -32,7 +32,11 @@ use crate::content::{ContentStore, FIELD_PREFIX, Meta, StoreError, StoreErrorKin
 use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
 
 mod accounts;
+mod keys;
 pub use accounts::{AccountRow, CodeCheck, SessionRow, SignInFrom};
+pub use keys::{
+    DEFAULT_EXPIRY, EXPIRIES, KeyRow, MAX_KEYS, MAX_LABEL, NewKey, SCOPES, SESSION, Scope, Scopes,
+};
 
 /// The site in nex-db's routes.
 const SITE: &str = nex_db::DEFAULT_SITE;
@@ -73,6 +77,23 @@ pub const ADMIN_ROLE: &str = "admin";
 pub struct NexToken {
     binding: [u8; 48],
     len: u8,
+    via: Via,
+}
+
+/// How a request's caller came in, for the API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Via {
+    /// A browser: no credential, or a session cookie.
+    #[default]
+    Browser,
+    /// An API key that counts, with its scopes.
+    Key(Scopes),
+    /// A bearer key that does not count: malformed, unknown, revoked,
+    /// expired, or its account gone. The request is a guest's.
+    BadKey,
+    /// A key whose account may not sign in now (disabled, locked out). The
+    /// request is a guest's.
+    KeyRefused,
 }
 
 impl NexToken {
@@ -83,7 +104,22 @@ impl NexToken {
         NexToken {
             binding,
             len: u8::try_from(len).unwrap_or(48),
+            via: Via::Browser,
         }
+    }
+
+    /// A program's token: no CSRF binding (a key never posts a form).
+    fn by_key(via: Via) -> NexToken {
+        NexToken {
+            via,
+            ..NexToken::new(&[])
+        }
+    }
+
+    /// How the caller came in.
+    #[must_use]
+    pub fn via(&self) -> Via {
+        self.via
     }
 
     /// No binding.
@@ -665,6 +701,11 @@ impl NexAuth {
         Ok((PermSet(bits), names))
     }
 
+    /// The names of `user`'s roles.
+    pub fn role_names(&self, user: UserId) -> Result<Vec<String>, StoreError> {
+        self.roles_of(account_of(user)).map(|(_, names)| names)
+    }
+
     /// The sign-in rules for `user` (its roles' strictest).
     pub fn rules(&self, user: UserId) -> Result<Rules, StoreError> {
         let (_, names) = self.roles_of(account_of(user))?;
@@ -840,9 +881,7 @@ impl NexAuth {
 
     /// Bans the account: every session it holds ends in the same commit.
     pub fn ban(&self, user: UserId) -> Result<(), StoreError> {
-        self.db
-            .db()
-            .auth()
+        self.auth()?
             .set_standing(
                 account_of(user),
                 nex_db::Standing::Banned { reason: 1 },
@@ -1023,6 +1062,10 @@ impl Authenticator for NexAuth {
         out: &mut AuthOut,
     ) -> Authentication {
         let _client: Option<IpAddr> = request.trip().client;
+        // A program: judged by its key alone, whatever cookie it sends.
+        if let Some(key) = request.head().header("authorization").and_then(bearer) {
+            return self.authenticate_key(key, out);
+        }
         let header = request.head().header("cookie");
         let guest = |out: &mut AuthOut| {
             // A guest's binding is the pre-session cookie, when it is one.
@@ -1113,6 +1156,101 @@ impl Authenticator for NexAuth {
         let user = user_of(account);
         let session = id;
         out.keep(NexToken::new(&session.0.to_le_bytes()));
+        // Only a session cookie reaches the account and admin pages.
+        let perms = PermSet(perms.0 | SESSION.0);
         Authentication::Identified(Identity::user(user, session, perms).with_standing(standing))
+    }
+}
+
+/// The key in an `Authorization: Bearer <key>` field; `Some("")` for a
+/// bearer field without a usable key (it counts as a bad key), `None` for
+/// any other scheme.
+fn bearer(field: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(field).ok()?.trim();
+    let (scheme, rest) = text.split_once(' ').unwrap_or((text, ""));
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let key = rest.trim();
+    let usable = !key.is_empty() && key.len() <= 512 && key.bytes().all(|b| b.is_ascii_graphic());
+    Some(if usable { key } else { "" })
+}
+
+impl NexAuth {
+    /// A request with an API key: its account, with the account's roles cut
+    /// down to the key's scopes; a guest marked as such when the key does
+    /// not count.
+    fn authenticate_key(&self, key: &str, out: &mut AuthOut) -> Authentication {
+        let refused = |out: &mut AuthOut, via: Via| {
+            out.keep(NexToken::by_key(via));
+            Authentication::Identified(Identity::guest())
+        };
+        let Ok(auth) = self.auth() else {
+            return Authentication::Unavailable;
+        };
+        let (account, id, scopes) = match auth.validate_api_key(key) {
+            Ok(nex_db::ApiKeyCheck::Valid {
+                account,
+                id,
+                scopes,
+            }) => (account, id, Scopes::of_stored(&scopes)),
+            Ok(_) => return refused(out, Via::BadKey),
+            Err(_) => return Authentication::Unavailable,
+        };
+        let session = keys::key_session(id);
+        // The account's roles and standing, read at most `recheck` ago, so a
+        // removed role or a disabled account reaches its keys too.
+        let recheck = self.policy().recheck;
+        let (perms, standing) = if let Some(known) = self.checked.get(session, recheck) {
+            known
+        } else {
+            let standing = match auth.standing(account) {
+                Ok(Some(nex_db::Standing::Banned { .. })) => {
+                    return Authentication::Refused(wasp_core::Refusal::status(403));
+                }
+                Ok(Some(nex_db::Standing::Active | nex_db::Standing::PendingVerification)) => {
+                    Standing::Good
+                }
+                // Disabled, or locked out: no use of the account now.
+                Ok(Some(_)) => Standing::Suspended { until: None },
+                Ok(None) => return refused(out, Via::BadKey),
+                Err(_) => return Authentication::Unavailable,
+            };
+            let Ok((perms, _)) = self.roles_of(account) else {
+                return Authentication::Unavailable;
+            };
+            self.checked.put(session, perms, standing, recheck);
+            (perms, standing)
+        };
+        if standing != Standing::Good {
+            return refused(out, Via::KeyRefused);
+        }
+        out.keep(NexToken::by_key(Via::Key(scopes)));
+        let perms = PermSet(perms.0 & scopes.perms().0);
+        Authentication::Identified(Identity::user(user_of(account), session, perms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bearer;
+
+    #[test]
+    fn a_bearer_field_gives_its_key_and_other_schemes_nothing() {
+        assert_eq!(bearer(b"Bearer abc.DEF-1"), Some("abc.DEF-1"));
+        assert_eq!(bearer(b"  bearer   abc  "), Some("abc"));
+        assert_eq!(bearer(b"BEARER abc"), Some("abc"));
+        // A bearer field without a usable key counts as a bad key.
+        assert_eq!(bearer(b"Bearer"), Some(""));
+        assert_eq!(bearer(b"Bearer a b"), Some(""));
+        assert_eq!(bearer("Bearer caf\u{e9}".as_bytes()), Some(""));
+        assert_eq!(
+            bearer(format!("Bearer {}", "k".repeat(513)).as_bytes()),
+            Some("")
+        );
+        // Another scheme is not a key: the cookie decides.
+        assert_eq!(bearer(b"Basic dTpw"), None);
+        assert_eq!(bearer(b"Bearerabc"), None);
+        assert_eq!(bearer(b"\xff"), None);
     }
 }

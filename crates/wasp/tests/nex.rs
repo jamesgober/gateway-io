@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use gateway_io::{Door, Settings, WebServices};
 use wasp::content::{ContentStore, Stored};
-use wasp::nex::{NexAuth, NexDb, NexStore, SESSION_COOKIE};
+use wasp::nex::{NexAuth, NexDb, NexStore, SESSION, SESSION_COOKIE};
 use wasp_core::suite::config::Config;
 use wasp_core::suite::kernel::UrgentLine;
 use wasp_core::{Core, Exit, Identified, Passport, Rule, Service, ServiceCtx, Subject};
@@ -246,7 +246,8 @@ fn the_core_authenticates_nex_db_sessions() {
 
     let (status, body) = send(addr, "/", Some(&cookie));
     assert_eq!(status, 200);
-    let want = format!("user {:032x} perms 5", user.0);
+    // The roles' bits, and the one only a session cookie carries.
+    let want = format!("user {:032x} perms {}", user.0, 5 | SESSION.0);
     assert!(body.ends_with(&want), "{body}");
 
     // Signed out: the session is gone, and its cookie is cleared.
@@ -265,7 +266,11 @@ fn the_core_authenticates_nex_db_sessions() {
         .expect("sign in")
         .expect("signed in");
     let again = again.split(';').next().expect("pair").to_owned();
-    assert!(send(addr, "/", Some(&again)).1.contains("perms 5"));
+    assert!(
+        send(addr, "/", Some(&again))
+            .1
+            .contains(&format!("perms {}", 5 | SESSION.0))
+    );
     auth.ban(user).expect("ban");
     let (_, body) = send(addr, "/", Some(&again));
     assert!(body.ends_with("guest"), "{body}");

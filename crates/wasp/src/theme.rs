@@ -341,7 +341,60 @@ pub struct Security {
     pub revoke: String,
     /// The revoke-the-others button's address.
     pub revoke_others: String,
+    /// The site has the API: the API keys section shows.
+    pub api: bool,
+    /// The account's API keys, newest first.
+    pub keys: Arc<Vec<Arc<KeyView>>>,
+    /// A key just made: its text, shown this once.
+    pub new_key: String,
+    /// The make-a-key form's address.
+    pub key_create: String,
+    /// The revoke-a-key button's address.
+    pub key_revoke: String,
+    /// The scopes a key may have.
+    pub scopes: Arc<Vec<Arc<ScopeView>>>,
+    /// How long a key may last, in days.
+    pub expiries: Arc<Vec<Arc<Choice>>>,
+    /// The most keys an account holds.
+    pub max_keys: i64,
 }
+
+/// One API key on the account page (`page.security.keys`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyView {
+    /// Its id, for the revoke button.
+    pub id: String,
+    /// Its label.
+    pub label: String,
+    /// Its scopes, joined by `, ` (empty: none).
+    pub scopes: String,
+    /// When it was made.
+    pub created: String,
+    /// When it stops working.
+    pub expires: String,
+    /// It has stopped working.
+    pub expired: bool,
+}
+
+luminess::view!(KeyView as "key" {
+    id: text,
+    label: text,
+    scopes: text,
+    created: text,
+    expires: text,
+    expired: bool,
+});
+
+/// A scope a new key may have (`page.security.scopes`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeView {
+    /// Its name (`account:read`).
+    pub name: String,
+    /// What it allows.
+    pub label: String,
+}
+
+luminess::view!(ScopeView as "scope" { name: text, label: text });
 
 /// One session on the account page (`page.security.sessions`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -400,6 +453,14 @@ luminess::view!(Security as "security" {
     sessions: list(object(SessionView)),
     revoke: text,
     revoke_others: text,
+    api: bool,
+    keys: list(object(KeyView)),
+    new_key: text,
+    key_create: text,
+    key_revoke: text,
+    scopes: list(object(ScopeView)),
+    expiries: list(object(Choice)),
+    max_keys: int,
 });
 
 /// What a page's `<head>` says to search engines and when it is shared

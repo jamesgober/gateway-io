@@ -21,6 +21,9 @@
 //!
 //! [host.blog.log_rule.misses] # falls back to [log_rule.*]
 //! codes = ["404"]
+//!
+//! [host.blog.api]             # falls back to [api] (enabled, prefix)
+//! prefix = "/json"
 //! ```
 //!
 //! An exact name wins over a wildcard; among wildcards the longest wins. A
@@ -67,8 +70,12 @@ pub struct HostProfiles {
 }
 
 const PROFILE_KEYS: &[&str] = &[
-    "admin", "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
+    "admin", "api", "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
 ];
+
+/// The keys of a profile's `[host.<name>.api]` (the budget is the
+/// process's, in `[api]`).
+const PROFILE_API_KEYS: &[&str] = &["enabled", "prefix"];
 
 /// `host` as profiles compare it: lower case, without a port or a trailing
 /// dot.
@@ -136,6 +143,16 @@ impl HostProfiles {
                 return Err(format!(
                     "unknown key `{at}.{k}`: the keys of a host profile are {}",
                     PROFILE_KEYS.join(", ")
+                ));
+            }
+            if let Some(k) = config
+                .keys(&format!("{at}.api"))
+                .into_iter()
+                .find(|k| !PROFILE_API_KEYS.contains(k))
+            {
+                return Err(format!(
+                    "unknown key `{at}.api.{k}`: a host profile's API keys are {}",
+                    PROFILE_API_KEYS.join(", ")
                 ));
             }
             let hosts: Vec<String> = config
