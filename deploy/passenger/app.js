@@ -1,12 +1,20 @@
 // Start shim for hosts whose application setup runs Node apps only (cPanel's
 // "Setup Node.js App", Phusion Passenger). It starts the wasp binary beside
-// it on a free loopback port and passes every request through, adding the
+// it on a Unix socket in run/ and passes every request through, adding the
 // client to X-Forwarded-For. No dependencies: Node's own http module.
 //
+// Why a socket: any account on a shared server can open a loopback port, and
+// wasp believes the client address its front end names. run/ is this
+// account's alone (mode 0700), the socket is too (0600), and wasp closes any
+// connection from another user before reading a byte.
+//
 // Environment: WASP_BIN (default ./wasp), WASP_CONFIG (default ./wasp.conf),
-// WASP_ADMIN_PASSWORD (passed on), WASP_STOP_TIMEOUT (seconds a stop may
-// take before wasp is killed, default 20), WASP_START_TIMEOUT (seconds wasp
-// may take to open its port, default 60). Passenger sets PORT.
+// WASP_ADMIN_PASSWORD (passed on), WASP_SOCKET (default ./run/wasp.sock; a
+// socket's path is at most about 100 bytes, so set a shorter one if the
+// application folder is deep), WASP_STOP_TIMEOUT (seconds a stop may take
+// before wasp is killed, default 20), WASP_START_TIMEOUT (seconds wasp may
+// take to open its socket, default 60). Passenger sets PORT, for this shim
+// only.
 //
 // Starting: the shim listens only once wasp accepts connections, so the
 // request that woke the app is answered by wasp, not with a 502.
@@ -18,6 +26,7 @@
 // shim dies first: its standard input is a pipe held by this process.
 'use strict';
 
+const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const path = require('path');
@@ -28,12 +37,13 @@ const bin = process.env.WASP_BIN || path.join(here, 'wasp');
 const config = process.env.WASP_CONFIG || path.join(here, 'wasp.conf');
 const stopTimeout = Number(process.env.WASP_STOP_TIMEOUT) || 20;
 const startTimeout = Number(process.env.WASP_START_TIMEOUT) || 60;
+const socket = process.env.WASP_SOCKET || path.join(here, 'run', 'wasp.sock');
 
-// Resolves once something accepts connections on 127.0.0.1:<port>.
-function accepting(port, deadline) {
+// Resolves once something accepts connections on the socket.
+function accepting(deadline) {
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const s = net.connect({ host: '127.0.0.1', port });
+      const s = net.connect({ path: socket });
       s.once('connect', () => {
         s.destroy();
         resolve();
@@ -41,7 +51,7 @@ function accepting(port, deadline) {
       s.once('error', () => {
         s.destroy();
         if (Date.now() >= deadline) {
-          reject(new Error(`wasp did not open its port within ${startTimeout}s`));
+          reject(new Error(`wasp did not open its socket within ${startTimeout}s`));
         } else {
           setTimeout(attempt, 100);
         }
@@ -51,26 +61,27 @@ function accepting(port, deadline) {
   });
 }
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.unref();
-    s.on('error', reject);
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => resolve(port));
-    });
-  });
+// The socket's folder, this account's alone.
+function socketFolder() {
+  if (Buffer.byteLength(socket) > 100) {
+    throw new Error(`the socket path ${socket} is too long: set WASP_SOCKET to a shorter one`);
+  }
+  const dir = path.dirname(socket);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
 }
 
 async function main() {
-  const inner = await freePort();
-  // wasp reads PORT: it listens on 127.0.0.1:<inner> and trusts only the
-  // loopback front end (this shim) for client addresses.
+  socketFolder();
+  // wasp reads WASP_SOCKET: it listens on that socket, lets only this user
+  // connect, and believes the client this shim names. PORT is Passenger's,
+  // for this shim, so wasp does not get it.
+  const env = { ...process.env, WASP_SOCKET: socket, WASP_CONFIG: config };
+  delete env.PORT;
   const child = spawn(bin, [], {
     cwd: here,
     stdio: ['pipe', 'inherit', 'inherit'],
-    env: { ...process.env, PORT: String(inner), WASP_CONFIG: config },
+    env,
   });
   let server = null;
   let exited = false;
@@ -117,14 +128,15 @@ async function main() {
     const until = Date.now() + 2000;
     const send = () => {
       const upstream = http.request(
-        { host: '127.0.0.1', port: inner, method: req.method, path: req.url, headers },
+        { socketPath: socket, method: req.method, path: req.url, headers },
         (up) => {
           res.writeHead(up.statusCode || 502, up.rawHeaders);
           up.pipe(res);
         },
       );
       upstream.on('error', (e) => {
-        if (resend && e.code === 'ECONNREFUSED' && !stopping && Date.now() < until) {
+        const down = e.code === 'ECONNREFUSED' || e.code === 'ENOENT';
+        if (resend && down && !stopping && Date.now() < until) {
           setTimeout(send, 100);
           return;
         }
@@ -139,7 +151,7 @@ async function main() {
     };
     send();
   });
-  await accepting(inner, Date.now() + startTimeout * 1000);
+  await accepting(Date.now() + startTimeout * 1000);
   if (!stopping) server.listen(process.env.PORT || 3000);
 }
 

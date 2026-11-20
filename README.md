@@ -392,8 +392,8 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gateway.listen` | `127.0.0.1:8080` | the listening address |
-| `gateway.workers` | logical CPUs, at most 64 (at most 4 when `PORT` is set) | reactor workers (1 to 256); with `blocking`, the connections served at once |
+| `gateway.listen` | `127.0.0.1:8080` | the listening address, or `unix:<path>` for a Unix socket (owner-only, and only this user's processes may connect); `WASP_SOCKET`, set by the start shim, takes its place, and so does `PORT` |
+| `gateway.workers` | logical CPUs, at most 64 (at most 4 when `PORT` or `WASP_SOCKET` is set) | reactor workers (1 to 256); with `blocking`, the connections served at once |
 | `gateway.passports` | 256 | passports per worker (requests in flight) |
 | `gateway.reserve` | an eighth of `gateway.passports` | passports per worker held back for health checks, the content editor, and sign-in: browsing cannot take them, so a flood of page views never locks those out |
 | `gateway.shed_passports` | 90 | the gateway sheds browsing on its own when this share of the passports (percent) is in use; 0 turns it off |
@@ -413,8 +413,8 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
 | `site.base` | none | the folder the site lives under (`/blog`: a leading `/`, no trailing `/`) |
-| `site.hosts` | none | the site's hosts, canonical first; none answers only the development hosts (`localhost`, `127.0.0.1`, `[::1]`), and is refused at boot when `PORT` is set |
-| `site.development` | `false` | allows an empty `site.hosts` when `PORT` is set (a local run behind a front end) |
+| `site.hosts` | none | the site's hosts, canonical first; none answers only the development hosts (`localhost`, `127.0.0.1`, `[::1]`), and is refused at boot when `PORT` or `WASP_SOCKET` is set |
+| `site.development` | `false` | allows an empty `site.hosts` when `PORT` or `WASP_SOCKET` is set (a local run behind a front end) |
 | `site.assets` | none | a folder served under `/static` |
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |

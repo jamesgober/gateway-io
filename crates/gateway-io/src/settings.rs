@@ -110,6 +110,42 @@ pub enum IngressMode {
 /// most.
 pub const PORT_WORKERS: u16 = 4;
 
+/// The variable a start shim sets to the Unix socket wasp listens on
+/// (`<app>/run/wasp.sock`): it takes the place of `PORT`, and only this
+/// account's own processes can connect.
+pub const SOCKET_ENV: &str = "WASP_SOCKET";
+
+/// The prefix of a `gateway.listen` that is a Unix socket's path.
+pub const UNIX_PREFIX: &str = "unix:";
+
+/// Whether an application server or a start shim runs this process: `PORT`
+/// or [`SOCKET_ENV`] is set.
+#[must_use]
+pub fn behind_front_end() -> bool {
+    std::env::var_os("PORT").is_some() || std::env::var_os(SOCKET_ENV).is_some()
+}
+
+/// `listen` checked: an address, or `unix:<path>` on a system with Unix
+/// sockets.
+fn check_listen(listen: &str) -> Result<(), SettingsError> {
+    let Some(path) = listen.strip_prefix(UNIX_PREFIX) else {
+        return Ok(());
+    };
+    if path.trim().is_empty() {
+        return Err(SettingsError(
+            "gateway.listen `unix:` needs the socket's path (`unix:/home/me/app/run/wasp.sock`)"
+                .into(),
+        ));
+    }
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(SettingsError(format!(
+            "gateway.listen `{listen}` is a Unix socket, which this system does not have: use an address"
+        )))
+    }
+}
+
 /// The keys of the sections the gateway reads.
 pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
@@ -223,14 +259,14 @@ impl Settings {
 
     /// Reads the settings; every key is optional, and a key the gateway does
     /// not know in `[gateway]` or `[door]` is refused (a typo never leaves a
-    /// setting at its default). Behind an application server (`PORT` set)
-    /// the default worker count is at most [`PORT_WORKERS`]: a shared host
+    /// setting at its default). Behind an application server (`PORT` or
+    /// `WASP_SOCKET` set) the default worker count is at most [`PORT_WORKERS`]: a shared host
     /// reports all of its CPUs, not the account's share.
     pub fn from_config(config: &Config) -> Result<Settings, SettingsError> {
         check_keys(config).map_err(SettingsError)?;
         let d = Settings::default();
         let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());
-        let default_workers = if std::env::var_os("PORT").is_some() {
+        let default_workers = if behind_front_end() {
             d.workers.min(PORT_WORKERS)
         } else {
             d.workers
@@ -335,7 +371,37 @@ impl Settings {
             .get::<String>("gateway.ingress")
             .map_err(|e| SettingsError(e.to_string()))?
             .is_some();
-        settings.with_port(std::env::var("PORT").ok().as_deref(), explicit_ingress)
+        check_listen(&settings.listen)?;
+        settings.with_front_end(
+            std::env::var("PORT").ok().as_deref(),
+            std::env::var(SOCKET_ENV).ok().as_deref(),
+            explicit_ingress,
+        )
+    }
+
+    /// [`with_port`](Self::with_port), or with `socket` (the start shim's
+    /// [`SOCKET_ENV`]) the gateway listens on that Unix socket instead,
+    /// whatever `PORT` and `gateway.listen` say; the ingress is as for
+    /// `PORT`. Only processes of this account's user may connect to it.
+    pub fn with_front_end(
+        self,
+        port: Option<&str>,
+        socket: Option<&str>,
+        explicit_ingress: bool,
+    ) -> Result<Settings, SettingsError> {
+        let Some(socket) = socket else {
+            return self.with_port(port, explicit_ingress);
+        };
+        let listen = format!("{UNIX_PREFIX}{socket}");
+        check_listen(&listen).map_err(|_| {
+            SettingsError(format!(
+                "{SOCKET_ENV} must be a Unix socket's path on a system that has them, not `{socket}`"
+            ))
+        })?;
+        let mut s = self;
+        s.listen = listen;
+        s.trust_front_end(explicit_ingress);
+        Ok(s)
     }
 
     /// The settings for a process an application server starts (Phusion
@@ -359,13 +425,20 @@ impl Settings {
             .filter(|p| *p != 0)
             .ok_or_else(|| SettingsError(format!("PORT must be a port number, not `{port}`")))?;
         self.listen = format!("127.0.0.1:{port}");
+        self.trust_front_end(explicit_ingress);
+        Ok(self)
+    }
+
+    /// Unless `gateway.ingress` was configured (`explicit_ingress`), the
+    /// local front end names the client: proxy ingress trusting only
+    /// loopback.
+    fn trust_front_end(&mut self, explicit_ingress: bool) {
         if !explicit_ingress {
             self.ingress = IngressMode::Proxy {
                 trusted: vec!["127.0.0.1".into(), "::1".into()],
                 forwarded_proto: true,
             };
         }
-        Ok(self)
     }
 }
 

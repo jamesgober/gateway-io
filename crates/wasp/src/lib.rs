@@ -387,7 +387,7 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
     // Typos first: `hots = [...]` is named as the typo it is, not as an
     // empty host list.
     check_keys(config)?;
-    check_hosts(config, std::env::var_os("PORT").is_some())?;
+    check_hosts(config, gateway_io::settings::behind_front_end())?;
     wire_with(
         config,
         data_dir,

@@ -155,7 +155,7 @@ impl SiteSettings {
             assets: config.get("site.assets").map_err(e)?,
             theme: config.get_or("site.theme", d.theme).map_err(e)?,
             theme_poll: config.get_or("site.theme_poll", d.theme_poll).map_err(e)?,
-            https_sign_in: std::env::var_os("PORT").is_some()
+            https_sign_in: gateway_io::settings::behind_front_end()
                 && !config.get_or("site.development", false).map_err(e)?,
             admin_theme: admin_source(config)?,
             api: crate::api::ApiSettings::from_config(config, !nex_accounts(config))?,

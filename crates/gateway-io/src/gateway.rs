@@ -272,19 +272,104 @@ impl Door {
 
 /// The listener for the settings' address and ingress.
 fn listener(settings: &Settings) -> Result<ListenerSpec, OpenError> {
-    let spec = ListenerSpec::tcp("web", settings.listen.as_str()).profile(serve_net::ProfileId(0));
-    Ok(match &settings.ingress {
-        IngressMode::Direct => spec,
+    let source = match &settings.ingress {
+        IngressMode::Direct => None,
         IngressMode::Proxy {
             forwarded_proto, ..
         } => {
             let trusted = serve_net::TrustedProxies::new(&settings.ingress.trusted())
                 .map_err(|e| OpenError(format!("gateway.trusted_proxies: {e}")))?;
-            spec.ingress(serve_net::Ingress::Proxy(
-                serve_net::ProxySource::forwarded_for(trusted).trust_scheme(*forwarded_proto),
-            ))
+            Some(serve_net::ProxySource::forwarded_for(trusted).trust_scheme(*forwarded_proto))
         }
+    };
+    if let Some(path) = settings.listen.strip_prefix(crate::settings::UNIX_PREFIX) {
+        return unix_listener(path, source);
+    }
+    let spec = ListenerSpec::tcp("web", settings.listen.as_str()).profile(serve_net::ProfileId(0));
+    Ok(match source {
+        None => spec,
+        Some(source) => spec.ingress(serve_net::Ingress::Proxy(source)),
     })
+}
+
+/// A Unix socket listener at `path`, owner-only (`0600`), whose peers must
+/// run as this process's user; behind a front end (`source`), only such a
+/// peer may name the client. Whatever is at `path` already must be a socket
+/// of this user: net-io then refuses it while something listens on it, and
+/// replaces it when it is stale. Anything else there is refused and left as
+/// it is.
+#[cfg(unix)]
+fn unix_listener(
+    path: &str,
+    source: Option<serve_net::ProxySource>,
+) -> Result<ListenerSpec, OpenError> {
+    check_socket_path(std::path::Path::new(path))?;
+    Ok(ListenerSpec::unix("web", path)
+        .profile(serve_net::ProfileId(0))
+        .unix_mode(serve_net::UnixMode::new(0o600))
+        .ingress(serve_net::Ingress::Unix(
+            serve_net::UnixPeerTrust::SameUser,
+            source,
+        )))
+}
+
+/// Refuses a `path` that holds anything but a socket of this process's
+/// user.
+#[cfg(unix)]
+fn check_socket_path(path: &std::path::Path) -> Result<(), OpenError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    let shown = path.display();
+    if !meta.file_type().is_socket() {
+        return Err(OpenError(format!(
+            "gateway.listen: {shown} exists and is not a socket; wasp never removes it, so move it or choose another path"
+        )));
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let me = own_uid(dir).map_err(|e| {
+        OpenError(format!(
+            "gateway.listen: cannot tell who owns {shown} ({e})"
+        ))
+    })?;
+    if meta.uid() != me {
+        return Err(OpenError(format!(
+            "gateway.listen: {shown} is a socket of another user (uid {}); wasp never removes it",
+            meta.uid()
+        )));
+    }
+    Ok(())
+}
+
+/// This process's user: the owner of a file it makes in `dir` (a new name,
+/// never an existing file), removed at once. No unsafe call needed.
+#[cfg(unix)]
+fn own_uid(dir: &std::path::Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let probe = dir.join(format!(".wasp-owner-{}-{nanos}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)?;
+    let uid = file.metadata().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    uid
+}
+
+#[cfg(not(unix))]
+fn unix_listener(
+    path: &str,
+    _source: Option<serve_net::ProxySource>,
+) -> Result<ListenerSpec, OpenError> {
+    Err(OpenError(format!(
+        "gateway.listen `unix:{path}` is a Unix socket, which this system does not have"
+    )))
 }
 
 /// The gateway as a kernel subsystem, at [`Position::LAST`]: it opens after
