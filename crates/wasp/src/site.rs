@@ -608,7 +608,7 @@ mod gatekeeper_site {
             let cleared = gk
                 .authorize(cx.identity().identified().clone(), &Rule::guest_only())
                 .map_err(|r| refused(&r))?;
-            // Argon2id runs here, on this worker (see the limits).
+            // Argon2id runs here, on the gateway's CPU pool (the route is `Cpu`).
             let login = gk.login(
                 &cleared,
                 &v,
@@ -642,7 +642,9 @@ mod gatekeeper_site {
         .public()
         .csrf_exempt("the gatekeeper checks its sign-in token and the origin itself")
         .template("sign-in")
-        .name("sign-in-post");
+        .name("sign-in-post")
+    // Argon2id: answered on the gateway's CPU pool, off the worker.
+    .work(serve_net::WorkClass::Cpu);
 
         let gk = gatekeeper;
         let sign_out: SiteRoute = post("/sign-out", move |cx: &mut SiteCx<'_>| {

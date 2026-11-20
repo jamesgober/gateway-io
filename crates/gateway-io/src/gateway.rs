@@ -186,7 +186,13 @@ impl Door {
                     stages.clone(),
                 )
                 .with_access(access)
-                .with_lane_rates(&settings.lane_rates),
+                .with_lane_rates(&settings.lane_rates)
+                .with_cpu(match settings.driver {
+                    // One thread per connection already: nothing to gain.
+                    Driver::Blocking => None,
+                    Driver::Reactor => crate::offload::CpuPool::start(settings.cpu_threads)
+                        .map_err(|e| OpenError(format!("gateway.cpu_threads: {e}")))?,
+                }),
             )
             .map_err(|e| OpenError(e.to_string()))?;
         let load = Watcher::start(
@@ -598,6 +604,9 @@ impl Subsystem for Gateway {
         if next.stage_timing != current.stage_timing {
             later.push("gateway.stage_timing");
         }
+        if next.cpu_threads != current.cpu_threads {
+            later.push("gateway.cpu_threads");
+        }
         if next.ingress != current.ingress {
             later.push("gateway.ingress");
         }
@@ -658,6 +667,7 @@ impl Subsystem for Gateway {
                     keep_alive_requests: running.keep_alive_requests,
                     driver: running.driver,
                     stage_timing: running.stage_timing,
+                    cpu_threads: running.cpu_threads,
                     ingress: running.ingress,
                     lane_rates: running.lane_rates,
                     ban: applied_ban,
