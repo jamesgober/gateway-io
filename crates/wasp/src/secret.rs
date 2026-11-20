@@ -6,7 +6,7 @@
 //!
 //! | Key | Default | Meaning |
 //! |---|---|---|
-//! | `auth.secret` | `<data folder>/gate.key` | the master secret's file |
+//! | `auth.secret` | `gate.key` beside `nex.path` with nex-db, else `<data folder>/gate.key` | the master secret's file |
 //!
 //! Rotating it on purpose: stop the site, move the file away, start again.
 //! Every open form (and, with the gatekeeper, every session) is then
@@ -26,9 +26,12 @@ pub fn fresh() -> Result<Zeroizing<[u8; LEN]>, String> {
 }
 
 /// Writes a new secret to `path`, owner-only on Unix. Never replaces an
-/// existing file, and never shows a half-written one: the secret is written
-/// to a file of its own first and linked into place, so of two processes
-/// starting at once one makes it and the other reads that one.
+/// existing file, and never shows a half-written one where it can help it:
+/// the secret is written to a file of its own first and linked into place,
+/// so of two processes starting at once one makes it and the other reads
+/// that one. On a file system without hard links (some network and FAT
+/// mounts) the secret is written in place, created only if it is not there;
+/// a reader that finds it still short waits a moment for it.
 pub fn create(path: &Path) -> Result<(), String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let fail = |e: std::io::Error| format!("auth.secret {}: {e}", path.display());
@@ -40,6 +43,22 @@ pub fn create(path: &Path) -> Result<(), String> {
     name.push(format!(".{}-{n}.new", std::process::id()));
     let draft = path.with_file_name(name);
     let secret = fresh()?;
+    let linked = write_new(&draft, &secret[..]).and_then(|()| std::fs::hard_link(&draft, path));
+    let _ = std::fs::remove_file(&draft);
+    match linked {
+        Ok(()) => Ok(()),
+        // Another process made it first: its secret is the one.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        // No hard links here: created in place, only if it is not there.
+        Err(_) => match write_new(path, &secret[..]) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other.map_err(fail),
+        },
+    }
+}
+
+/// Writes `bytes` to a new file at `path` (owner-only on Unix), synced.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -47,17 +66,15 @@ pub fn create(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&draft).and_then(|mut file| {
-        file.write_all(&secret[..])?;
-        file.sync_all()
-    });
-    let linked = written.and_then(|()| match std::fs::hard_link(&draft, path) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        other => other,
-    });
-    let _ = std::fs::remove_file(&draft);
-    linked.map_err(fail)
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
+
+/// How long a reader waits for a secret another process is still writing
+/// in place.
+#[cfg(feature = "store-nex")]
+const SHORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The secret in `path`, made first when there is none. Refused when the
 /// file is not exactly [`LEN`] bytes, or (on Unix) when others may read it.
@@ -69,23 +86,32 @@ pub fn read_or_create(path: &Path) -> Result<Zeroizing<[u8; LEN]>, String> {
     if !path.exists() {
         create(path)?;
     }
-    let mut file = std::fs::File::open(path).map_err(fail)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = file.metadata().map_err(fail)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(format!(
-                "auth.secret {} can be read by other users: make it owner-only (chmod 600)",
-                path.display()
-            ));
+    let until = std::time::Instant::now() + SHORT_WAIT;
+    let bytes = loop {
+        let mut file = std::fs::File::open(path).map_err(fail)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file.metadata().map_err(fail)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "auth.secret {} can be read by other users: make it owner-only (chmod 600)",
+                    path.display()
+                ));
+            }
         }
-    }
-    let mut bytes = Zeroizing::new(Vec::with_capacity(LEN + 1));
-    (&mut file)
-        .take(LEN as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(fail)?;
+        let mut bytes = Zeroizing::new(Vec::with_capacity(LEN + 1));
+        (&mut file)
+            .take(LEN as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(fail)?;
+        // Still being written in place by another process: wait for it.
+        if bytes.len() < LEN && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        break bytes;
+    };
     if bytes.len() != LEN {
         return Err(format!(
             "auth.secret {} is not a {LEN}-byte secret: move it away to have a new one made",

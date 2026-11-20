@@ -82,16 +82,27 @@ struct Shared {
 }
 
 /// The CSRF tokens' key, derived from the master secret (`auth.secret`,
-/// default `<data folder>/gate.key`) so a form opened before a restart
-/// still posts after it; without a data folder (tests, tools), for this run
-/// only.
+/// default `gate.key` in the folder that holds the database: beside
+/// `nex.path`, else the data folder) so a form opened before a restart still
+/// posts after it; with neither (tests, tools), for this run only.
 #[cfg(feature = "store-nex")]
 fn csrf_key(
     config: &Config,
     secret_dir: Option<&std::path::Path>,
 ) -> Result<crypt_io::Zeroizing<[u8; 32]>, String> {
     let named: Option<std::path::PathBuf> = config.get("auth.secret").map_err(|e| e.to_string())?;
-    let master = match named.or_else(|| secret_dir.map(|d| d.join("gate.key"))) {
+    // Beside the database, so it follows the site (and its backups) and two
+    // sites never share it.
+    let database: Option<std::path::PathBuf> = config.get("nex.path").map_err(|e| e.to_string())?;
+    let beside = database.map(|db| {
+        db.parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("gate.key")
+    });
+    let master = match named
+        .or(beside)
+        .or_else(|| secret_dir.map(|d| d.join("gate.key")))
+    {
         Some(path) => secret::read_or_create(&path)?,
         None => secret::fresh()?,
     };

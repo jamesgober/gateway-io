@@ -361,6 +361,9 @@ fn a_refused_form_says_it_expired() {
     let data = temp_dir("form-expired");
     let conf = config(&data.0);
     let (door, addr) = open(&conf);
+    // The master secret is kept beside the database, with the site.
+    let key = data.0.join("gate.key");
+    assert!(key.is_file(), "{}", key.display());
     let (pre, _) = form(addr);
     let refused = post(
         addr,
