@@ -26,6 +26,8 @@ pub struct Note {
     pub message: Box<str>,
     /// The request's reference, as the visitor sees it, or empty.
     pub reference: Box<str>,
+    /// The signed-in account, when there is one (set by the gateway).
+    pub user: Option<u128>,
 }
 
 thread_local! {
@@ -39,7 +41,8 @@ thread_local! {
 pub fn note(code: &'static str, message: &str, reference: &str) {
     NOTE.with(|n| {
         let mut n = n.borrow_mut();
-        let keep = n.take().map(|old| old.message).unwrap_or_default();
+        let old = n.take().unwrap_or_default();
+        let (keep, user) = (old.message, old.user);
         let message = if message.is_empty() {
             keep
         } else {
@@ -49,6 +52,7 @@ pub fn note(code: &'static str, message: &str, reference: &str) {
             code,
             message,
             reference: reference.into(),
+            user,
         });
     });
 }
@@ -63,6 +67,14 @@ pub fn path_under(prefix: &str) -> bool {
         p.strip_prefix(prefix)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     })
+}
+
+/// The account the request is signed in as.
+pub(crate) fn set_user(user: u128) {
+    NOTE.with(|n| {
+        let mut n = n.borrow_mut();
+        n.get_or_insert_with(Note::default).user = Some(user);
+    });
 }
 
 /// The call starts: `path` is this thread's request.

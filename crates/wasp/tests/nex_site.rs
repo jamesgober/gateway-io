@@ -872,6 +872,81 @@ fn error_pages_follow_the_errors_table_and_admin_errors_use_the_admin_theme() {
 }
 
 #[test]
+fn a_log_rule_gets_what_the_site_noted() {
+    let data = temp_dir("log-rule");
+    let file = data.0.join("errors.log");
+    let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    let conf = Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n\
+         [log_rule.client_errors]\ncodes = [\"404\"]\nfields = [\"path\", \"status\", \"code\", \"message\", \"request\", \"user\"]\ndestination = \"file:{}\"\n",
+        slash(&theme),
+        slash(&data.0.join("nex")),
+        slash(&file)
+    ))
+    .expect("config");
+    let wiring = wasp::wire(&conf).expect("wiring");
+    let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
+    auth.ensure_account(EDITOR, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
+        .expect("editor");
+    let rules = gateway_io::LogRules::from_config(&conf).expect("rules");
+    let access = gateway_io::AccessLog::with_writer_and_rules(|_| {}, rules).expect("log");
+    let mut web = WebServices::new();
+    web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
+    let settings = Settings {
+        listen: "127.0.0.1:0".into(),
+        workers: 2,
+        passports: 8,
+        ..Settings::default()
+    };
+    let door = Door::open_with(
+        wiring.core,
+        &settings,
+        UrgentLine::detached(),
+        web,
+        gateway_io::Extras {
+            access: Some(access),
+            ..gateway_io::Extras::default()
+        },
+    )
+    .expect("opens");
+    let addr = door.local_addr().expect("addr");
+    let ed = sign_in_as(addr, EDITOR);
+    let page = get(addr, "/admin/edit/nothing-here", &[&ed]);
+    assert_eq!(page.status, 404);
+    let reference = {
+        let at = page.body.find("Reference: ").expect("reference") + 11;
+        page.body[at..at + 16].to_owned()
+    };
+    let until = Instant::now() + Duration::from_secs(5);
+    let line = loop {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        if let Some(l) = text
+            .lines()
+            .find(|l| l.contains("/admin/edit/nothing-here"))
+        {
+            break l.to_owned();
+        }
+        assert!(Instant::now() < until, "no line: {text}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(line.contains("\"code\":\"admin.unknown\""), "{line}");
+    assert!(line.contains("No post or page has that slug."), "{line}");
+    assert!(
+        line.contains(&format!("\"request\":\"{reference}\"")),
+        "{line}"
+    );
+    assert!(
+        !line.contains("\"user\":\"\""),
+        "the editor's account: {line}"
+    );
+    assert!(
+        !line.contains(EDITOR),
+        "an account id, never an email: {line}"
+    );
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
 fn a_site_theme_cannot_replace_the_admin_pages() {
     let data = temp_dir("admin-split");
     let site = data.0.join("site-theme");

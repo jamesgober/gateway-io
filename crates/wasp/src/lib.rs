@@ -350,6 +350,8 @@ fn check_keys(config: &Config) -> Result<(), String> {
         let known = |k: &str| {
             // `[errors]` checks its own keys (a status or a class each).
             k == "errors"
+                // `[log_rule.<name>]` too (gateway_io::rules).
+                || k == "log_rule"
                 || SUITE_SECTIONS.contains(&k)
                 || KNOWN_KEYS.iter().any(|(s, _)| *s == k)
                 || gateway_io::settings::KNOWN_KEYS
