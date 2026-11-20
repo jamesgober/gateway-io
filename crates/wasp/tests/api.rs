@@ -17,6 +17,7 @@ use wasp_core::suite::kernel::UrgentLine;
 
 const EDITOR: &str = "ed@example.com";
 const PASSWORD: &str = "correct horse battery staple";
+const OTHER: &str = "other@example.com";
 const HOST: &str = "localhost";
 
 struct TempDir(PathBuf);
@@ -51,7 +52,7 @@ fn config(data: &Path, extra: &str) -> Config {
 
 /// The site on a loopback port, with the editor's account. `budgets`: the
 /// API's budget per caller is charged (loopback is not exempt).
-fn open(conf: &Config, budgets: bool) -> (Door, SocketAddr) {
+fn open(conf: &Config, budgets: bool) -> (Door, SocketAddr, NexAuth) {
     let t = Instant::now();
     let wiring = loop {
         match wasp::wire(conf) {
@@ -65,10 +66,11 @@ fn open(conf: &Config, budgets: bool) -> (Door, SocketAddr) {
             Err(e) => panic!("wiring: {e}"),
         }
     };
-    let db = wiring.nex.clone().expect("nex-db");
-    NexAuth::new(db)
-        .ensure_account(EDITOR, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
+    let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
+    auth.ensure_account(EDITOR, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
         .expect("editor");
+    auth.ensure_account(OTHER, PASSWORD, &[MEMBER_ROLE])
+        .expect("other");
     let mut web = WebServices::new();
     web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
     let settings = Settings {
@@ -85,7 +87,7 @@ fn open(conf: &Config, budgets: bool) -> (Door, SocketAddr) {
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     let addr = door.local_addr().expect("addr");
-    (door, addr)
+    (door, addr, auth)
 }
 
 #[derive(Debug)]
@@ -199,6 +201,10 @@ fn encode(s: &str) -> String {
 }
 
 fn sign_in(addr: SocketAddr) -> String {
+    sign_in_as(addr, EDITOR)
+}
+
+fn sign_in_as(addr: SocketAddr, email: &str) -> String {
     let first = call(addr, "GET", "/sign-in", &[], "");
     assert_eq!(first.status, 303, "{first:?}");
     let pre = first.cookie("__Host-nexpre").expect("pre");
@@ -210,7 +216,7 @@ fn sign_in(addr: SocketAddr) -> String {
         &cookie(&pre),
         &format!(
             "email={}&password={}&csrf_token={}",
-            encode(EDITOR),
+            encode(email),
             encode(PASSWORD),
             encode(&page.csrf())
         ),
@@ -224,8 +230,9 @@ fn make_key(addr: SocketAddr, session: &str, label: &str, scopes: &[&str]) -> St
     let page = call(addr, "GET", "/account/security", &cookie(session), "");
     assert_eq!(page.status, 200, "{page:?}");
     let mut form = format!(
-        "label={}&days=30&csrf_token={}",
+        "label={}&days=30&password={}&csrf_token={}",
         encode(label),
+        encode(PASSWORD),
         encode(&page.csrf())
     );
     for s in scopes {
@@ -246,7 +253,7 @@ fn make_key(addr: SocketAddr, session: &str, label: &str, scopes: &[&str]) -> St
 fn a_key_reads_what_its_scopes_allow_and_never_the_account_pages() {
     let data = temp_dir("keys");
     let conf = config(&data.0, "");
-    let (door, addr) = open(&conf, false);
+    let (door, addr, _) = open(&conf, false);
     let session = sign_in(addr);
 
     // A browser, by its cookie.
@@ -367,10 +374,10 @@ fn a_key_reads_what_its_scopes_allow_and_never_the_account_pages() {
 fn a_key_form_breaking_a_rule_makes_no_key() {
     let data = temp_dir("rules");
     let conf = config(&data.0, "");
-    let (door, addr) = open(&conf, false);
+    let (door, addr, _) = open(&conf, false);
     let session = sign_in(addr);
     let page = call(addr, "GET", "/account/security", &cookie(&session), "");
-    let csrf = encode(&page.csrf());
+    let csrf = format!("{}&password={}", encode(&page.csrf()), encode(PASSWORD));
     for (form, why) in [
         (
             format!("label=&days=30&csrf_token={csrf}"),
@@ -379,6 +386,17 @@ fn a_key_form_breaking_a_rule_makes_no_key() {
         (
             format!("label=x&days=7&csrf_token={csrf}"),
             "Choose how long",
+        ),
+        (
+            format!(
+                "label=x&days=30&password=wrong&csrf_token={}",
+                encode(&page.csrf())
+            ),
+            "The password is not right.",
+        ),
+        (
+            format!("label=x&days=30&csrf_token={}", encode(&page.csrf())),
+            "The password is not right.",
         ),
         (
             format!("label=x&days=30&scope=account%3Awrite&csrf_token={csrf}"),
@@ -412,7 +430,7 @@ fn a_key_form_breaking_a_rule_makes_no_key() {
 fn content_reads_and_errors_are_json() {
     let data = temp_dir("content");
     let conf = config(&data.0, "");
-    let (door, addr) = open(&conf, false);
+    let (door, addr, _) = open(&conf, false);
 
     let posts = call(addr, "GET", "/api/v1/posts", &[], "");
     assert_eq!(posts.status, 200, "{posts:?}");
@@ -483,7 +501,7 @@ fn content_reads_and_errors_are_json() {
 fn the_api_moves_or_goes_with_its_settings() {
     let data = temp_dir("settings");
     let conf = config(&data.0, "[api]\nprefix = \"/json\"\n");
-    let (door, addr) = open(&conf, false);
+    let (door, addr, _) = open(&conf, false);
     assert_eq!(call(addr, "GET", "/json/posts", &[], "").status, 200);
     let old = call(addr, "GET", "/api/v1/posts", &[], "");
     assert_eq!(old.status, 404, "{old:?}");
@@ -493,7 +511,7 @@ fn the_api_moves_or_goes_with_its_settings() {
 
     let data = temp_dir("off");
     let conf = config(&data.0, "[api]\nenabled = false\n");
-    let (door, addr) = open(&conf, false);
+    let (door, addr, _) = open(&conf, false);
     assert!(!call(addr, "GET", "/api/v1/posts", &[], "").is_json());
     let session = sign_in(addr);
     let page = call(addr, "GET", "/account/security", &cookie(&session), "");
@@ -527,16 +545,17 @@ fn the_api_moves_or_goes_with_its_settings() {
 }
 
 #[test]
-fn each_key_has_a_budget_of_its_own() {
+fn each_account_has_one_budget_for_all_its_keys() {
     let data = temp_dir("budget");
     let conf = config(&data.0, "[api]\nrate = 1\nburst = 2\n");
-    let (door, addr) = open(&conf, true);
+    let (door, addr, _) = open(&conf, true);
     let session = sign_in(addr);
     let a = make_key(addr, &session, "a", &[]);
     let b = make_key(addr, &session, "b", &[]);
+    let theirs = make_key(addr, &sign_in_as(addr, OTHER), "theirs", &[]);
 
-    // Key a spends its burst: a 429 with Retry-After, well inside ten
-    // quick requests (one more a second comes back).
+    // Key a spends the account's burst: a 429 with Retry-After, well
+    // inside ten quick requests (one more a second comes back).
     let mut refused = None;
     for _ in 0..10 {
         let got = call(addr, "GET", "/api/v1/posts", &bearer(&a), "");
@@ -546,15 +565,130 @@ fn each_key_has_a_budget_of_its_own() {
         }
         assert_eq!(got.status, 200, "{got:?}");
     }
-    let refused = refused.expect("key a over its budget");
+    let refused = refused.expect("the account over its budget");
     assert!(refused.field("retry-after").is_some(), "{refused:?}");
-    // Key b, a guest and page views are each on their own.
+    // Another key of the same account, or its browser, gets no more.
     let got = call(addr, "GET", "/api/v1/posts", &bearer(&b), "");
+    assert_eq!(got.status, 429, "{got:?}");
+    let got = call(addr, "GET", "/api/v1/posts", &cookie(&session), "");
+    assert_eq!(got.status, 429, "{got:?}");
+    // Another account, a guest and page views are each on their own.
+    let got = call(addr, "GET", "/api/v1/posts", &bearer(&theirs), "");
     assert_eq!(got.status, 200, "{got:?}");
     let got = call(addr, "GET", "/api/v1/posts", &[], "");
     assert_eq!(got.status, 200, "{got:?}");
     for _ in 0..5 {
         assert_eq!(call(addr, "GET", "/", &[], "").status, 200);
     }
+    let _ = door.close(Duration::from_secs(2));
+}
+
+/// The account id `/api/v1/me` gives for `key`.
+fn user_of(addr: SocketAddr, key: &str) -> wasp_core::UserId {
+    let me = call(addr, "GET", "/api/v1/me", &bearer(key), "");
+    let id = me.json("id").expect("id");
+    wasp_core::UserId(u128::from_str_radix(&id, 16).expect("hex"))
+}
+
+#[test]
+fn a_ban_or_a_disable_stops_keys_at_once_and_a_lockout_does_not() {
+    let data = temp_dir("standing");
+    let conf = config(&data.0, "");
+    let (door, addr, auth) = open(&conf, false);
+    let session = sign_in(addr);
+    let key = make_key(addr, &session, "standing", &["account:read"]);
+    let me = |k: &str| call(addr, "GET", "/api/v1/me", &bearer(k), "");
+    let user = user_of(addr, &key);
+
+    // Wrong sign-in codes (ten, the default) lock the account, not its
+    // programs.
+    for _ in 0..10 {
+        let _ = auth.check_code(user, "000000").expect("code");
+    }
+    assert!(!auth.may_sign_in(user).expect("standing"), "locked out");
+    assert_eq!(me(&key).status, 200, "a lockout leaves keys working");
+
+    // A disable stops the key on the next request, with no wait.
+    auth.disable(user, user).expect("disable");
+    let got = me(&key);
+    assert_eq!(got.status, 403, "{got:?}");
+    assert_eq!(got.json("code").as_deref(), Some("api.account_disabled"));
+    assert!(auth.enable(user, user).expect("enable"));
+    assert_eq!(me(&key).status, 200);
+    // So does a ban.
+    auth.ban(user).expect("ban");
+    assert_eq!(me(&key).status, 403);
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_password_change_or_signing_out_everywhere_revokes_every_key() {
+    let data = temp_dir("revoke-all");
+    let conf = config(&data.0, "");
+    let (door, addr, _) = open(&conf, false);
+    let session = sign_in(addr);
+    let one = make_key(addr, &session, "one", &[]);
+    let two = make_key(addr, &session, "two", &[]);
+    let theirs = make_key(addr, &sign_in_as(addr, OTHER), "theirs", &[]);
+    let posts = |k: &str| call(addr, "GET", "/api/v1/posts", &bearer(k), "").status;
+    assert_eq!((posts(&one), posts(&two)), (200, 200));
+
+    const NEW: &str = "a new and longer password";
+    let page = call(addr, "GET", "/account/security", &cookie(&session), "");
+    assert!(page.body.contains("revokes your API keys"), "{}", page.body);
+    let changed = call(
+        addr,
+        "POST",
+        "/account/password",
+        &cookie(&session),
+        &format!(
+            "current={}&new={}&again={}&csrf_token={}",
+            encode(PASSWORD),
+            encode(NEW),
+            encode(NEW),
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(changed.status, 200, "{changed:?}");
+    assert!(
+        changed.body.contains("your API keys are revoked"),
+        "{}",
+        changed.body
+    );
+    assert_eq!((posts(&one), posts(&two)), (401, 401));
+    assert!(changed.body.contains("No keys yet."), "{}", changed.body);
+    assert_eq!(posts(&theirs), 200, "another account's keys stay");
+
+    // Signing out everywhere too.
+    let session = changed.cookie("__Host-nex").expect("the new session");
+    let page = call(addr, "GET", "/account/security", &cookie(&session), "");
+    let made = call(
+        addr,
+        "POST",
+        "/account/keys",
+        &cookie(&session),
+        &format!(
+            "label=three&days=30&password={}&csrf_token={}",
+            encode(NEW),
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(made.status, 200, "{made:?}");
+    let three = {
+        let at = made.body.find("class=\"key\">").expect("the key") + 12;
+        let rest = &made.body[at..];
+        rest[..rest.find('<').expect("end")].to_owned()
+    };
+    assert_eq!(posts(&three), 200);
+    let out = call(
+        addr,
+        "POST",
+        "/account/sign-out-everywhere",
+        &cookie(&session),
+        &format!("csrf_token={}", encode(&page.csrf())),
+    );
+    assert_eq!(out.status, 303, "{out:?}");
+    assert_eq!(posts(&three), 401);
+    assert_eq!(posts(&theirs), 200);
     let _ = door.close(Duration::from_secs(2));
 }
