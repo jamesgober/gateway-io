@@ -26,12 +26,19 @@ pub fn fresh() -> Result<Zeroizing<[u8; LEN]>, String> {
 }
 
 /// Writes a new secret to `path`, owner-only on Unix. Never replaces an
-/// existing file.
+/// existing file, and never shows a half-written one: the secret is written
+/// to a file of its own first and linked into place, so of two processes
+/// starting at once one makes it and the other reads that one.
 pub fn create(path: &Path) -> Result<(), String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let fail = |e: std::io::Error| format!("auth.secret {}: {e}", path.display());
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(fail)?;
     }
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}-{n}.new", std::process::id()));
+    let draft = path.with_file_name(name);
     let secret = fresh()?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -40,9 +47,16 @@ pub fn create(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(fail)?;
-    file.write_all(&secret[..]).map_err(fail)?;
-    file.sync_all().map_err(fail)
+    let written = options.open(&draft).and_then(|mut file| {
+        file.write_all(&secret[..])?;
+        file.sync_all()
+    });
+    let linked = written.and_then(|()| match std::fs::hard_link(&draft, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    });
+    let _ = std::fs::remove_file(&draft);
+    linked.map_err(fail)
 }
 
 /// The secret in `path`, made first when there is none. Refused when the
@@ -121,6 +135,26 @@ mod tests {
         let b = derive(&first, "something else").expect("other");
         assert_ne!(*a, *b, "one key per purpose");
         assert_ne!(*a, *first, "never the secret itself");
+
+        // Processes starting at once on a new data folder: one secret, never
+        // a half-written file.
+        let race = dir.0.join("race").join("gate.key");
+        let made: Vec<[u8; LEN]> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| *read_or_create(&race).expect("made or read")))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        assert!(made.iter().all(|m| *m == made[0]), "one secret for all");
+        let left: Vec<_> = std::fs::read_dir(dir.0.join("race"))
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "no draft left behind: {left:?}");
 
         std::fs::write(&path, b"short").expect("write");
         let err = read_or_create(&path).expect_err("not 32 bytes");

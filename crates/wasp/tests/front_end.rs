@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,20 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Keeps every folder the process makes (data, logs, ...) inside `dir`, so
+/// tests running at once never share one, and nothing lands in the home
+/// folder.
+fn own_folders(c: &mut Command, dir: &Folder) {
+    for kind in ["DATA", "CONFIG", "CACHE", "LOGS", "STATE", "RUNTIME"] {
+        c.env(format!("WASP_{kind}_DIR"), dir.0.join("dirs").join(kind));
+    }
+}
+
+/// Where a process's standard error goes.
+fn log_of(dir: &Folder, port: u16) -> PathBuf {
+    dir.0.join(format!("wasp-{port}.log"))
+}
+
 fn wasp(dir: &Folder, port: u16) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_wasp"));
     c.current_dir(&dir.0)
@@ -51,8 +65,16 @@ fn wasp(dir: &Folder, port: u16) -> Command {
         .env("WASP_CONFIG", dir.0.join("wasp.conf"))
         .env_remove("WASP_ADMIN_PASSWORD")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(std::fs::File::create(log_of(dir, port)).expect("log file"));
+    own_folders(&mut c, dir);
     c
+}
+
+/// The end of a process's standard error, for a failure message.
+fn tail(log: &Path) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(15)..].join("\n")
 }
 
 /// `/ready`'s status, through a front end that names the client.
@@ -69,18 +91,18 @@ fn ready(port: u16) -> Option<u16> {
     std::str::from_utf8(buf.get(9..12)?).ok()?.parse().ok()
 }
 
-fn wait_ready(port: u16, child: &mut Child) {
+fn wait_ready(port: u16, child: &mut Child, log: &Path) {
     let until = Instant::now() + Duration::from_secs(30);
     while Instant::now() < until {
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("wasp exited before it was ready: {status}");
+            panic!("wasp exited before it was ready: {status}\n{}", tail(log));
         }
         if ready(port) == Some(200) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("wasp was not ready within 30s");
+    panic!("wasp was not ready within 30s\n{}", tail(log));
 }
 
 fn wait_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
@@ -110,7 +132,7 @@ fn closing_standard_input_stops_it_cleanly_and_a_restart_overlapping_the_drain_c
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn");
-    wait_ready(port, &mut old);
+    wait_ready(port, &mut old, &log_of(&dir, port));
 
     // The front end lets go; a new process starts at once on the same data
     // folder (and a new port), while the old one is still stopping.
@@ -122,8 +144,12 @@ fn closing_standard_input_stops_it_cleanly_and_a_restart_overlapping_the_drain_c
         .expect("spawn");
 
     let status = wait_exit(&mut old, Duration::from_secs(20)).expect("the old process stops");
-    assert!(status.success(), "a clean stop: {status}");
-    wait_ready(port2, &mut new);
+    assert!(
+        status.success(),
+        "a clean stop: {status}\n{}",
+        tail(&log_of(&dir, port))
+    );
+    wait_ready(port2, &mut new, &log_of(&dir, port2));
 
     drop(new.stdin.take());
     let status = wait_exit(&mut new, Duration::from_secs(20)).expect("the new process stops");
@@ -137,18 +163,20 @@ fn a_parent_that_dies_takes_it_down() {
     // A stand-in front end: a shell that starts wasp (standard input from
     // /dev/null, so only the parent watch can stop it), prints its pid, and
     // waits. Killing the shell hands wasp to another parent.
-    let mut shell = Command::new("sh")
-        .arg("-c")
-        .arg("\"$0\" < /dev/null & echo $!; wait")
+    let log = log_of(&dir, port);
+    let mut sh = Command::new("sh");
+    sh.arg("-c")
+        .arg("\"$0\" < /dev/null 2> \"$1\" & echo $!; wait")
         .arg(env!("CARGO_BIN_EXE_wasp"))
+        .arg(&log)
         .current_dir(&dir.0)
         .env("PORT", port.to_string())
         .env("WASP_CONFIG", dir.0.join("wasp.conf"))
         .env_remove("WASP_ADMIN_PASSWORD")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn");
+        .stderr(Stdio::null());
+    own_folders(&mut sh, &dir);
+    let mut shell = sh.spawn().expect("spawn");
     let mut line = String::new();
     let mut out = shell.stdout.take().expect("stdout");
     let mut byte = [0u8; 1];
@@ -159,7 +187,11 @@ fn a_parent_that_dies_takes_it_down() {
     let until = Instant::now() + Duration::from_secs(30);
     while ready(port) != Some(200) {
         assert!(Instant::now() < until, "wasp was not ready within 30s");
-        assert!(alive(pid), "wasp exited before it was ready");
+        assert!(
+            alive(pid),
+            "wasp exited before it was ready\n{}",
+            tail(&log)
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -179,7 +211,7 @@ fn a_parent_that_dies_takes_it_down() {
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn");
-    wait_ready(port2, &mut next);
+    wait_ready(port2, &mut next, &log_of(&dir, port2));
     drop(next.stdin.take());
     assert!(wait_exit(&mut next, Duration::from_secs(20)).is_some());
 }
