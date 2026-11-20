@@ -288,6 +288,17 @@ impl NexAuth {
         }))
     }
 
+    /// Revokes every key of `user`; how many.
+    pub fn revoke_api_keys(&self, user: UserId) -> Result<usize, StoreError> {
+        let mut n = 0;
+        for key in self.api_keys(user)? {
+            if self.revoke_api_key(user, &key.id)?.is_some() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Revokes `user`'s key `id` (32 hex digits) and drops it from the list:
     /// `None` when `user` has no such key (another account's key is never
     /// touched), else its label.

@@ -295,19 +295,21 @@ form_net::form! {
     ignore = ["csrf_token"];
 }
 
-/// The make-a-key form: a label, how many days, and any number of `scope`
-/// boxes (web-net checked its `csrf_token` before the handler).
+/// The make-a-key form: a label, how many days, any number of `scope` boxes,
+/// and the current password (web-net checked its `csrf_token` before the
+/// handler).
 #[derive(Debug, Default)]
 struct KeyForm {
     label: String,
     days: String,
     scopes: Vec<String>,
+    password: Zeroizing<String>,
 }
 
 #[derive(Default)]
 struct KeyFormBuilder {
     form: KeyForm,
-    seen: (bool, bool),
+    seen: (bool, bool, bool),
 }
 
 impl form_net::FormBuilder for KeyFormBuilder {
@@ -329,13 +331,17 @@ impl form_net::FormBuilder for KeyFormBuilder {
                 self.seen.1 = true;
                 value.clone_into(&mut self.form.days);
             }
+            "password" if !self.seen.2 => {
+                self.seen.2 = true;
+                self.form.password = Zeroizing::new(value.to_owned());
+            }
             "scope" => {
                 if self.form.scopes.len() >= crate::nex::SCOPES.len() {
                     return Err(refuse(ExtractError::Invalid("too many scopes")));
                 }
                 self.form.scopes.push(value.to_owned());
             }
-            "label" | "days" => return Err(refuse(ExtractError::Duplicate)),
+            "label" | "days" | "password" => return Err(refuse(ExtractError::Duplicate)),
             _ => return Err(refuse(ExtractError::Unknown)),
         }
         Ok(())
@@ -955,7 +961,7 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
                     cx,
                     user,
                     "",
-                    "Your password is changed. You are signed out everywhere else.",
+                    "Your password is changed. You are signed out everywhere else, and your API keys are revoked.",
                 )
             }
             Err(why) => {
@@ -1069,6 +1075,15 @@ fn key_routes(acc: &Accounts) -> Vec<NexRoute> {
         let Ok(days) = form.days.trim().parse::<u32>() else {
             return refused(cx, "Choose how long the key lasts.");
         };
+        // The password, so a session someone else got hold of cannot make
+        // a key that outlives it.
+        let Some(_slot) = hash_slot(&s.hashing) else {
+            cx.set_header("retry-after", "2");
+            return Err(web_net::Error::unavailable("auth.busy"));
+        };
+        if form.password.is_empty() || !s.auth.password_is(user, &form.password).map_err(store)? {
+            return refused(cx, "The password is not right.");
+        }
         match s
             .auth
             .create_api_key(user, &form.label, scopes, days)

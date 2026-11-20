@@ -482,7 +482,8 @@ fn a_realm_keeps_its_sessions_and_keys_in_it() {
         "/account/keys",
         &[&one],
         &format!(
-            "label=blog&days=30&scope=account%3Aread&csrf_token={}",
+            "label=blog&days=30&scope=account%3Aread&password={}&csrf_token={}",
+            encode(PASSWORD),
             encode(&page.csrf())
         ),
     );
@@ -507,7 +508,7 @@ fn a_realm_keeps_its_sessions_and_keys_in_it() {
     assert_eq!(moved.status, 404, "{moved:?}");
     assert!(!moved.body.contains("\"code\""), "{}", moved.body);
 
-    // Signing out everywhere ends the realm's sessions and leaves its keys.
+    // Signing out everywhere ends the realm's sessions and its keys.
     let page = get(addr, "blog.test", "/account/security", &[&one]);
     let out = post(
         addr,
@@ -518,6 +519,6 @@ fn a_realm_keeps_its_sessions_and_keys_in_it() {
     );
     assert_eq!(out.status, 303, "{out:?}");
     assert_eq!(get(addr, "blog.test", "/account", &[&one]).status, 303);
-    assert_eq!(get_with(addr, "blog.test", "/json/me", &bearer).status, 200);
+    assert_eq!(get_with(addr, "blog.test", "/json/me", &bearer).status, 401);
     let _ = door.close(Duration::from_secs(2));
 }

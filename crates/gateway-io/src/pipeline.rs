@@ -184,20 +184,30 @@ impl Pipeline {
     /// The request's caller, bound to its ticket, charged to its lane's
     /// budget: `Some(status)` when it is over. Only for a lane with a
     /// budget, so other requests pay nothing. A signed-in caller is its
-    /// session (or API key) by the id authentication gave it; a guest is its
+    /// account, whichever session or API key it came with; a guest is its
     /// address.
     fn charge(&self, worker: u16, tag: TicketTag, h: &wasp_core::Handoff) -> Option<u16> {
         let lane = h.trip().lane;
         if !self.budgeted[usize::from(lane.0.min(5))] {
             return None;
         }
-        let session = h.identity().session();
+        let account = match h.identity().subject() {
+            wasp_core::Subject::User(u) => Some(u.0),
+            wasp_core::Subject::Guest => None,
+        };
         let verdict = self.tickets.with_ticket(worker, tag, |ticket| {
-            if let Some(id) = session {
-                let bound =
-                    ticket.bind_session(bouncer_io::SessionKey::from_digest(id.0.to_le_bytes()));
-                if bound.is_deny() {
-                    return bound;
+            if let Some(id) = account {
+                // The account (its bans), and its budget: one for all its
+                // sessions and keys together, so more keys never mean more
+                // requests. The budget is kept under the binding the
+                // bouncer charges lanes to.
+                for bound in [
+                    ticket.bind_account(bouncer_io::AccountKey(id)),
+                    ticket.bind_session(bouncer_io::SessionKey::from_digest(id.to_le_bytes())),
+                ] {
+                    if bound.is_deny() {
+                        return bound;
+                    }
                 }
             }
             ticket.bind_lane(crate::bouncer::lane_class(lane))
