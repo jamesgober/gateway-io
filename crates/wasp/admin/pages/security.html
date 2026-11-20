@@ -44,6 +44,19 @@
 
 <section>
 <h2>Sessions</h2>
+<table class="entries">
+<thead><tr><th>Device</th><th>Address</th><th>Signed in</th><th>Last used</th><th></th></tr></thead>
+<tbody>
+{%- for x in page.security.sessions %}
+<tr><td>{{ x.device }}{% if x.current %} <strong>(this one)</strong>{% endif %}</td><td>{{ x.address }}</td><td>{{ x.signed_in }}</td><td>{{ x.last_used }}</td>
+<td>{% if not x.current %}<form class="inline" method="post" action="{{ page.security.revoke }}"><input type="hidden" name="csrf_token" value="{{ page.security.csrf }}"><input type="hidden" name="session" value="{{ x.id }}"><button type="submit">Sign out</button></form>{% endif %}</td></tr>
+{%- endfor %}
+</tbody>
+</table>
+<form method="post" action="{{ page.security.revoke_others }}">
+<input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
+<button type="submit">Sign out all other sessions</button>
+</form>
 <form method="post" action="{{ page.security.everywhere }}">
 <input type="hidden" name="csrf_token" value="{{ page.security.csrf }}">
 <button type="submit">Sign out everywhere</button>

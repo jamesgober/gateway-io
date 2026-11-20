@@ -7,6 +7,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gateway_io::{Door, Settings, WebServices};
@@ -80,6 +81,9 @@ fn open_with_auth(conf: &Config) -> (Door, SocketAddr, NexAuth) {
         listen: "127.0.0.1:0".into(),
         workers: 2,
         passports: 8,
+        // These tests are about accounts, not the door's budgets: bursts of
+        // sign-ins from one address are expected here.
+        exempt: vec![std::net::IpAddr::from([127, 0, 0, 1])],
         ..Settings::default()
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
@@ -319,6 +323,141 @@ fn sign_out_everywhere_and_the_session_cap() {
     );
     assert_eq!(out.status, 303, "{out:?}");
     assert!(!signed_in(addr, &second) && !signed_in(addr, &third));
+    drop(door);
+}
+
+/// The session ids a session's page offers to sign out (every one but its
+/// own).
+fn other_ids(addr: SocketAddr, session: &str) -> Vec<String> {
+    let page = get(addr, "/account/security", &[session]);
+    assert_eq!(page.status, 200, "{page:?}");
+    assert_eq!(page.body.matches("(this one)").count(), 1, "{}", page.body);
+    page.body
+        .split("name=\"session\" value=\"")
+        .skip(1)
+        .filter_map(|s| s.get(..32))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn sessions_are_listed_and_signed_out_one_by_one() {
+    let data = temp_dir("session-list");
+    let conf = config(&data.0, "[auth.lockout]\naddress_attempts = 100\n");
+    let (door, addr) = open(&conf);
+    let a = sign_in(addr, MEMBER, PASSWORD);
+    let b = sign_in(addr, MEMBER, PASSWORD);
+    let c = sign_in(addr, MEMBER, PASSWORD);
+    let page = get(addr, "/account/security", &[&a]);
+    assert!(page.body.contains("<td>127.0.0.1</td>"), "{}", page.body);
+    assert!(page.body.contains(" UTC</td>"), "{}", page.body);
+    let others = other_ids(addr, &a);
+    assert_eq!(others.len(), 2, "{others:?}");
+    // b's own id is the one of a's others that b's page does not offer.
+    let b_others = other_ids(addr, &b);
+    let b_id = others
+        .iter()
+        .find(|id| !b_others.contains(id))
+        .expect("b's id")
+        .clone();
+    let revoke = post(
+        addr,
+        "/account/sessions/revoke",
+        &[&a],
+        &format!("session={b_id}&csrf_token={}", encode(&token(addr, &a))),
+    );
+    assert_eq!(revoke.status, 200, "{revoke:?}");
+    assert!(!signed_in(addr, &b), "b ended");
+    assert!(signed_in(addr, &a) && signed_in(addr, &c), "only b");
+    let again = post(
+        addr,
+        "/account/sessions/revoke",
+        &[&a],
+        &format!("session={b_id}&csrf_token={}", encode(&token(addr, &a))),
+    );
+    assert_eq!(again.status, 404, "already ended");
+
+    let rest = post(
+        addr,
+        "/account/sessions/revoke-others",
+        &[&a],
+        &format!("csrf_token={}", encode(&token(addr, &a))),
+    );
+    assert_eq!(rest.status, 200);
+    assert!(
+        rest.body.contains("One other session is signed out."),
+        "{}",
+        rest.body
+    );
+    assert!(signed_in(addr, &a) && !signed_in(addr, &c));
+    drop(door);
+}
+
+#[test]
+fn sign_ins_at_the_same_moment_each_get_their_own_session_record() {
+    let data = temp_dir("session-race");
+    let conf = config(&data.0, "[auth.lockout]\naddress_attempts = 1000\n");
+    let (door, addr) = open(&conf);
+    let mut sessions = Vec::new();
+    // Two at a time: as many passwords as are hashed at once.
+    for _ in 0..4 {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let both: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let (pre, csrf) = form(addr);
+                    gate.wait();
+                    let done = post(
+                        addr,
+                        "/sign-in",
+                        &[&pre],
+                        &format!(
+                            "email={}&password={}&csrf_token={}",
+                            encode(MEMBER),
+                            encode(PASSWORD),
+                            encode(&csrf)
+                        ),
+                    );
+                    assert_eq!(done.status, 303, "{done:?}");
+                    done.cookie("__Host-nex").expect("session")
+                })
+            })
+            .collect();
+        for t in both {
+            sessions.push(t.join().expect("sign-in"));
+        }
+    }
+    // Every session sees itself once and the others as others.
+    let all: Vec<Vec<String>> = sessions.iter().map(|s| other_ids(addr, s)).collect();
+    let mut every: Vec<String> = all.iter().flatten().cloned().collect();
+    every.sort();
+    every.dedup();
+    assert_eq!(every.len(), sessions.len(), "one id per session: {every:?}");
+    let own: Vec<String> = all
+        .iter()
+        .map(|others| {
+            let mine: Vec<&String> = every.iter().filter(|id| !others.contains(id)).collect();
+            assert_eq!(mine.len(), 1, "{others:?}");
+            mine[0].clone()
+        })
+        .collect();
+    // Signing out one session's id from another ends that one only.
+    for (k, id) in own.iter().enumerate().skip(1) {
+        let by = &sessions[0];
+        let r = post(
+            addr,
+            "/account/sessions/revoke",
+            &[by],
+            &format!("session={id}&csrf_token={}", encode(&token(addr, by))),
+        );
+        assert_eq!(r.status, 200, "{r:?}");
+        assert!(!signed_in(addr, &sessions[k]), "session {k} ended");
+        for (j, s) in sessions.iter().enumerate().skip(k + 1) {
+            assert!(signed_in(addr, s), "session {j} still in after {k}");
+        }
+        assert!(signed_in(addr, by));
+    }
     drop(door);
 }
 

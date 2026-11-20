@@ -335,7 +335,39 @@ pub struct Security {
     pub enable: String,
     /// The remove button's address (administrator only).
     pub remove: String,
+    /// The account's sessions, newest first.
+    pub sessions: Arc<Vec<Arc<SessionView>>>,
+    /// The revoke-one button's address.
+    pub revoke: String,
+    /// The revoke-the-others button's address.
+    pub revoke_others: String,
 }
+
+/// One session on the account page (`page.security.sessions`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionView {
+    /// Its id, for the revoke button.
+    pub id: String,
+    /// The device it signed in from.
+    pub device: String,
+    /// The address it signed in from.
+    pub address: String,
+    /// When it signed in (`2026-11-20 14:05 UTC`).
+    pub signed_in: String,
+    /// When it was last used.
+    pub last_used: String,
+    /// The session viewing the page.
+    pub current: bool,
+}
+
+luminess::view!(SessionView as "session" {
+    id: text,
+    device: text,
+    address: text,
+    signed_in: text,
+    last_used: text,
+    current: bool,
+});
 
 luminess::view!(Security as "security" {
     identifier: text,
@@ -365,6 +397,9 @@ luminess::view!(Security as "security" {
     disable: text,
     enable: text,
     remove: text,
+    sessions: list(object(SessionView)),
+    revoke: text,
+    revoke_others: text,
 });
 
 /// What a page's `<head>` says to search engines and when it is shared

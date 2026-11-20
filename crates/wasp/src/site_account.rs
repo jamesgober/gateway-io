@@ -33,11 +33,13 @@ use wasp_core::{PermSet, Rule, Subject, UserId};
 use web_net::form_net::{self, Secret};
 use web_net::{get, post};
 
-use crate::nex::{CodeCheck, NexAuth, PRE_COOKIE, PasswordStep, SESSION_COOKIE, cookie};
+use crate::nex::{
+    CodeCheck, NexAuth, PRE_COOKIE, PasswordStep, SESSION_COOKIE, SignInFrom, cookie,
+};
 use crate::policy::MfaMode;
 use crate::site::{Pages, query_value};
 use crate::site_nex::{ADMIN, Attempts, EDITOR, NexCx, NexRoute, hash_slot};
-use crate::theme::{ADMIN_CSP, AccountView, Security};
+use crate::theme::{ADMIN_CSP, AccountView, Security, SessionView};
 
 /// The half-done sign-in's cookie.
 pub const STEP_COOKIE: &str = "__Host-nexstep";
@@ -276,6 +278,14 @@ form_net::form! {
 }
 
 form_net::form! {
+    /// A session's revoke button.
+    struct SessionForm {
+        session: String,
+    }
+    ignore = ["csrf_token"];
+}
+
+form_net::form! {
     /// An administrator's button on one account.
     struct AccountForm {
         account: String,
@@ -286,6 +296,38 @@ form_net::form! {
 
 fn store(_: crate::content::StoreError) -> web_net::Error {
     web_net::Error::unavailable("auth.unavailable")
+}
+
+/// Where this request signs in from.
+fn from(cx: &NexCx<'_>) -> SignInFrom {
+    let ua = cx
+        .header("user-agent")
+        .and_then(|h| std::str::from_utf8(h).ok());
+    SignInFrom::new(ua, cx.request().client().addr())
+}
+
+/// `t` as `2026-11-20 14:05 UTC`.
+fn when(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Days to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 fn me(cx: &NexCx<'_>) -> Result<UserId, web_net::Error> {
@@ -348,6 +390,34 @@ impl Accounts {
             min_length: i64::try_from(rules.min_length).unwrap_or(i64::MAX),
             editor: perms.contains(EDITOR),
             admin: perms.contains(ADMIN),
+            sessions: Arc::new(
+                a.sessions_of(
+                    user,
+                    cx.identity()
+                        .identity
+                        .session()
+                        .unwrap_or(wasp_core::SessionId(0)),
+                )
+                .map_err(store)?
+                .into_iter()
+                .map(|s| {
+                    Arc::new(SessionView {
+                        id: s.id,
+                        device: if s.device.is_empty() {
+                            "Unknown device".to_owned()
+                        } else {
+                            s.device
+                        },
+                        address: s.address,
+                        signed_in: when(s.signed_in),
+                        last_used: when(s.last_used),
+                        current: s.current,
+                    })
+                })
+                .collect(),
+            ),
+            revoke: cx.url("/account/sessions/revoke")?,
+            revoke_others: cx.url("/account/sessions/revoke-others")?,
             ..Security::default()
         })
     }
@@ -397,7 +467,7 @@ impl Accounts {
         user: UserId,
         remember: bool,
     ) -> Result<(), web_net::Error> {
-        let set = self.auth.open_session(user).map_err(store)?;
+        let set = self.auth.open_session(user, &from(cx)).map_err(store)?;
         cx.set_header("set-cookie", set);
         cx.set_header("set-cookie", clear(PRE_COOKIE));
         cx.set_header("set-cookie", clear(STEP_COOKIE));
@@ -742,7 +812,7 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
         };
         match s
             .auth
-            .change_password(user, form.current.expose(), form.new.expose())
+            .change_password(user, form.current.expose(), form.new.expose(), &from(cx))
             .map_err(store)?
         {
             Ok(set) => {
@@ -797,7 +867,52 @@ fn own_routes(acc: &Accounts) -> Vec<NexRoute> {
     .template("admin/security")
     .name("account-forget-devices");
 
-    let mut routes = vec![page, password, everywhere, devices];
+    let s = acc.clone();
+    let revoke: NexRoute = post("/account/sessions/revoke", move |cx: &mut NexCx<'_>| {
+        let user = me(cx)?;
+        let form: SessionForm = cx.form()?;
+        let who = s.who(user);
+        if s.auth
+            .revoke_session(user, form.session.trim())
+            .map_err(store)?
+        {
+            crate::events::audit(&who, "session_revoked", &who);
+            s.security_page(cx, user, "", "That session is signed out.")
+        } else {
+            cx.status(404);
+            s.security_page(cx, user, "That session has already ended.", "")
+        }
+    })
+    .allow(SIGNED_IN)
+    .template("admin/security")
+    .name("account-session-revoke");
+
+    let s = acc.clone();
+    let others: NexRoute = post(
+        "/account/sessions/revoke-others",
+        move |cx: &mut NexCx<'_>| {
+            let user = me(cx)?;
+            let this = cx
+                .identity()
+                .identity
+                .session()
+                .ok_or_else(|| web_net::Error::forbidden("account.no_session"))?;
+            let n = s.auth.revoke_others(user, this).map_err(store)?;
+            let who = s.who(user);
+            crate::events::audit(&who, "other_sessions_revoked", &who);
+            let notice = match n {
+                0 => "There were no other sessions.".to_owned(),
+                1 => "One other session is signed out.".to_owned(),
+                n => format!("{n} other sessions are signed out."),
+            };
+            s.security_page(cx, user, "", &notice)
+        },
+    )
+    .allow(SIGNED_IN)
+    .template("admin/security")
+    .name("account-session-revoke-others");
+
+    let mut routes = vec![page, password, everywhere, devices, revoke, others];
     routes.extend(two_factor_routes(acc));
     routes
 }

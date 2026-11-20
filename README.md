@@ -172,6 +172,7 @@ The editor shows the fields of the entry's kind. A theme reads them in `page.ent
 With nex-db, every signed-in account has `/account/security`:
 
 - **Password.** Change it with the current one. Every other session ends.
+- **Sessions.** Every session of the account, with the device and address it signed in from, when it signed in and when it was last used. Sign out any one of them, or all but this one.
 - **Sign out everywhere.** Ends every session of the account, this one too, and forgets its remembered devices.
 - **Two-step sign-in.** Turn it on with an authenticator app and your password. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off, signing out everywhere and "Forget remembered devices" undo that.
 
