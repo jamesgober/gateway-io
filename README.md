@@ -38,7 +38,7 @@ cargo build --release -p wasp
 cargo run -p wasp
 ```
 
-It reads `wasp.conf` from the working directory (or the file named by `WASP_CONFIG`) and listens on `127.0.0.1:8080` by default. Ctrl+C (or SIGTERM) closes the door first, drains, then stops the core and the kernel.
+It reads `wasp.conf` from the working directory (or the file named by `WASP_CONFIG`) and listens on `127.0.0.1:8080` by default. Run as root or administrator, it reads only the file `WASP_CONFIG` names: a working directory is easy for someone else to plant a file in. With no file found it starts on the defaults and says so in a warning. Ctrl+C (or SIGTERM) closes the door first, drains, then stops the core and the kernel.
 
 To sign in, name a boot account and give its password in the environment (never in the configuration):
 
@@ -51,7 +51,9 @@ admin = "admin@example.com"
 WASP_ADMIN_PASSWORD='a long password' cargo run -p wasp
 ```
 
-Accounts and sessions are in memory: a restart signs everyone out. The gates' master secret is `<data folder>/gate.key`, made on the first run.
+Accounts and sessions are in memory: a restart signs everyone out, and the boot account is made again on every start, so `WASP_ADMIN_PASSWORD` is needed each time. The gates' master secret is `<data folder>/gate.key`, made on the first run.
+
+With nex-db (below) accounts are kept: `WASP_ADMIN_PASSWORD` is needed only for the start that makes the boot account. Once it exists, a start without the variable boots as usual; a start that names an account not made yet refuses with that reason.
 
 The stores are cargo features of `wasp`: `gatekeeper` (on by default) and `store-nex` (off). A site on nex-db alone, with durable accounts and no C dependency:
 
@@ -136,9 +138,9 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `content.path` | `<data folder>/content.bison` | the bison-db file |
 | `auth.store` | `gatekeeper` (`nex` in a build without it) | the site's accounts and sessions: `gatekeeper` (feature `gatekeeper`, on by default; in memory: a restart signs everyone out) or `nex` (feature `store-nex`; nex-db: durable) |
 | `nex.path` | `<data folder>/nex` | the nex-db database, shared by `auth.store = "nex"` and `content.store = "nex"`; one process at a time |
-| `nex.lock_wait` | `15s` | how long a boot waits for another process (a restart overlapping the old one's stop) to let go of the database before it refuses |
-| `auth.admin` | none | an account made at boot (given the `member` and `editor` roles with nex-db); its password from `WASP_ADMIN_PASSWORD` |
-| `auth.secret` | `<data folder>/gate.key` | the gates' 32-byte master secret, made on the first run (owner-only on Unix) |
+| `nex.lock_wait` | `15s` | how long a boot waits for another process (a restart overlapping the old one's stop) to let go of the database; it warns when it starts waiting and names the process when it can. `0s` refuses at once |
+| `auth.admin` | none | an account made at boot (given the `member` and `editor` roles with nex-db); its password from `WASP_ADMIN_PASSWORD`, needed with nex-db only until the account exists |
+| `auth.secret` | `<data folder>/gate.key` | the site's 32-byte master secret, made on the first run (owner-only on Unix): the gatekeeper's keys and, with nex-db, the forms' CSRF key come from it, so a form opened before a restart still posts after it. Move the file away (while stopped) to change it; open forms are then refused once |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
