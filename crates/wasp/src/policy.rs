@@ -18,9 +18,9 @@
 //! | `auth.session.absolute` | `30d` | `1m` to `400d` |
 //! | `auth.session.max_concurrent` | 0 (no cap) | |
 //! | `auth.session.recheck` | `1m` | `1s` to `1h` |
-//! | `auth.lockout.attempts` | 10 | 1 to 1000 |
-//! | `auth.lockout.window` | `15m` | at least `1s` |
-//! | `auth.lockout.duration` | `15m` | at least `1s` |
+//! | `auth.lockout.attempts` | 10 | 1 to 20 |
+//! | `auth.lockout.window` | `15m` | at least `1m` |
+//! | `auth.lockout.duration` | `15m` | at least `1m` |
 //! | `auth.lockout.address_attempts` | 10 | 1 to 100000 |
 //! | `auth.lockout.address_window` | `10m` | at least `1s` |
 //!
@@ -44,6 +44,11 @@ pub const PASSWORD_CAP: usize = 1024;
 
 /// The shortest minimum password length a configuration may set.
 pub const MIN_LENGTH_FLOOR: usize = 8;
+
+/// The most wrong passwords or codes `auth.lockout.attempts` may allow per
+/// window (at least a minute): a six-digit code is never open to fast
+/// guessing.
+pub const MAX_ATTEMPTS: u32 = 20;
 
 /// The most recovery codes nex-db makes.
 pub const RECOVERY_CAP: usize = 10;
@@ -484,11 +489,19 @@ impl Policy {
                 .unwrap_or(u32::MAX),
             address_window: r.duration("auth.lockout.address_window", Duration::from_secs(600))?,
         };
-        if lockout.attempts == 0 || lockout.attempts > 1000 {
+        if lockout.attempts == 0 || lockout.attempts > MAX_ATTEMPTS {
             return Err(format!(
-                "auth.lockout.attempts is {}: it must be between 1 and 1000 (an account is never left without a lockout)",
+                "auth.lockout.attempts is {}: it must be between 1 and {MAX_ATTEMPTS} (an account is never left without a lockout, and a code is never open to fast guessing)",
                 lockout.attempts
             ));
+        }
+        for (key, d) in [
+            ("auth.lockout.window", lockout.window),
+            ("auth.lockout.duration", lockout.duration),
+        ] {
+            if d < Duration::from_secs(60) {
+                return Err(format!("{key} must be at least `1m`"));
+            }
         }
         if lockout.address_attempts == 0 || lockout.address_attempts > 100_000 {
             return Err("auth.lockout.address_attempts must be between 1 and 100000".to_owned());
@@ -662,7 +675,9 @@ mod tests {
                 "[auth.lockout]\nattempts = 0\n",
                 "never left without a lockout",
             ),
-            ("[auth.lockout]\nwindow = \"0\"\n", "at least `1s`"),
+            ("[auth.lockout]\nwindow = \"30s\"\n", "at least `1m`"),
+            ("[auth.lockout]\nduration = \"10s\"\n", "at least `1m`"),
+            ("[auth.lockout]\nattempts = 21\n", "between 1 and 20"),
             ("[auth.session]\nabsolute = \"401d\"\n", "400d"),
             ("[auth.session]\nidle = \"30s\"\n", "at least `1m`"),
             ("[auth.mfa]\nrecovery_codes = 11\n", "at most 10"),

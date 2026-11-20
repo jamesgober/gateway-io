@@ -163,15 +163,25 @@ impl NexAuth {
         self.set_field(user, "devices_after", &now_ms().to_string())
     }
 
+    /// Whether `user` may sign in now: active, or not yet verified (not
+    /// locked out, disabled, banned, or gone).
+    pub fn may_sign_in(&self, user: UserId) -> Result<bool, StoreError> {
+        Ok(matches!(
+            self.db
+                .db()
+                .auth()
+                .standing(account_of(user))
+                .map_err(nex)?,
+            Some(nex_db::Standing::Active | nex_db::Standing::PendingVerification)
+        ))
+    }
+
     /// The second step of a sign-in: a code from the authenticator app, or
     /// a recovery code. Wrong codes count toward the lockout.
     pub fn check_code(&self, user: UserId, code: &str) -> Result<CodeCheck, StoreError> {
         let account = account_of(user);
         let auth = self.db.db().auth();
-        if !matches!(
-            auth.standing(account).map_err(nex)?,
-            Some(nex_db::Standing::Active | nex_db::Standing::PendingVerification)
-        ) {
+        if !self.may_sign_in(user)? {
             return Ok(CodeCheck::Blocked);
         }
         let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
@@ -251,13 +261,17 @@ impl NexAuth {
         self.open_session(user).map(Ok)
     }
 
-    /// Ends every session `user` holds (this one too); how many ended.
+    /// Ends every session `user` holds (this one too) and forgets its
+    /// remembered devices; how many sessions ended.
     pub fn sign_out_everywhere(&self, user: UserId) -> Result<u32, StoreError> {
-        self.db
+        let ended = self
+            .db
             .db()
             .auth()
             .revoke_all(account_of(user))
-            .map_err(nex)
+            .map_err(nex)?;
+        self.forget_devices(user)?;
+        Ok(ended)
     }
 
     /// Starts two-step sign-in for `user`: the secret to type into an
@@ -370,18 +384,22 @@ impl NexAuth {
         self.forget_devices(user)
     }
 
-    /// Lets `user` sign in again (after a disable or a lockout).
-    pub fn enable(&self, user: UserId, by: UserId) -> Result<(), StoreError> {
+    /// Lets `user` sign in again after a disable or a lockout: `false`, and
+    /// nothing changed, for any other standing (a ban, an unverified account
+    /// stay as they are).
+    pub fn enable(&self, user: UserId, by: UserId) -> Result<bool, StoreError> {
+        let auth = self.db.db().auth();
+        let account = account_of(user);
+        if !matches!(
+            auth.standing(account).map_err(nex)?,
+            Some(nex_db::Standing::Suspended { .. } | nex_db::Standing::LockedOut { .. })
+        ) {
+            return Ok(false);
+        }
         self.failures.clear(user);
-        self.db
-            .db()
-            .auth()
-            .set_standing(
-                account_of(user),
-                nex_db::Standing::Active,
-                Some(account_of(by)),
-            )
-            .map_err(nex)
+        auth.set_standing(account, nex_db::Standing::Active, Some(account_of(by)))
+            .map_err(nex)?;
+        Ok(true)
     }
 
     /// Removes `user`: the account, its sessions and secrets, and its
