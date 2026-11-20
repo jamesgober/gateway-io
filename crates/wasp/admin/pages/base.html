@@ -11,7 +11,7 @@
 <body>
 <header>
 <a class="brand" href="{{ page.site.admin }}">{{ page.site.name }}</a>
-<nav><a href="{{ page.site.admin }}">Content</a> <a href="{{ page.site.account }}">Account</a> <a href="{{ page.site.home }}">View site</a></nav>
+<nav>{% if page.editor or page.security.editor %}<a href="{{ page.site.admin }}">Content</a> {% endif %}{% if page.editor.admin or page.security.admin %}<a href="{{ page.site.admin }}/accounts">Accounts</a> {% endif %}<a href="{{ page.site.account }}">Account</a> <a href="{{ page.site.home }}">View site</a></nav>
 </header>
 <main>
 {% block content %}{% endblock %}

@@ -42,13 +42,26 @@ use crate::content::Entry;
 pub const REQUIRED: &[&str] = &["home", "post", "page", "sign-in", "account"];
 
 /// The templates every admin theme must have (routes name them `admin/<name>`).
-pub const ADMIN_REQUIRED: &[&str] = &["list", "edit"];
+pub const ADMIN_REQUIRED: &[&str] = &[
+    "list",
+    "edit",
+    "security",
+    "two-factor",
+    "codes",
+    "code",
+    "accounts",
+];
 
 /// The built-in admin theme's templates.
 const ADMIN_PAGES: &[(&str, &str)] = &[
     ("base", include_str!("../admin/pages/base.html")),
     ("list", include_str!("../admin/pages/list.html")),
     ("edit", include_str!("../admin/pages/edit.html")),
+    ("security", include_str!("../admin/pages/security.html")),
+    ("two-factor", include_str!("../admin/pages/two-factor.html")),
+    ("codes", include_str!("../admin/pages/codes.html")),
+    ("code", include_str!("../admin/pages/code.html")),
+    ("accounts", include_str!("../admin/pages/accounts.html")),
 ];
 
 /// The built-in admin theme's stylesheet, served at `/admin/static/admin.css`.
@@ -144,6 +157,8 @@ pub struct Editor {
     pub date: String,
     /// The body as the author writes it.
     pub body: String,
+    /// Whether the visitor manages the accounts (a link to them).
+    pub admin: bool,
 }
 
 luminess::view!(Editor as "editor" {
@@ -162,6 +177,123 @@ luminess::view!(Editor as "editor" {
     summary: text,
     date: text,
     body: text,
+    admin: bool,
+});
+
+/// One account in the administrator's list (`page.security.accounts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountView {
+    /// The account's id (32 hex digits), for the forms.
+    pub id: String,
+    /// Its email.
+    pub identifier: String,
+    /// Its roles, comma separated.
+    pub roles: String,
+    /// `active`, `disabled`, `locked`, `banned`, or `pending`.
+    pub standing: String,
+    /// Whether two-step sign-in is on.
+    pub totp: bool,
+    /// Whether it may be disabled or removed from here (not the viewer's own
+    /// account, not the boot account).
+    pub managed: bool,
+}
+
+luminess::view!(AccountView as "account" {
+    id: text,
+    identifier: text,
+    roles: text,
+    standing: text,
+    totp: bool,
+    managed: bool,
+});
+
+/// The account and sign-in security pages (`page.security`): the password
+/// form, two-step sign-in, recovery codes, the second sign-in step, and the
+/// administrator's accounts. Every page that has it renders from the admin
+/// theme.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Security {
+    /// The signed-in account's email, or empty.
+    pub identifier: String,
+    /// The CSRF token, for the hidden `csrf_token` fields.
+    pub csrf: String,
+    /// Why the last form was refused, or empty.
+    pub error: String,
+    /// What the last form did, or empty.
+    pub notice: String,
+    /// Where this page's main form posts.
+    pub action: String,
+    /// The password form's address.
+    pub password: String,
+    /// The sign-out-everywhere button's address.
+    pub everywhere: String,
+    /// The forget-remembered-devices button's address.
+    pub devices: String,
+    /// The two-step set-up page's address.
+    pub two_factor: String,
+    /// The turn-two-step-off form's address.
+    pub two_factor_off: String,
+    /// The new-recovery-codes form's address.
+    pub new_codes: String,
+    /// Where to go after the codes page.
+    pub next: String,
+    /// Two-step sign-in is on for the account.
+    pub totp: bool,
+    /// Two-step sign-in may be turned on here.
+    pub offered: bool,
+    /// The account's roles require two-step sign-in.
+    pub required: bool,
+    /// The secret to type into an authenticator app (set-up only).
+    pub secret: String,
+    /// The `otpauth://` link (set-up only).
+    pub uri: String,
+    /// Recovery codes, shown once.
+    pub codes: Vec<String>,
+    /// "Remember this device" is offered, for this many days.
+    pub remember_days: i64,
+    /// The shortest password the account may set.
+    pub min_length: i64,
+    /// The account may edit the content.
+    pub editor: bool,
+    /// The account manages the accounts.
+    pub admin: bool,
+    /// The accounts (administrator only).
+    pub accounts: Arc<Vec<Arc<AccountView>>>,
+    /// The disable button's address (administrator only).
+    pub disable: String,
+    /// The enable button's address (administrator only).
+    pub enable: String,
+    /// The remove button's address (administrator only).
+    pub remove: String,
+}
+
+luminess::view!(Security as "security" {
+    identifier: text,
+    csrf: text,
+    error: text,
+    notice: text,
+    action: text,
+    password: text,
+    everywhere: text,
+    devices: text,
+    two_factor: text,
+    two_factor_off: text,
+    new_codes: text,
+    next: text,
+    totp: bool,
+    offered: bool,
+    required: bool,
+    secret: text,
+    uri: text,
+    codes: list(text),
+    remember_days: int,
+    min_length: int,
+    editor: bool,
+    admin: bool,
+    accounts: list(object(AccountView)),
+    disable: text,
+    enable: text,
+    remove: text,
 });
 
 /// What a page template reads, as `page`. Content is shared, not copied:
@@ -182,6 +314,8 @@ pub struct Page {
     pub form: Option<Arc<Form>>,
     /// The content editor, on the editor's pages.
     pub editor: Option<Arc<Editor>>,
+    /// The account and sign-in security pages.
+    pub security: Option<Arc<Security>>,
 }
 
 luminess::view!(Page as "page" {
@@ -192,6 +326,7 @@ luminess::view!(Page as "page" {
     message: text,
     form: object(Form),
     editor: object(Editor),
+    security: object(Security),
 });
 
 /// The theme: what the watcher reloads.

@@ -31,7 +31,7 @@ use wasp_core::suite::config::Config;
 use web_net::{Assets, CachePolicy, Context, Route, get};
 
 use crate::content::{Content, Entry, Kind};
-use crate::theme::{ADMIN_CSS, AdminSource, Editor, Form, Page, SiteEngine, SiteInfo};
+use crate::theme::{ADMIN_CSS, AdminSource, Editor, Form, Page, Security, SiteEngine, SiteInfo};
 
 #[cfg(feature = "gatekeeper")]
 pub use gatekeeper_site::{SiteApp, SiteCx, SiteRoute, build};
@@ -185,7 +185,23 @@ impl Pages {
             message: message.to_owned(),
             form: form.map(Arc::new),
             editor: None,
+            security: None,
         }
+    }
+
+    /// A security page view (the admin theme renders it).
+    #[cfg_attr(not(feature = "store-nex"), allow(dead_code))]
+    pub(crate) fn security_page(&self, title: &str, security: Security) -> Page {
+        Page {
+            security: Some(Arc::new(security)),
+            ..self.page(title, None, "", None)
+        }
+    }
+
+    /// The site's name.
+    #[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+    pub(crate) fn site_name(&self) -> &str {
+        &self.site.name
     }
 
     /// An editor's page view.

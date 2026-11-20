@@ -35,6 +35,9 @@ gatekeeper = ["gateway-io/gatekeeper", "dep:gatekeeper-io", "dep:key-vault", "de
 # nex-db as a store: `content.store = "nex"` and `auth.store = "nex"`.
 # Optional: no part of the process outside its adapter depends on it.
 store-nex = ["dep:nex-db", "dep:crypt-io"]
+# Two-step sign-in (TOTP) for nex-db accounts. It brings crypt-io's C backend
+# (AWS-LC), so the static musl build leaves it out.
+mfa = ["store-nex", "nex-db/mfa"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }

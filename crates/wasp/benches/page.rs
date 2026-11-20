@@ -58,6 +58,7 @@ fn main() {
             message: String::new(),
             form: None,
             editor: None,
+            security: None,
         });
     });
     let page = Page {
@@ -68,6 +69,7 @@ fn main() {
         message: String::new(),
         form: None,
         editor: None,
+        security: None,
     };
     let post_cost = measure(|| {
         buf.clear();

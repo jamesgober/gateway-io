@@ -1037,9 +1037,9 @@ dependencies = [
 
 [[package]]
 name = "system-suite"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdea8b717d8e86b8eb825a61ea6fb52eed6503d9820e298a394fb032069780dd"
+checksum = "1c2139e1f56b8ee6224b8216cee627d5ef2e588f5a6f45892c1e3f9fe99ed88b"
 dependencies = [
  "arc-swap",
  "config-lib",

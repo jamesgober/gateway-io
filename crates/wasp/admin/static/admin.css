@@ -19,3 +19,13 @@ input, textarea, select { font: inherit; padding: 0.4rem 0.5rem; border: 1px sol
 button { font: inherit; padding: 0.4rem 1rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: #fff; cursor: pointer; justify-self: start; }
 button.danger { background: var(--danger); border-color: var(--danger); margin-top: 1rem; }
 p.error { color: var(--danger); }
+p.notice { color: var(--accent); }
+.muted { color: var(--muted); }
+section { margin-top: 1.5rem; }
+section form { margin-top: 0.75rem; }
+form.inline { display: inline-flex; gap: 0.5rem; align-items: center; margin-right: 0.5rem; }
+form.inline button.danger { margin-top: 0; }
+label.check { display: flex; gap: 0.5rem; align-items: center; }
+code.secret { font-size: 1.1rem; letter-spacing: 0.05em; word-break: break-all; }
+ul.codes { columns: 2; font-size: 1.1rem; }
+code.uri { word-break: break-all; font-size: 0.85rem; }

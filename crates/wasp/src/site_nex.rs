@@ -24,12 +24,13 @@ use std::sync::Arc;
 
 use gateway_io::{Caller, WebGate};
 use wasp_core::{Access, Decision, Identity, PermSet, Rule};
-use web_net::form_net::{self, Secret};
+use web_net::form_net;
 use web_net::{App, Context, Denial, Gate, Request, Route, get, post};
 
 use crate::content::{Content, Draft, Entry, Kind, SaveError, StoreError};
 use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
+use crate::site_account::{Accounts, CookieKeys};
 use crate::theme::{Editor, Form, SiteEngine};
 
 /// The permission the account page needs (the `member` role's bit).
@@ -37,6 +38,9 @@ pub const MEMBER: PermSet = PermSet(1);
 
 /// The permission the content editor needs (the `editor` role's bit).
 pub const EDITOR: PermSet = PermSet(2);
+
+/// The permission the accounts page needs (the `admin` role's bit).
+pub const ADMIN: PermSet = PermSet(4);
 
 /// The editor's rule.
 const EDITING: Rule = Rule::needs(4, EDITOR);
@@ -110,15 +114,6 @@ pub type NexApp = App<NexGate, SiteEngine>;
 pub type NexRoute = Route<NexWho, Rule, SiteEngine>;
 
 form_net::form! {
-    /// The sign-in form (web-net checked its `csrf_token` before the handler).
-    struct SignIn {
-        email: String,
-        password: Secret,
-    }
-    ignore = ["csrf_token"];
-}
-
-form_net::form! {
     /// The entry form (web-net checked its `csrf_token` before the handler).
     struct EntryForm {
         kind: String,
@@ -154,6 +149,7 @@ fn editor(cx: &mut NexCx<'_>, pages: &Pages) -> Result<Editor, web_net::Error> {
         new_post: cx.url("/admin/new/post")?,
         new_page: cx.url("/admin/new/page")?,
         csrf: cx.csrf_token()?,
+        admin: cx.identity().identity.perms().contains(ADMIN),
         ..Editor::default()
     })
 }
@@ -290,13 +286,6 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
     [list, new_entry, edit, save, delete]
 }
 
-/// Sign-in attempts one client address may make per [`ATTEMPT_WINDOW`]:
-/// past it the address waits, before any password is hashed.
-pub const ATTEMPTS: u32 = 10;
-
-/// The window [`ATTEMPTS`] are counted in.
-pub const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-
 /// Client addresses tracked at once; past it the stalest entries go.
 const TRACKED: usize = 10_000;
 
@@ -304,21 +293,30 @@ const TRACKED: usize = 10_000;
 /// of sign-ins holds at most this many workers, and the rest answer 503.
 pub const HASHING: usize = 2;
 
-/// Sign-in attempts per client address.
+/// Sign-in attempts per client address (`auth.lockout.address_attempts`
+/// per `address_window`): past it the address waits, before any password is
+/// hashed.
 #[derive(Debug, Default)]
-struct Attempts(
+pub(crate) struct Attempts(
     std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
 );
 
 impl Attempts {
-    /// Counts one attempt from `client`: `false` when it is over the limit.
-    fn admit(&self, client: std::net::IpAddr, now: std::time::Instant) -> bool {
+    /// Counts one attempt from `client`: `false` when it is over `limit`
+    /// within `window`.
+    pub(crate) fn admit(
+        &self,
+        client: std::net::IpAddr,
+        now: std::time::Instant,
+        limit: u32,
+        window: std::time::Duration,
+    ) -> bool {
         let mut map = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.len() >= TRACKED && !map.contains_key(&client) {
-            map.retain(|_, (since, _)| now.duration_since(*since) < ATTEMPT_WINDOW);
+            map.retain(|_, (since, _)| now.duration_since(*since) < window);
             if map.len() >= TRACKED {
                 let stalest = map
                     .iter()
@@ -330,18 +328,18 @@ impl Attempts {
             }
         }
         let entry = map.entry(client).or_insert((now, 0));
-        if now.duration_since(entry.0) >= ATTEMPT_WINDOW {
+        if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
         }
         entry.1 = entry.1.saturating_add(1);
-        entry.1 <= ATTEMPTS
+        entry.1 <= limit
     }
 }
 
 /// A slot for hashing one password, given back when dropped.
-struct HashSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+pub(crate) struct HashSlot<'a>(&'a std::sync::atomic::AtomicUsize);
 
-fn hash_slot(busy: &std::sync::atomic::AtomicUsize) -> Option<HashSlot<'_>> {
+pub(crate) fn hash_slot(busy: &std::sync::atomic::AtomicUsize) -> Option<HashSlot<'_>> {
     use std::sync::atomic::Ordering;
     let mut n = busy.load(Ordering::Acquire);
     while n < HASHING {
@@ -364,6 +362,19 @@ fn random_hex() -> Result<String, web_net::Error> {
     Ok(bytes[..16].iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The keys the nex-db site derives from the master secret, and its boot
+/// account.
+#[derive(Debug)]
+pub struct SiteKeys {
+    /// The forms' CSRF key.
+    pub csrf: crypt_io::Zeroizing<[u8; 32]>,
+    /// The sealed sign-in cookies' keys.
+    pub cookies: CookieKeys,
+    /// The boot account (`auth.admin`), never disabled or removed from the
+    /// accounts page.
+    pub boot: Option<String>,
+}
+
 /// Builds the site behind nex-db's accounts.
 pub fn build(
     auth: NexAuth,
@@ -371,9 +382,11 @@ pub fn build(
     content: Content,
     engine: SiteEngine,
     settings: &SiteSettings,
-    csrf_key: crypt_io::Zeroizing<[u8; 32]>,
+    keys: SiteKeys,
     ready: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<NexApp, String> {
+    let csrf_key = keys.csrf;
+    let boot = keys.boot;
     let pages = Pages::new(settings, content);
     // The key outlives a restart (`crate::secret`): a form opened before it
     // still posts after it.
@@ -470,58 +483,15 @@ pub fn build(
     .template("sign-in")
     .name("sign-in");
 
-    let show = sign_in_form;
-    let a = auth.clone();
-    let attempts = Arc::new(Attempts::default());
-    let hashing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let sign_in_post: NexRoute = post("/sign-in", move |cx: &mut NexCx<'_>| {
-        let next = cx.next_path()?.unwrap_or_else(|| "/account".to_owned());
-        if !cx.identity().identity.is_guest() {
-            return cx.redirect(303, &next);
-        }
-        let form: SignIn = cx.form()?;
-        if let Some(client) = cx.request().client().addr()
-            && !attempts.admit(client, std::time::Instant::now())
-        {
-            cx.status(429);
-            cx.set_header("retry-after", "600");
-            return show(
-                cx,
-                "Too many sign-in attempts from your address. Please wait a few minutes, then try again.",
-                &form.email,
-            );
-        }
-        // Argon2id runs here, on this worker, at most HASHING at once.
-        let Some(_slot) = hash_slot(&hashing) else {
-            cx.set_header("retry-after", "2");
-            return Err(web_net::Error::unavailable("auth.busy"));
-        };
-        match a
-            .sign_in(&form.email, form.password.expose())
-            .map_err(|_| web_net::Error::unavailable("auth.unavailable"))?
-        {
-            Some(set) => {
-                cx.set_header("set-cookie", set);
-                cx.set_header(
-                    "set-cookie",
-                    format!("{PRE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"),
-                );
-                cx.redirect(303, &next)
-            }
-            None => {
-                cx.status(401);
-                show(
-                    cx,
-                    "Those sign-in details are not right. Please try again.",
-                    &form.email,
-                )
-            }
-        }
-    })
-    .public()
-    .template("sign-in")
-    .name("sign-in-post");
-
+    let accounts = Accounts {
+        auth: auth.clone(),
+        pages: pages.clone(),
+        keys: keys.cookies,
+        attempts: Arc::new(Attempts::default()),
+        hashing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        boot,
+        show: Arc::new(sign_in_form),
+    };
     let a = auth;
     let sign_out: NexRoute = post("/sign-out", move |cx: &mut NexCx<'_>| {
         if let Some(token) = cx
@@ -541,7 +511,7 @@ pub fn build(
 
     let [home, post_page, about, page] = content_routes::<NexWho, Rule>(&pages);
     let [list, new_entry, edit, save, delete] = editor_routes(&pages);
-    builder
+    let mut builder = builder
         .route(home)
         .route(post_page)
         .route(about)
@@ -553,10 +523,11 @@ pub fn build(
         .route(delete)
         .route(account)
         .route(sign_in)
-        .route(sign_in_post)
-        .route(sign_out)
-        .build()
-        .map_err(|e| format!("site: {e}"))
+        .route(sign_out);
+    for route in crate::site_account::routes(&accounts) {
+        builder = builder.route(route);
+    }
+    builder.build().map_err(|e| format!("site: {e}"))
 }
 
 #[cfg(test)]
@@ -571,13 +542,17 @@ mod tests {
         let ip: IpAddr = "198.51.100.7".parse().expect("ip");
         let other: IpAddr = "198.51.100.8".parse().expect("ip");
         let t = Instant::now();
-        for _ in 0..ATTEMPTS {
-            assert!(a.admit(ip, t));
+        let window = Duration::from_secs(600);
+        for _ in 0..10 {
+            assert!(a.admit(ip, t, 10, window));
         }
-        assert!(!a.admit(ip, t), "over the limit");
-        assert!(a.admit(other, t), "another address is not affected");
+        assert!(!a.admit(ip, t, 10, window), "over the limit");
         assert!(
-            a.admit(ip, t + ATTEMPT_WINDOW + Duration::from_secs(1)),
+            a.admit(other, t, 10, window),
+            "another address is not affected"
+        );
+        assert!(
+            a.admit(ip, t + window + Duration::from_secs(1), 10, window),
             "a new window"
         );
     }
