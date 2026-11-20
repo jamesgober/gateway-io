@@ -73,7 +73,7 @@ fn imported_files_are_served_after_a_boot() {
     write(
         &from.0,
         "posts/from-a-file.md",
-        "title: From a file\ndate: 2026-11-18\nsummary: Imported.\n\nFirst <b>paragraph</b>.\n\nSecond.\n",
+        "title: From a file\ndate: 2026-11-18\nsummary: Imported.\ndescription: Found by search.\nrobots: noindex\n\nFirst <b>paragraph</b>.\n\nSecond.\n",
     );
     write(
         &from.0,
@@ -87,11 +87,16 @@ fn imported_files_are_served_after_a_boot() {
     );
     write(&from.0, "posts/no-date.md", "title: No date\n\nx\n");
     write(&from.0, "posts/typo.md", "tilte: Typo\n\nx\n");
+    write(
+        &from.0,
+        "posts/bad-robots.md",
+        "title: Bad robots\ndate: 2026-11-18\nrobots: noarchive\n\nx\n",
+    );
     let conf = config("bison", &data.0);
 
     let report = wasp::import(&conf, &data.0, &from.0).expect("import");
     assert_eq!(report.saved, ["from-a-file", "colophon"], "{report:?}");
-    assert_eq!(report.refused.len(), 3, "{report:?}");
+    assert_eq!(report.refused.len(), 4, "{report:?}");
 
     // Imported again: replaced, not added twice.
     let again = wasp::import(&conf, &data.0, &from.0).expect("again");
@@ -114,6 +119,14 @@ fn imported_files_are_served_after_a_boot() {
     assert!(
         body.contains("<p>First &lt;b&gt;paragraph&lt;/b&gt;.</p><p>Second.</p>"),
         "escaped, split into paragraphs: {body}"
+    );
+    assert!(
+        body.contains("<meta name=\"description\" content=\"Found by search.\">"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<meta name=\"robots\" content=\"noindex\">"),
+        "{body}"
     );
     let (home, listing) = get(addr, "/");
     assert_eq!(home, 200);

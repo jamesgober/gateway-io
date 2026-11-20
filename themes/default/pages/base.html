@@ -3,7 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}{{ page.title }} | {{ page.site.name }}{% endblock %}</title>
+<title>{% block title %}{{ page.head.title }} | {{ page.site.name }}{% endblock %}</title>
+{% if page.head.description %}<meta name="description" content="{{ page.head.description }}">
+{% endif %}{% if page.head.canonical %}<link rel="canonical" href="{{ page.head.canonical }}">
+{% endif %}{% if page.head.robots %}<meta name="robots" content="{{ page.head.robots }}">
+{% endif %}<meta property="og:type" content="{{ page.head.og_type }}">
+<meta property="og:site_name" content="{{ page.site.name }}">
+<meta property="og:title" content="{{ page.head.og_title }}">
+{% if page.head.og_description %}<meta property="og:description" content="{{ page.head.og_description }}">
+{% endif %}{% if page.head.canonical %}<meta property="og:url" content="{{ page.head.canonical }}">
+{% endif %}{% if page.head.og_image %}<meta property="og:image" content="{{ page.head.og_image }}">
+{% endif %}<meta name="twitter:card" content="{{ page.head.twitter_card }}">
 <link rel="stylesheet" href="{{ page.site.css }}">
 <link rel="icon" type="image/svg+xml" href="{{ page.site.icon }}">
 </head>

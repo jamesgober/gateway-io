@@ -157,6 +157,8 @@ pub struct Editor {
     pub date: String,
     /// The body as the author writes it.
     pub body: String,
+    /// The search and sharing fields, as typed.
+    pub meta: crate::content::Meta,
     /// Whether the visitor manages the accounts (a link to them).
     pub admin: bool,
 }
@@ -177,7 +179,19 @@ luminess::view!(Editor as "editor" {
     summary: text,
     date: text,
     body: text,
+    meta: object(crate::content::Meta),
     admin: bool,
+});
+
+luminess::view!(crate::content::Meta as "meta" {
+    seo_title: text,
+    description: text,
+    og_title: text,
+    og_description: text,
+    canonical: text,
+    robots: text,
+    og_image: text,
+    twitter_card: text,
 });
 
 /// One account in the administrator's list (`page.security.accounts`).
@@ -299,6 +313,45 @@ luminess::view!(Security as "security" {
     remove: text,
 });
 
+/// What a page's `<head>` says to search engines and when it is shared
+/// (`page.head`): an entry's search and sharing fields, with the fallbacks
+/// already applied, so a theme writes each one as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Head {
+    /// The title for search results and the browser tab: the search title,
+    /// else the title.
+    pub title: String,
+    /// The meta description: the entry's, else its summary; empty: none.
+    pub description: String,
+    /// The canonical address, absolute when the site has hosts; empty: none.
+    pub canonical: String,
+    /// The robots directive; empty: none (`index, follow`).
+    pub robots: String,
+    /// `article` for a post, else `website`.
+    pub og_type: String,
+    /// The sharing title: the entry's, else `title`.
+    pub og_title: String,
+    /// The sharing description: the entry's, else `description`.
+    pub og_description: String,
+    /// The sharing image, absolute when the site has hosts; empty: none.
+    pub og_image: String,
+    /// The card: the entry's, else `summary_large_image` with an image and
+    /// `summary` without.
+    pub twitter_card: String,
+}
+
+luminess::view!(Head as "head" {
+    title: text,
+    description: text,
+    canonical: text,
+    robots: text,
+    og_type: text,
+    og_title: text,
+    og_description: text,
+    og_image: text,
+    twitter_card: text,
+});
+
 /// What a page template reads, as `page`. Content is shared, not copied:
 /// `entry` and `posts` point into the manifest.
 #[derive(Clone, Debug)]
@@ -307,6 +360,8 @@ pub struct Page {
     pub site: Arc<SiteInfo>,
     /// The page title.
     pub title: String,
+    /// The page's `<head>` fields.
+    pub head: Arc<Head>,
     /// The entry the route shows, if any.
     pub entry: Option<Arc<Entry>>,
     /// The post listing, newest first.
@@ -324,6 +379,7 @@ pub struct Page {
 luminess::view!(Page as "page" {
     site: object(SiteInfo),
     title: text,
+    head: object(Head),
     entry: object(Entry),
     posts: list(object(Entry)),
     message: text,

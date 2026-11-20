@@ -91,6 +91,20 @@ A stop signal that was already ignored when wasp started stays ignored: SIGHUP u
 
 On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member`, `editor` and `admin` roles at every start. The editor's pages are never cached, and every form carries a CSRF token.
 
+Each entry also has optional search and sharing fields, under "Search and sharing" in the editor:
+
+| Field | Left empty |
+|---|---|
+| Search title (`seo_title`) | the title |
+| Meta description (`description`) | the summary |
+| Canonical address (`canonical`): a site path or an `https://` address | the entry's own address |
+| Robots (`robots`): `noindex`, `nofollow`, both, or their `index`/`follow` opposites | none (search engines index and follow) |
+| Sharing title (`og_title`) and description (`og_description`) | the search title and the meta description |
+| Sharing image (`og_image`): a site path or an `https://` address | none |
+| Card (`twitter_card`): `summary` or `summary_large_image` | the large card with an image, else `summary` |
+
+A site path is under the site's base, and becomes absolute (`https://` and the first of `site.hosts`) in the page. The search title, the two descriptions and the sharing title are the text a reader sees, so they will be translated with the title and summary when translations arrive; the others stay the same in every language.
+
 ## Accounts
 
 With nex-db, every signed-in account has `/account/security`:
@@ -159,6 +173,8 @@ With a durable store (`content.store = "bison"`), posts and pages come in from f
 <folder>/pages/<slug>.md     title, summary; a blank line; the body
 ```
 
+The search and sharing fields are header lines too, by the names above (`description: One line for search results.`).
+
 ```bash
 cargo run -p wasp -- import ./content
 ```
@@ -171,7 +187,9 @@ themes/default/errors/   error, error/404         (view: error)
 themes/default/static/   site.css, favicon.svg    (served under /theme/)
 ```
 
-The admin pages (`/admin` and below) have their own theme, built into the binary, so they work whatever the site theme is, and a site theme can neither restyle them nor put anything into them. They are sent with a stricter content security policy than the site's (nothing inline, nothing from another origin, never framed). An install that wants its own admin theme sets `[admin] custom_theme = true` and names a folder in `[admin] theme`, shaped like the built-in one (`crates/wasp/admin/`: `pages/` with `base`, `list`, `edit`, and `static/`, served under `/admin/static/`). The sign-in and account pages stay with the site theme: every visitor sees them.
+Every page view has `page.head`, with the search and sharing fields already filled in from their fallbacks: `title`, `description`, `canonical`, `robots`, `og_type` (`article` for a post), `og_title`, `og_description`, `og_image` and `twitter_card`. A theme writes each one into its `<head>` as it is, and leaves out the empty ones. The default theme's `base.html` shows how.
+
+The admin pages (`/admin` and below) have their own theme, built into the binary, so they work whatever the site theme is, and a site theme can neither restyle them nor put anything into them. They are sent with a stricter content security policy than the site's (nothing inline, nothing from another origin, never framed). An install that wants its own admin theme sets `[admin] custom_theme = true` and names a folder in `[admin] theme`, shaped like the built-in one (`crates/wasp/admin/`: `pages/` with `base`, `list`, `edit`, and `static/`, served under `/admin/static/`). The sign-in form and the account page stay with the site theme: every visitor sees them. The security pages (password, two-step sign-in, the second sign-in step) use the admin theme.
 
 ## Configuration
 

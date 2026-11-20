@@ -131,6 +131,7 @@ fn content_in_nex_db_is_served_and_kept() {
                 summary: String::new(),
                 body: "Through a restart.".into(),
                 date: "2026-11-18".into(),
+                meta: wasp::content::Meta::default(),
             })
             .expect("put");
         // A put on a known slug updates the entity at that route.
@@ -142,6 +143,7 @@ fn content_in_nex_db_is_served_and_kept() {
                 summary: String::new(),
                 body: "Through a restart.".into(),
                 date: "2026-11-18".into(),
+                meta: wasp::content::Meta::default(),
             })
             .expect("update");
         assert_eq!(store.load().expect("load").len(), 5, "updated, not added");
@@ -368,6 +370,7 @@ fn a_kind_change_survives_a_restart() {
         } else {
             String::new()
         },
+        meta: wasp::content::Meta::default(),
     };
     {
         let store = NexStore::new(NexDb::open(&dir).expect("open"));
