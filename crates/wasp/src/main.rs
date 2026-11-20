@@ -111,6 +111,11 @@ fn main() -> ExitCode {
     if let Err(error) = boot.start(wiring.theme) {
         return failed(boot.foundation(), &error);
     }
+    for theme in wiring.more_themes {
+        if let Err(error) = boot.start(theme) {
+            return failed(boot.foundation(), &error);
+        }
+    }
     if let Some(policy) = wiring.auth_policy
         && let Err(error) = boot.start(policy)
     {

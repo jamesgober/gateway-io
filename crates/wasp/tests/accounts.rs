@@ -130,7 +130,7 @@ impl Got {
 
 fn send(addr: SocketAddr, request: &str) -> Got {
     let mut s = TcpStream::connect(addr).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(10)))
+    s.set_read_timeout(Some(Duration::from_secs(30)))
         .expect("timeout");
     s.write_all(request.as_bytes()).expect("write");
     let mut buf = Vec::new();

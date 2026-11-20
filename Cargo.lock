@@ -1195,6 +1195,7 @@ dependencies = [
  "key-vault",
  "luminess",
  "nex-db",
+ "serve-net",
  "wasp-core",
  "web-net",
 ]

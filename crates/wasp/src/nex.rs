@@ -294,13 +294,24 @@ impl Provider for NexDb {
 #[derive(Clone, Debug)]
 pub struct NexStore {
     db: NexDb,
+    site: Arc<str>,
 }
 
 impl NexStore {
-    /// The content store over `db`.
+    /// The content store over `db`, on nex-db's default content site.
     #[must_use]
     pub fn new(db: NexDb) -> NexStore {
-        NexStore { db }
+        NexStore {
+            db,
+            site: Arc::from(SITE),
+        }
+    }
+
+    /// The same store on the content site `site` (a host profile's own).
+    #[must_use]
+    pub fn on_site(mut self, site: &str) -> NexStore {
+        self.site = Arc::from(site);
+        self
     }
 }
 
@@ -334,7 +345,7 @@ impl ContentStore for NexStore {
             std::collections::HashMap::new();
         for kind in ["post", "page"] {
             let mut page = content
-                .list(&Listing::latest(kind).limit(1000))
+                .list(&Listing::latest(kind).site(self.site.as_ref()).limit(1000))
                 .map_err(nex)?;
             loop {
                 for e in page.items() {
@@ -416,7 +427,7 @@ impl ContentStore for NexStore {
         for (name, value) in &custom {
             fields.push((name.as_str(), value));
         }
-        match content.resolve(SITE, &path).map_err(nex)? {
+        match content.resolve(&self.site, &path).map_err(nex)? {
             Some(route) => {
                 let patch = fields.iter().fold(Patch::new(), |p, (k, v)| p.set(*k, *v));
                 content.save_draft(route.entity(), patch).map_err(nex)?;
@@ -428,6 +439,7 @@ impl ContentStore for NexStore {
                     .fold(Entity::new(entry.kind.as_str()), |e, (k, v)| {
                         e.field(*k, *v)
                     })
+                    .site(self.site.as_ref())
                     .path(path);
                 content.put(entity).map_err(nex)?;
             }
@@ -436,7 +448,7 @@ impl ContentStore for NexStore {
         // route goes, or the next boot could read the old one back.
         let other = if entry.kind == "post" { "page" } else { "post" };
         if let Some(route) = content
-            .resolve(SITE, &path_of(other, &entry.slug))
+            .resolve(&self.site, &path_of(other, &entry.slug))
             .map_err(nex)?
         {
             content.delete(route.entity()).map_err(nex)?;
@@ -448,7 +460,10 @@ impl ContentStore for NexStore {
         let content = self.db.db().content();
         let mut any = false;
         for kind in ["post", "page"] {
-            if let Some(route) = content.resolve(SITE, &path_of(kind, slug)).map_err(nex)? {
+            if let Some(route) = content
+                .resolve(&self.site, &path_of(kind, slug))
+                .map_err(nex)?
+            {
                 content.delete(route.entity()).map_err(nex)?;
                 any = true;
             }

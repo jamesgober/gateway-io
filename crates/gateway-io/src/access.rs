@@ -67,6 +67,8 @@ pub struct AccessEntry {
     pub user_agent: Option<Box<str>>,
     /// The `Referer` header, when a log rule asked for it.
     pub referrer: Option<Box<str>>,
+    /// The host (lower case, no port), when a log rule is for some hosts.
+    pub host: Option<Box<str>>,
     /// The application's error code the service noted, or empty.
     pub code: &'static str,
     /// The message the service noted, or empty.
@@ -85,6 +87,7 @@ pub(crate) struct Line {
     query: Option<Box<str>>,
     user_agent: Option<Box<str>>,
     referrer: Option<Box<str>>,
+    host: Option<Box<str>>,
     note: Option<crate::note::Note>,
 }
 
@@ -96,6 +99,7 @@ impl Line {
             query: None,
             user_agent: None,
             referrer: None,
+            host: None,
             note: None,
         }
     }
@@ -116,6 +120,10 @@ impl Line {
                 .flatten(),
             user_agent: wants.user_agent.then(|| header("user-agent")).flatten(),
             referrer: wants.referrer.then(|| header("referer")).flatten(),
+            host: wants
+                .host
+                .then(|| head.header_str("host").map(|h| host_of(h).into()))
+                .flatten(),
             ..Line::new(head.method_str(), head.path())
         }
     }
@@ -221,6 +229,7 @@ impl AccessLog {
             query: b & 1 != 0,
             user_agent: b & 2 != 0,
             referrer: b & 4 != 0,
+            host: b & 8 != 0,
         })
     }
 
@@ -305,6 +314,7 @@ impl AccessLog {
             query: line.query,
             user_agent: line.user_agent,
             referrer: line.referrer,
+            host: line.host,
             code: note.code,
             message: note.message,
             request: note.reference,
@@ -348,7 +358,27 @@ fn access_line(foundation: &Foundation, e: &AccessEntry) {
 }
 
 fn bits(w: Wants) -> u8 {
-    u8::from(w.query) | u8::from(w.user_agent) << 1 | u8::from(w.referrer) << 2
+    u8::from(w.query)
+        | u8::from(w.user_agent) << 1
+        | u8::from(w.referrer) << 2
+        | u8::from(w.host) << 3
+}
+
+/// A `Host` header as rules compare it: lower case, without a port or a
+/// trailing dot, at most 253 bytes.
+fn host_of(h: &str) -> String {
+    let h = h.trim();
+    let h = match h.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => h.rsplit_once(':').map_or(h, |(name, port)| {
+            if port.bytes().all(|b| b.is_ascii_digit()) {
+                name
+            } else {
+                h
+            }
+        }),
+    };
+    crate::note::cut(h.trim_end_matches('.'), 253).to_ascii_lowercase()
 }
 
 impl std::fmt::Debug for AccessLog {
