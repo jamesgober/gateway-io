@@ -86,7 +86,45 @@ fn open_with_auth(conf: &Config) -> (Door, SocketAddr, NexAuth) {
         exempt: vec![std::net::IpAddr::from([127, 0, 0, 1])],
         ..Settings::default()
     };
-    let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
+    // `WASP_TEST_TRACE=<file>`: every finished request, as the server saw
+    // it, appended to the file (for chasing a request that got no reply).
+    let access = std::env::var_os("WASP_TEST_TRACE").map(|path| {
+        let path = PathBuf::from(path);
+        gateway_io::AccessLog::with_writer(move |e| {
+            let line = format!(
+                "{:?} server {} {} status={:?} end={} bytes={} server_time={:?} client={:?}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default(),
+                e.method,
+                e.path,
+                e.status,
+                e.end,
+                e.bytes_out,
+                e.server_time,
+                e.client
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        })
+        .expect("trace log")
+    });
+    let door = Door::open_with(
+        wiring.core,
+        &settings,
+        UrgentLine::detached(),
+        web,
+        gateway_io::Extras {
+            access,
+            ..gateway_io::Extras::default()
+        },
+    )
+    .expect("opens");
     let addr = door.local_addr().expect("addr");
     (door, addr, auth)
 }
@@ -129,12 +167,36 @@ impl Got {
 }
 
 fn send(addr: SocketAddr, request: &str) -> Got {
+    let t = Instant::now();
     let mut s = TcpStream::connect(addr).expect("connect");
+    let connected = t.elapsed();
     s.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
     s.write_all(request.as_bytes()).expect("write");
+    let written = t.elapsed();
     let mut buf = Vec::new();
-    let _ = s.read_to_end(&mut buf);
+    let read = s.read_to_end(&mut buf);
+    if buf.is_empty() {
+        // No reply: say what the client saw, for the server's trace.
+        let first = request.lines().next().unwrap_or("");
+        let line = format!(
+            "{:?} client NO REPLY to `{first}` from {:?}: connected after {connected:?}, written after {written:?}, read ended after {:?} with {read:?}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default(),
+            s.local_addr().ok(),
+            t.elapsed()
+        );
+        eprint!("{line}");
+        if let Some(path) = std::env::var_os("WASP_TEST_TRACE")
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let mut lines = head.lines();

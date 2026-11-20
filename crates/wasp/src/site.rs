@@ -61,6 +61,9 @@ pub struct SiteSettings {
     pub base: String,
     /// The site's hosts, canonical first; empty for a development site.
     pub hosts: Vec<String>,
+    /// Answer any host (a host profile with wildcards: the host router has
+    /// already picked the profile).
+    pub any_host: bool,
     /// A folder served under `/static`.
     pub assets: Option<PathBuf>,
     /// The theme folder.
@@ -80,6 +83,7 @@ impl Default for SiteSettings {
             name: "WASP".to_owned(),
             base: String::new(),
             hosts: Vec::new(),
+            any_host: false,
             assets: None,
             theme: PathBuf::from("themes/default"),
             theme_poll: Duration::from_secs(1),
@@ -137,6 +141,7 @@ impl SiteSettings {
                 base
             },
             hosts: config.get_or("site.hosts", d.hosts).map_err(e)?,
+            any_host: false,
             assets: config.get("site.assets").map_err(e)?,
             theme: config.get_or("site.theme", d.theme).map_err(e)?,
             theme_poll: config.get_or("site.theme_poll", d.theme_poll).map_err(e)?,
@@ -348,11 +353,17 @@ pub(crate) fn configure<G: web_net::Gate>(
     ready: impl Fn() -> bool + Send + Sync + 'static,
 ) -> web_net::Builder<G, SiteEngine> {
     let base = settings.base.trim_end_matches('/');
-    if settings.hosts.is_empty() {
-        builder = builder.development();
-    }
-    for host in &settings.hosts {
-        builder = builder.host(host);
+    if settings.any_host {
+        // The host router has picked this site already; `hosts` still names
+        // the canonical host (the origin, the sign-in redirect).
+        builder = builder.any_host();
+    } else {
+        if settings.hosts.is_empty() {
+            builder = builder.development();
+        }
+        for host in &settings.hosts {
+            builder = builder.host(host);
+        }
     }
     if !base.is_empty() {
         builder = builder.base(base);

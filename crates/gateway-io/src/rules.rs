@@ -134,6 +134,7 @@ pub struct Rule {
     fields: Vec<Field>,
     destination: Destination,
     rate: u32,
+    scope: Scope,
 }
 
 impl Rule {
@@ -141,6 +142,71 @@ impl Rule {
         self.codes
             .iter()
             .any(|(lo, hi)| (*lo..=*hi).contains(&status))
+    }
+}
+
+/// Host names, exact and wildcard (`*.example.com`: one more label).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hosts {
+    exact: Vec<String>,
+    wild: Vec<String>,
+}
+
+impl Hosts {
+    fn of(config: &Config, key: &str) -> Result<Hosts, String> {
+        let list: Vec<String> = config
+            .get(key)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let mut out = Hosts::default();
+        for h in list {
+            let h = h.trim().to_ascii_lowercase();
+            match h.strip_prefix('*') {
+                Some(suffix) => out.wild.push(suffix.to_owned()),
+                None => out.exact.push(h),
+            }
+        }
+        Ok(out)
+    }
+
+    fn extend(&mut self, other: &Hosts) {
+        self.exact.extend(other.exact.iter().cloned());
+        self.wild.extend(other.wild.iter().cloned());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.wild.is_empty()
+    }
+
+    /// Whether `host` (lower case, no port) is one of these.
+    fn has(&self, host: &str) -> bool {
+        self.exact.iter().any(|h| h == host)
+            || self.wild.iter().any(|w| {
+                host.strip_suffix(w.as_str())
+                    .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+            })
+    }
+}
+
+/// Which requests a rule is for, by host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Every request.
+    Any,
+    /// A host profile's own.
+    Only(Hosts),
+    /// Every request but those of profiles with rules of their own.
+    Except(Hosts),
+}
+
+impl Scope {
+    fn covers(&self, host: Option<&str>) -> bool {
+        let host = host.unwrap_or("");
+        match self {
+            Scope::Any => true,
+            Scope::Only(h) => h.has(host),
+            Scope::Except(h) => !h.has(host),
+        }
     }
 }
 
@@ -153,6 +219,8 @@ pub struct Wants {
     pub user_agent: bool,
     /// The `Referer` header.
     pub referrer: bool,
+    /// The `Host` header (a rule is for some hosts only).
+    pub host: bool,
 }
 
 /// Every rule.
@@ -177,121 +245,164 @@ const RULE_KEYS: &[&str] = &[
 impl LogRules {
     /// The rules `[log_rule.*]` sets. A bad rule is refused with its key.
     pub fn from_config(config: &Config) -> Result<LogRules, String> {
-        let e = |e: wasp_core::suite::Error| e.to_string();
-        let names = config.keys("log_rule");
-        if names.len() > MAX_RULES {
-            return Err(format!("[log_rule]: at most {MAX_RULES} rules"));
-        }
+        // A host profile with rules of its own (`[host.<name>.log_rule.*]`)
+        // takes them for its hosts; the top-level rules are for every
+        // other host.
         let mut rules = Vec::new();
-        for name in names {
-            let at = format!("log_rule.{name}");
-            if let Some(k) = config
-                .keys(&at)
-                .into_iter()
-                .find(|k| !RULE_KEYS.contains(k))
-            {
-                return Err(format!(
-                    "unknown key `{at}.{k}`: the keys of a rule are {}",
-                    RULE_KEYS.join(", ")
-                ));
+        let mut owned = Hosts::default();
+        for profile in config.keys("host").into_iter().filter(|k| *k != "default") {
+            let section = format!("host.{profile}.log_rule");
+            if !config.contains(&section) {
+                continue;
             }
-            let Some(code_list) = config
-                .get::<Vec<String>>(&format!("{at}.codes"))
-                .map_err(e)?
-            else {
-                return Err(format!(
-                    "{at}.codes is missing (statuses like \"404\" or classes like \"5xx\")"
-                ));
-            };
-            if code_list.is_empty() {
-                return Err(format!("{at}.codes is empty"));
-            }
-            let mut codes = Vec::new();
-            for c in &code_list {
-                codes.push(code_range(c).ok_or_else(|| {
-                    format!("{at}.codes: `{c}` is not a status from 100 to 599 or a class from 1xx to 5xx")
-                })?);
-            }
-            let include_query: bool = config
-                .get_or(&format!("{at}.include_query"), false)
-                .map_err(e)?;
-            let fields = match config
-                .get::<Vec<String>>(&format!("{at}.fields"))
-                .map_err(e)?
-            {
-                None => DEFAULT_FIELDS.to_vec(),
-                Some(list) => {
-                    let mut out = Vec::new();
-                    for f in &list {
-                        let field = Field::parse(f)
-                            .ok_or_else(|| format!("{at}.fields: no field `{f}`"))?;
-                        if !out.contains(&field) {
-                            out.push(field);
-                        }
-                    }
-                    out
-                }
-            };
-            // The query only with the switch, whatever the list says.
-            let fields: Vec<Field> = fields
-                .into_iter()
-                .filter(|f| *f != Field::Query || include_query)
-                .collect();
-            let fields = if include_query && !fields.contains(&Field::Query) {
-                let mut f = fields;
-                f.push(Field::Query);
-                f
-            } else {
-                fields
-            };
-            let destination: String = config
-                .get_or(&format!("{at}.destination"), "log".to_owned())
-                .map_err(e)?;
-            let max_size: u64 = config
-                .get_or(&format!("{at}.max_size"), 10 * 1024 * 1024_u64)
-                .map_err(e)?;
-            let keep: u64 = config.get_or(&format!("{at}.keep"), 5_u64).map_err(e)?;
-            let destination = match destination.as_str() {
-                "log" => Destination::Log,
-                other => {
-                    let Some(path) = other.strip_prefix("file:").filter(|p| !p.trim().is_empty())
-                    else {
-                        return Err(format!(
-                            "{at}.destination is `{other}`: `log`, or `file:` and a path"
-                        ));
-                    };
-                    if !(64 * 1024..=1024 * 1024 * 1024).contains(&max_size) {
-                        return Err(format!(
-                            "{at}.max_size must be between 65536 (64 KiB) and 1073741824 (1 GiB)"
-                        ));
-                    }
-                    if keep > 100 {
-                        return Err(format!("{at}.keep must be at most 100"));
-                    }
-                    Destination::File {
-                        path: PathBuf::from(path.trim()),
-                        max_size,
-                        keep: u32::try_from(keep).unwrap_or(100),
-                    }
-                }
-            };
-            let rate: u64 = config.get_or(&format!("{at}.rate"), 100_u64).map_err(e)?;
-            if rate > 100_000 {
-                return Err(format!(
-                    "{at}.rate must be at most 100000 a second (0 for no cap)"
-                ));
-            }
-            rules.push(Rule {
-                name: name.to_owned(),
-                codes,
-                fields,
-                destination,
-                rate: u32::try_from(rate).unwrap_or(100_000),
-            });
+            let hosts = Hosts::of(config, &format!("host.{profile}.hosts"))?;
+            owned.extend(&hosts);
+            rules.extend(rules_in(
+                config,
+                &section,
+                &format!("{profile}."),
+                &Scope::Only(hosts),
+            )?);
+        }
+        let top = if owned.is_empty() {
+            Scope::Any
+        } else {
+            Scope::Except(owned)
+        };
+        rules.extend(rules_in(config, "log_rule", "", &top)?);
+        if rules.len() > MAX_RULES {
+            return Err(format!("at most {MAX_RULES} log rules in all"));
         }
         Ok(LogRules { rules })
     }
+}
 
+/// The rules in the table `section`, named with `prefix`, for `scope`.
+fn rules_in(
+    config: &Config,
+    section: &str,
+    prefix: &str,
+    scope: &Scope,
+) -> Result<Vec<Rule>, String> {
+    let e = |e: wasp_core::suite::Error| e.to_string();
+    let names = config.keys(section);
+    if names.len() > MAX_RULES {
+        return Err(format!("[{section}]: at most {MAX_RULES} rules"));
+    }
+    let mut rules = Vec::new();
+    for name in names {
+        let at = format!("{section}.{name}");
+        if let Some(k) = config
+            .keys(&at)
+            .into_iter()
+            .find(|k| !RULE_KEYS.contains(k))
+        {
+            return Err(format!(
+                "unknown key `{at}.{k}`: the keys of a rule are {}",
+                RULE_KEYS.join(", ")
+            ));
+        }
+        let Some(code_list) = config
+            .get::<Vec<String>>(&format!("{at}.codes"))
+            .map_err(e)?
+        else {
+            return Err(format!(
+                "{at}.codes is missing (statuses like \"404\" or classes like \"5xx\")"
+            ));
+        };
+        if code_list.is_empty() {
+            return Err(format!("{at}.codes is empty"));
+        }
+        let mut codes = Vec::new();
+        for c in &code_list {
+            codes.push(code_range(c).ok_or_else(|| {
+                format!(
+                    "{at}.codes: `{c}` is not a status from 100 to 599 or a class from 1xx to 5xx"
+                )
+            })?);
+        }
+        let include_query: bool = config
+            .get_or(&format!("{at}.include_query"), false)
+            .map_err(e)?;
+        let fields = match config
+            .get::<Vec<String>>(&format!("{at}.fields"))
+            .map_err(e)?
+        {
+            None => DEFAULT_FIELDS.to_vec(),
+            Some(list) => {
+                let mut out = Vec::new();
+                for f in &list {
+                    let field =
+                        Field::parse(f).ok_or_else(|| format!("{at}.fields: no field `{f}`"))?;
+                    if !out.contains(&field) {
+                        out.push(field);
+                    }
+                }
+                out
+            }
+        };
+        // The query only with the switch, whatever the list says.
+        let fields: Vec<Field> = fields
+            .into_iter()
+            .filter(|f| *f != Field::Query || include_query)
+            .collect();
+        let fields = if include_query && !fields.contains(&Field::Query) {
+            let mut f = fields;
+            f.push(Field::Query);
+            f
+        } else {
+            fields
+        };
+        let destination: String = config
+            .get_or(&format!("{at}.destination"), "log".to_owned())
+            .map_err(e)?;
+        let max_size: u64 = config
+            .get_or(&format!("{at}.max_size"), 10 * 1024 * 1024_u64)
+            .map_err(e)?;
+        let keep: u64 = config.get_or(&format!("{at}.keep"), 5_u64).map_err(e)?;
+        let destination = match destination.as_str() {
+            "log" => Destination::Log,
+            other => {
+                let Some(path) = other.strip_prefix("file:").filter(|p| !p.trim().is_empty())
+                else {
+                    return Err(format!(
+                        "{at}.destination is `{other}`: `log`, or `file:` and a path"
+                    ));
+                };
+                if !(64 * 1024..=1024 * 1024 * 1024).contains(&max_size) {
+                    return Err(format!(
+                        "{at}.max_size must be between 65536 (64 KiB) and 1073741824 (1 GiB)"
+                    ));
+                }
+                if keep > 100 {
+                    return Err(format!("{at}.keep must be at most 100"));
+                }
+                Destination::File {
+                    path: PathBuf::from(path.trim()),
+                    max_size,
+                    keep: u32::try_from(keep).unwrap_or(100),
+                }
+            }
+        };
+        let rate: u64 = config.get_or(&format!("{at}.rate"), 100_u64).map_err(e)?;
+        if rate > 100_000 {
+            return Err(format!(
+                "{at}.rate must be at most 100000 a second (0 for no cap)"
+            ));
+        }
+        rules.push(Rule {
+            name: format!("{prefix}{name}"),
+            codes,
+            fields,
+            destination,
+            rate: u32::try_from(rate).unwrap_or(100_000),
+            scope: scope.clone(),
+        });
+    }
+    Ok(rules)
+}
+
+impl LogRules {
     /// Whether there are none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -312,6 +423,7 @@ impl LogRules {
             query: any(Field::Query),
             user_agent: any(Field::UserAgent),
             referrer: any(Field::Referrer),
+            host: self.rules.iter().any(|r| r.scope != Scope::Any),
         }
     }
 }
@@ -374,7 +486,7 @@ impl Writer {
         }
         let Some(status) = e.status else { return };
         for (rule, state) in self.seen.rules.iter().zip(self.states.iter_mut()) {
-            if !rule.matches(status) {
+            if !rule.matches(status) || !rule.scope.covers(e.host.as_deref()) {
                 continue;
             }
             if rule.rate > 0 {
@@ -619,13 +731,36 @@ mod tests {
             Wants {
                 query: false,
                 user_agent: false,
-                referrer: true
+                referrer: true,
+                host: false,
             }
         );
         let q =
             rules("[log_rule.q]\ncodes = [\"2xx\"]\ninclude_query = true\nfields = [\"path\"]\n")
                 .expect("rules");
         assert!(q.wants().query, "the switch brings the query in");
+    }
+
+    #[test]
+    fn a_host_profile_s_rules_are_for_its_hosts_and_the_rest_for_the_others() {
+        let r = rules(
+            "[host.blog]\nhosts = [\"blog.test\", \"*.blog.test\"]\n             [host.blog.log_rule.misses]\ncodes = [\"404\"]\n             [host.main]\nhosts = [\"main.test\"]\n             [log_rule.all]\ncodes = [\"404\"]\n",
+        )
+        .expect("rules");
+        assert!(r.wants().host, "the host is kept for scoped rules");
+        let by = |name: &str| r.rules().iter().find(|x| x.name == name).expect(name);
+        let blog = by("blog.misses");
+        let all = by("all");
+        for (host, in_blog) in [
+            ("blog.test", true),
+            ("ann.blog.test", true),
+            ("a.b.blog.test", false),
+            ("main.test", false),
+            ("", false),
+        ] {
+            assert_eq!(blog.scope.covers(Some(host)), in_blog, "{host}");
+            assert_eq!(all.scope.covers(Some(host)), !in_blog, "{host}");
+        }
     }
 
     #[test]

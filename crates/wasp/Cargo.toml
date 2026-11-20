@@ -21,6 +21,7 @@ crypt-io = { workspace = true, optional = true }
 nex-db = { workspace = true, optional = true }
 # The web site: site, url, router, handlers.
 web-net = { workspace = true }
+serve-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
 luminess = { workspace = true }
 # The first durable content store (embedded, first-party).

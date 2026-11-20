@@ -557,10 +557,16 @@ impl ErrorRules {
     /// The rules `[errors.*]` sets. A key is a status from 400 to 599, or
     /// `4xx` or `5xx`; any other is refused, and so is an unknown key.
     pub fn from_config(config: &Config) -> Result<ErrorRules, String> {
+        ErrorRules::from_section(config, "errors")
+    }
+
+    /// The rules in the table `section` (`errors`, or a host profile's
+    /// `host.<name>.errors`).
+    pub fn from_section(config: &Config, section: &str) -> Result<ErrorRules, String> {
         let mut out = ErrorRules::default();
-        for key in config.keys("errors") {
-            let at = format!("errors.\"{key}\"");
-            let place = format!("errors.{key}");
+        for key in config.keys(section) {
+            let at = format!("{section}.\"{key}\"");
+            let place = format!("{section}.{key}");
             if let Some(k) = config
                 .keys(&place)
                 .into_iter()
@@ -1253,6 +1259,9 @@ pub struct ThemeWatcher {
     /// The `[errors.*]` rules: read again on a configuration reload, and
     /// checked against every theme reload.
     rules: ErrorRulesCell,
+    /// A host profile's own errors table (`host.<name>.errors`), read
+    /// instead of `[errors]` when the configuration has it.
+    own_errors: Option<String>,
 }
 
 impl ThemeWatcher {
@@ -1270,7 +1279,16 @@ impl ThemeWatcher {
             link: None,
             changed: Arc::new(|| {}),
             rules: Arc::default(),
+            own_errors: None,
         }
+    }
+
+    /// The same watcher, reading `section` (a host profile's errors table)
+    /// instead of `[errors]` when the configuration has it.
+    #[must_use]
+    pub fn with_own_errors(mut self, section: Option<String>) -> ThemeWatcher {
+        self.own_errors = section;
+        self
     }
 
     /// The same watcher, keeping `rules` (shared with the site's engine).
@@ -1410,7 +1428,12 @@ impl Subsystem for ThemeWatcher {
     /// theme (the folder may have changed without the watcher, when polling
     /// is off); a rule naming a template the theme lacks refuses it.
     fn reload(&mut self, config: &Config) -> Result<Commit, Failure> {
-        let rules = ErrorRules::from_config(config).map_err(Failure::new)?;
+        let section = self
+            .own_errors
+            .clone()
+            .filter(|sec| config.contains(sec))
+            .unwrap_or_else(|| "errors".to_owned());
+        let rules = ErrorRules::from_section(config, &section).map_err(Failure::new)?;
         let (pages, errors) = compile(&self.dir)?;
         rules.check(&errors).map_err(Failure::new)?;
         let theme = self.theme.clone();

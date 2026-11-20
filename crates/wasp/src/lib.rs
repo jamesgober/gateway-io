@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod content;
 pub mod events;
+pub mod hosts;
 pub mod import;
 #[cfg(feature = "store-nex")]
 pub mod nex;
@@ -53,6 +54,8 @@ pub struct Wiring {
     pub nex: Option<nex::NexDb>,
     /// The theme watcher (a kernel subsystem; start it before the gateway).
     pub theme: theme::ThemeWatcher,
+    /// The other host profiles' theme watchers, started the same way.
+    pub more_themes: Vec<theme::ThemeWatcher>,
     /// The sign-in settings' reload (a kernel subsystem), with nex-db
     /// accounts.
     pub auth_policy: Option<policy::PolicyReload>,
@@ -158,6 +161,23 @@ fn open_store(
     notices: &mut Vec<String>,
     shared: &mut Shared,
 ) -> Result<Arc<dyn content::ContentStore>, String> {
+    open_store_for(config, data_dir, notices, shared, DEFAULT_CONTENT)
+}
+
+/// The content site the site had before host profiles: `content =
+/// "default"` in a profile keeps using it.
+pub const DEFAULT_CONTENT: &str = "default";
+
+/// The content store `[content]` names, for the content site `label`: nex-db
+/// keeps each in its own content site, bison-db in its own file
+/// (`content-<label>.bison` beside `content.path`), memory in its own map.
+fn open_store_for(
+    config: &Config,
+    data_dir: &std::path::Path,
+    notices: &mut Vec<String>,
+    shared: &mut Shared,
+    label: &str,
+) -> Result<Arc<dyn content::ContentStore>, String> {
     let e = |e: wasp_core::suite::Error| e.to_string();
     let store_kind: String = config
         .get_or("content.store", "memory".to_owned())
@@ -165,16 +185,32 @@ fn open_store(
     let store: Arc<dyn content::ContentStore> = match store_kind.as_str() {
         "memory" => Arc::new(content::MemoryStore::new()),
         #[cfg(feature = "store-nex")]
-        "nex" => Arc::new(nex::NexStore::new(nex_db(config, data_dir, shared)?)),
+        "nex" => {
+            let store = nex::NexStore::new(nex_db(config, data_dir, shared)?);
+            Arc::new(if label == DEFAULT_CONTENT {
+                store
+            } else {
+                store.on_site(label)
+            })
+        }
         #[cfg(not(feature = "store-nex"))]
         "nex" => {
-            let _ = shared;
+            let _ = (shared, label);
             return Err(NO_NEX.to_owned());
         }
         "bison" => {
             let path: std::path::PathBuf = config
                 .get_or("content.path", data_dir.join("content.bison"))
                 .map_err(e)?;
+            let path = if label == DEFAULT_CONTENT {
+                path
+            } else {
+                let stem = path.file_stem().map_or_else(
+                    || "content".to_owned(),
+                    |s| s.to_string_lossy().into_owned(),
+                );
+                path.with_file_name(format!("{stem}-{label}.bison"))
+            };
             let recovery: String = config
                 .get_or("content.recovery", "strict".to_owned())
                 .map_err(e)?;
@@ -264,6 +300,7 @@ fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
 }
 
 /// The gates the site signs in through.
+#[derive(Clone)]
 enum Gates {
     #[cfg(feature = "gatekeeper")]
     Keeper(Arc<Gatekeeper>),
@@ -350,6 +387,8 @@ fn check_keys(config: &Config) -> Result<(), String> {
         let known = |k: &str| {
             // `[errors]` checks its own keys (a status or a class each).
             k == "errors"
+                // `[host.<name>]` (hosts::HostProfiles checks it).
+                || k == "host"
                 // `[log_rule.<name>]` too (gateway_io::rules).
                 || k == "log_rule"
                 || SUITE_SECTIONS.contains(&k)
@@ -387,7 +426,12 @@ fn check_keys(config: &Config) -> Result<(), String> {
 /// so a broken theme refuses to start.
 #[cfg_attr(
     not(any(feature = "gatekeeper", feature = "store-nex")),
-    allow(unreachable_code, unused_variables)
+    allow(
+        unreachable_code,
+        unused_variables,
+        unused_assignments,
+        clippy::never_loop
+    )
 )]
 fn wire_with(
     config: &Config,
@@ -403,7 +447,21 @@ fn wire_with(
     {
         shared.temporary = secret_dir.is_none();
     }
-    let store = open_store(config, data_dir, &mut notices, &mut shared)?;
+    // The host profiles, and one content store per content site they name.
+    let profiles = hosts::HostProfiles::from_config(config)?;
+    let mut labels: Vec<String> = match &profiles {
+        None => vec![DEFAULT_CONTENT.to_owned()],
+        Some(p) => p.profiles.iter().map(|x| x.content.clone()).collect(),
+    };
+    labels.sort();
+    labels.dedup();
+    let mut stores: Vec<(String, Arc<dyn content::ContentStore>)> = Vec::new();
+    for label in &labels {
+        stores.push((
+            label.clone(),
+            open_store_for(config, data_dir, &mut notices, &mut shared, label)?,
+        ));
+    }
     let threads: u64 = config.get_or("jobs.threads", 2_u64).map_err(e)?;
     let queue: u64 = config.get_or("jobs.queue", 1024_u64).map_err(e)?;
     let jobs = wasp_core::InProcessJobs::new(
@@ -538,9 +596,11 @@ fn wire_with(
         }
     };
     let guest_pages = Arc::new(wasp_core::GuestPages::default());
+    let builder = stores
+        .iter()
+        .fold(builder, |b, (_, store)| b.provider(store.clone()));
     let core = builder
         .guest_cache(guest_pages.clone())
-        .provider(store.clone())
         .jobs(Arc::new(jobs))
         .external("web")
         .service("hello", move |ctx| {
@@ -554,59 +614,114 @@ fn wire_with(
         .load()
         .map_err(|e| e.0)?;
     let core = Arc::new(core);
-    let theme = theme::load(&settings.theme).map_err(|e| e.0)?;
-    let error_rules = theme::ErrorRules::from_config(config)?;
-    error_rules.check(theme.error_pages())?;
-    let error_rules: theme::ErrorRulesCell =
-        Arc::new(std::sync::RwLock::new(Arc::new(error_rules)));
-    let purge = guest_pages.clone();
-    let watcher =
-        theme::ThemeWatcher::new(theme.clone(), settings.theme.clone(), settings.theme_poll)
-            .on_change(move || purge.purge())
-            .with_rules(error_rules.clone());
     let timing: bool = config
         .get_or("gateway.stage_timing", false)
         .map_err(|e| e.to_string())?;
     let stages = Arc::new(gateway_io::StageTimes::new(timing));
-    let manifest = content::Manifest::open_with(
-        store,
-        &settings.base,
-        true,
-        content::Fields::from_config(config)?,
-    )
-    .map_err(|e| e.to_string())?;
-    let purge = guest_pages.clone();
-    let manifest = content::Content::new(manifest).on_change(move || purge.purge());
-    let admin = theme::load_admin(&settings.admin_theme).map_err(|e| e.0)?;
-    let engine = theme::Timed::new(
-        theme::SiteRender::new(theme, admin).with_rules(error_rules),
-        stages.clone(),
-    );
-    let renders = engine.counts().clone();
-    // `/ready`: 503 while any provider (the content store, the database)
+    let fields = content::Fields::from_config(config)?;
+    // `/ready`: 503 while any provider (a content store, the database)
     // cannot serve, for the front end and the supervisor.
     let ready_core = core.clone();
-    let ready = move || ready_core.providers().iter().all(|p| p.healthy());
+    let ready: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || ready_core.providers().iter().all(|p| p.healthy()));
     #[cfg(feature = "gatekeeper")]
     let gatekeeper = match &gates {
         Gates::Keeper(gk) => Some(gk.clone()),
         #[allow(unreachable_patterns)]
         _ => None,
     };
-    let site: Box<dyn gateway_io::WebService> = match gates {
-        #[cfg(feature = "gatekeeper")]
-        Gates::Keeper(gk) => Box::new(site::build(gk, manifest, engine, &settings, ready)?),
-        #[cfg(feature = "store-nex")]
-        Gates::Nex(a) => Box::new(site_nex::build(
-            a,
-            core.access().clone(),
-            manifest,
-            engine,
-            &settings,
-            site_keys(config, secret_dir, boot)?,
-            ready,
-        )?),
+    // One site per host profile, or the one site `[site]` describes: its
+    // settings, its content site, and its own `[host.<name>.errors]` table
+    // when it has one.
+    let plans: Vec<(site::SiteSettings, String, Option<String>)> = match &profiles {
+        None => vec![(settings.clone(), DEFAULT_CONTENT.to_owned(), None)],
+        Some(p) => p
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let mut s = settings.clone();
+                s.hosts.clone_from(&x.exact);
+                // A wildcard, or the default profile, answers names its
+                // list does not hold: the router chose it for them.
+                s.any_host = !x.wildcards.is_empty() || p.default == Some(i);
+                if let Some(n) = &x.site_name {
+                    s.name.clone_from(n);
+                }
+                if let Some(t) = &x.theme {
+                    s.theme.clone_from(t);
+                }
+                (
+                    s,
+                    x.content.clone(),
+                    Some(format!("host.{}.errors", x.name)),
+                )
+            })
+            .collect(),
     };
+    let mut sites: Vec<Box<dyn gateway_io::WebService>> = Vec::new();
+    let mut watchers = Vec::new();
+    let mut renders = None;
+    for (s, label, own_errors) in plans {
+        let store = stores
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map(|(_, st)| st.clone())
+            .ok_or_else(|| format!("no content store for `{label}`"))?;
+        let theme = theme::load(&s.theme).map_err(|e| e.0)?;
+        let section = own_errors
+            .clone()
+            .filter(|sec| config.contains(sec))
+            .unwrap_or_else(|| "errors".to_owned());
+        let error_rules = theme::ErrorRules::from_section(config, &section)?;
+        error_rules.check(theme.error_pages())?;
+        let error_rules: theme::ErrorRulesCell =
+            Arc::new(std::sync::RwLock::new(Arc::new(error_rules)));
+        let purge = guest_pages.clone();
+        watchers.push(
+            theme::ThemeWatcher::new(theme.clone(), s.theme.clone(), s.theme_poll)
+                .on_change(move || purge.purge())
+                .with_rules(error_rules.clone())
+                .with_own_errors(own_errors),
+        );
+        let manifest = content::Manifest::open_with(store, &s.base, true, fields.clone())
+            .map_err(|e| e.to_string())?;
+        let purge = guest_pages.clone();
+        let manifest = content::Content::new(manifest).on_change(move || purge.purge());
+        let admin = theme::load_admin(&s.admin_theme).map_err(|e| e.0)?;
+        let engine = theme::Timed::new(
+            theme::SiteRender::new(theme, admin).with_rules(error_rules),
+            stages.clone(),
+        );
+        if renders.is_none() {
+            renders = Some(engine.counts().clone());
+        }
+        let ready = ready.clone();
+        let ready = move || ready();
+        let site: Box<dyn gateway_io::WebService> = match gates.clone() {
+            #[cfg(feature = "gatekeeper")]
+            Gates::Keeper(gk) => Box::new(site::build(gk, manifest, engine, &s, ready)?),
+            #[cfg(feature = "store-nex")]
+            Gates::Nex(a) => Box::new(site_nex::build(
+                a,
+                core.access().clone(),
+                manifest,
+                engine,
+                &s,
+                site_keys(config, secret_dir, boot.clone())?,
+                ready,
+            )?),
+        };
+        sites.push(site);
+    }
+    let site: Box<dyn gateway_io::WebService> = match profiles {
+        None => sites.pop().ok_or_else(|| "no site was built".to_owned())?,
+        Some(p) => Box::new(hosts::HostRouter::new(p, sites)),
+    };
+    let mut watchers = watchers.into_iter();
+    let theme = watchers
+        .next()
+        .ok_or_else(|| "no theme was loaded".to_owned())?;
     Ok(Wiring {
         core,
         site,
@@ -614,10 +729,11 @@ fn wire_with(
         gatekeeper,
         #[cfg(feature = "store-nex")]
         nex: shared.nex,
-        theme: watcher,
+        theme,
+        more_themes: watchers.collect(),
         auth_policy,
         guest_pages,
-        renders,
+        renders: renders.unwrap_or_default(),
         stages,
         notices,
     })

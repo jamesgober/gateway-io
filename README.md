@@ -119,6 +119,42 @@ A crash restarts it after two seconds. A configuration it refuses (exit 78) or a
 
 First make its log folder, private to the account: `mkdir -m 700 -p /usr/local/var/log/wasp`. launchd starts it again after a crash or a failed start (every 30 seconds while it keeps failing), and not after a clean stop.
 
+## Host profiles
+
+One wasp can serve several sites, each chosen by the request's `Host`:
+
+```toml
+[host]
+default = "main"                 # a host no profile names (else 421)
+
+[host.main]
+hosts = ["example.com", "www.example.com"]
+content = "default"              # the content the site had before profiles
+
+[host.blog]
+hosts = ["blog.example.com", "*.blog.example.com"]
+name = "The Blog"
+theme = "themes/blog"
+content = "blog"
+
+[host.blog.errors.404]
+message = "No such post."
+
+[host.blog.log_rule.misses]
+codes = ["404"]
+fields = ["path", "referrer"]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hosts` | required | exact names, and `*.example.com` for one more label (`a.example.com`, never `example.com` or `a.b.example.com`) |
+| `name` | `site.name` | the site's name |
+| `theme` | `site.theme` | its theme |
+| `content` | the profile's name | its content: a site of its own in nex-db, its own file with bison-db; `default` is the content from before profiles |
+| `realm` | `shared` | the accounts and sessions (one realm for now) |
+
+An exact name wins over a wildcard, and the longest wildcard wins. A host belongs to one profile only. A host no profile names gets `[host] default`, or 421 when there is none, and never another profile's pages. A profile's `[host.<name>.errors.*]` and `[host.<name>.log_rule.*]` replace the top-level tables for its hosts; without them it uses `[errors]` and `[log_rule]`. The guest cache keeps every host's pages apart. Without any `[host.*]` the site is the one `[site]` describes, as before.
+
 ## Edit content
 
 On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member`, `editor` and `admin` roles at every start. The editor's pages are never cached, and every form carries a CSRF token.
