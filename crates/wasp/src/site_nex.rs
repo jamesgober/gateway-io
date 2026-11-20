@@ -491,6 +491,7 @@ pub fn build(
         hashing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         boot,
         show: Arc::new(sign_in_form),
+        spent: Arc::default(),
     };
     let a = auth;
     let sign_out: NexRoute = post("/sign-out", move |cx: &mut NexCx<'_>| {

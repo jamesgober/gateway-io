@@ -50,6 +50,12 @@ fn config(data: &Path, extra: &str) -> Config {
 
 /// Opens the site with a member and an administrator.
 fn open(conf: &Config) -> (Door, SocketAddr) {
+    let (door, addr, _) = open_with_auth(conf);
+    (door, addr)
+}
+
+/// Opens the site, with a handle on its accounts.
+fn open_with_auth(conf: &Config) -> (Door, SocketAddr, NexAuth) {
     let t = Instant::now();
     let wiring = loop {
         match wasp::wire(conf) {
@@ -78,7 +84,7 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     let addr = door.local_addr().expect("addr");
-    (door, addr)
+    (door, addr, auth)
 }
 
 #[derive(Debug)]
@@ -352,6 +358,16 @@ fn an_administrator_disables_enables_and_removes_accounts() {
         )
     };
 
+    let not_disabled = act("/admin/accounts/enable", "");
+    assert_eq!(
+        not_disabled.status, 422,
+        "only a disabled or locked account"
+    );
+    assert!(
+        not_disabled
+            .body
+            .contains("Only a disabled or locked account")
+    );
     assert_eq!(act("/admin/accounts/disable", "").status, 303);
     assert!(!signed_in(addr, &member), "a disable ends the sessions");
     let (refused, _) = password_step(addr, MEMBER, PASSWORD, &[]);
@@ -565,23 +581,29 @@ fn turn_on(addr: SocketAddr, session: &str) -> (Vec<u8>, Vec<String>) {
             .expect("the key"),
     );
     assert!(start.body.contains("otpauth://totp/"), "{}", start.body);
-    let wrong = post(
-        addr,
-        "/account/two-factor",
-        &[session],
-        &format!("code=000000&csrf_token={}", encode(&start.csrf())),
+    assert!(
+        start.body.contains("name=\"password\""),
+        "the password is asked"
     );
+    let enroll = |code: &str, password: &str, csrf: &str| {
+        post(
+            addr,
+            "/account/two-factor",
+            &[session],
+            &format!(
+                "code={code}&password={}&csrf_token={}",
+                encode(password),
+                encode(csrf)
+            ),
+        )
+    };
+    // A borrowed session cannot turn it on: the password is needed.
+    let no_password = enroll(&code_for(&key, 0), "not it", &start.csrf());
+    assert_eq!(no_password.status, 422);
+    assert!(no_password.body.contains("password is not right"));
+    let wrong = enroll("000000", PASSWORD, &no_password.csrf());
     assert_eq!(wrong.status, 422);
-    let done = post(
-        addr,
-        "/account/two-factor",
-        &[session],
-        &format!(
-            "code={}&csrf_token={}",
-            code_for(&key, 0),
-            encode(&wrong.csrf())
-        ),
-    );
+    let done = enroll(&code_for(&key, 0), PASSWORD, &wrong.csrf());
     assert_eq!(done.status, 200, "{done:?}");
     let codes: Vec<String> = done
         .body
@@ -651,6 +673,20 @@ fn two_step_sign_in_with_a_code_a_recovery_code_and_a_remembered_device() {
     let signed = done.cookie("__Host-nex").expect("session");
     assert!(signed_in(addr, &signed));
     let device = done.cookie("__Host-nexdev").expect("remembered");
+    // The same half-done sign-in cannot be finished a second time.
+    let again = post(
+        addr,
+        "/sign-in/code",
+        &[&pre, &step],
+        &format!(
+            "code={}&csrf_token={}",
+            code_for(&key, 0),
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(again.status, 303, "{again:?}");
+    assert_eq!(again.field("location"), Some("/sign-in"));
+    assert!(again.cookie("__Host-nex").is_none(), "no second session");
 
     // The remembered device skips the code.
     let (skip, _) = password_step(addr, MEMBER, PASSWORD, &[&device]);
@@ -758,5 +794,109 @@ fn a_role_that_requires_two_step_sets_it_up_at_sign_in() {
         ),
     );
     assert_eq!(off.status, 403);
+    drop(door);
+}
+
+#[cfg(feature = "mfa")]
+#[test]
+fn sign_out_everywhere_forgets_remembered_devices() {
+    let data = temp_dir("everywhere-devices");
+    let conf = config(
+        &data.0,
+        "[auth.mfa]\nenabled = true\n[auth.lockout]\naddress_attempts = 100\n",
+    );
+    let (door, addr) = open(&conf);
+    let session = sign_in(addr, MEMBER, PASSWORD);
+    let (key, _) = turn_on(addr, &session);
+    let (first, pre) = password_step(addr, MEMBER, PASSWORD, &[]);
+    let step = first.cookie("__Host-nexstep").expect("step");
+    let page = get(addr, "/sign-in/code", &[&pre, &step]);
+    let done = post(
+        addr,
+        "/sign-in/code",
+        &[&pre, &step],
+        &format!(
+            "code={}&remember=on&csrf_token={}",
+            code_for(&key, 1),
+            encode(&page.csrf())
+        ),
+    );
+    let signed = done.cookie("__Host-nex").expect("session");
+    let device = done.cookie("__Host-nexdev").expect("remembered");
+    let (skip, _) = password_step(addr, MEMBER, PASSWORD, &[&device]);
+    assert!(skip.cookie("__Host-nex").is_some(), "remembered");
+
+    let out = post(
+        addr,
+        "/account/sign-out-everywhere",
+        &[&signed],
+        &format!("csrf_token={}", encode(&token(addr, &signed))),
+    );
+    assert_eq!(out.status, 303);
+    let (asked, _) = password_step(addr, MEMBER, PASSWORD, &[&device]);
+    assert!(
+        asked.cookie("__Host-nex").is_none(),
+        "the code again: {asked:?}"
+    );
+    drop(door);
+}
+
+#[cfg(feature = "mfa")]
+#[test]
+fn the_setup_step_refuses_a_disabled_account_and_is_good_once() {
+    let data = temp_dir("setup-once");
+    let conf = config(
+        &data.0,
+        "[auth.mfa]\nenabled = true\n[auth.role.admin.mfa]\nmode = \"required\"\n[auth.lockout]\naddress_attempts = 100\n",
+    );
+    let (door, addr, auth) = open_with_auth(&conf);
+    let admin = auth.known(ADMIN).expect("directory").expect("admin");
+    let member = auth.known(MEMBER).expect("directory").expect("member");
+
+    // Disabled between the two steps: the set-up is refused.
+    let (first, pre) = password_step(addr, ADMIN, PASSWORD, &[]);
+    let step = first.cookie("__Host-nexstep").expect("step");
+    auth.disable(admin, member).expect("disable");
+    let refused = get(addr, "/sign-in/setup", &[&pre, &step]);
+    assert_eq!(refused.status, 303, "{refused:?}");
+    assert_eq!(refused.field("location"), Some("/sign-in"));
+    assert!(auth.enable(admin, member).expect("enable"));
+
+    // Set up once; the same cookies cannot enroll another key afterwards.
+    let (first, pre) = password_step(addr, ADMIN, PASSWORD, &[]);
+    let step = first.cookie("__Host-nexstep").expect("step");
+    let page = get(addr, "/sign-in/setup", &[&pre, &step]);
+    assert_eq!(page.status, 200, "{page:?}");
+    let key = base32(
+        &page
+            .between("<code class=\"secret\">", "</code>")
+            .expect("key"),
+    );
+    let done = post(
+        addr,
+        "/sign-in/setup",
+        &[&pre, &step],
+        &format!(
+            "code={}&csrf_token={}",
+            code_for(&key, 0),
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(done.status, 200, "{done:?}");
+    assert!(done.cookie("__Host-nex").is_some());
+    let replay = get(addr, "/sign-in/setup", &[&pre, &step]);
+    assert_eq!(replay.status, 303, "two-step is on now: {replay:?}");
+    let replay = post(
+        addr,
+        "/sign-in/setup",
+        &[&pre, &step],
+        &format!(
+            "code={}&csrf_token={}",
+            code_for(&key, 1),
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(replay.status, 303, "{replay:?}");
+    assert!(replay.cookie("__Host-nex").is_none(), "no second session");
     drop(door);
 }
