@@ -71,6 +71,14 @@ curl -i http://127.0.0.1:8080/account
 
 The site: `/`, `/posts/:slug`, `/about` and every other page at `/:slug` (from the content store: in memory by default, or a bison-db file that survives restarts), `/account` (signed in only: guests get a 303 to `/sign-in?next=/account`), `/sign-in` (the form, and `POST` to sign in), `/sign-out` (`POST`), `/admin` (the content editor, below), `/health`, `/ready` (503 while a store cannot serve), `/theme/site.css`. Pages and error pages (404, 405, 500) are rendered by Luminess from `themes/default`; edit a template while the server runs and the next request has it (a template that does not compile is refused and the running theme stays).
 
+### Upgrading an install
+
+A start can now refuse a folder that other users of the machine can read, such as a log folder an older build made at mode 0755. The message names the folder and the fix, for example `run: chmod 700 /home/you/.local/share/wasp/logs`. Run it (or delete the folder so it is made again, private) and start again.
+
+The configuration file is checked the same way: one that other accounts can change is refused. On Windows that includes a file on a drive that keeps no permissions (FAT or exFAT, often a second drive or a USB disk): keep `wasp.conf` on an NTFS drive; the data folder can stay where it is.
+
+A stop signal that was already ignored when wasp started stays ignored: SIGHUP under `nohup`, and SIGINT for a job a shell script started in the background with `&`. A script that stops wasp with `kill -INT` should send SIGTERM instead.
+
 ## Edit content
 
 On a site signed in through nex-db (`auth.store = "nex"`), an account with the `editor` role writes the content in the browser: `/admin` lists every post and page, with links to edit each one and to write a new post or page. A save is checked and escaped like an import, and a refused save shows the form again with what was typed and the reason. Renaming an entry (changing its slug) moves it; a slug another entry has is refused. The boot account (`auth.admin`) is given the `member` and `editor` roles. The editor's pages are never cached, and every form carries a CSRF token.

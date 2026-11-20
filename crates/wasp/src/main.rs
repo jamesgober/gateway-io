@@ -34,9 +34,11 @@ fn main() -> ExitCode {
         .boot()
     {
         Ok(boot) => boot,
-        Err(error) => return error.report(),
+        Err(error) => {
+            say_how_to_fix_a_folder(&error);
+            return error.report();
+        }
     };
-    say_where_the_configuration_came_from(boot.foundation());
 
     // `wasp import <folder>`: content into the store, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -146,29 +148,37 @@ fn failed(foundation: &wasp_core::suite::Foundation, error: &wasp_core::suite::E
     error.report()
 }
 
-/// Logs the configuration file in use, and warns when there is none: every
-/// setting is then at its default (port 8080, data in the user's data
-/// folder), which is rarely what was meant.
-fn say_where_the_configuration_came_from(foundation: &wasp_core::suite::Foundation) {
-    let config = foundation.config();
-    if let Some(file) = config.source() {
-        let file = file.display().to_string();
-        log::info!(foundation.log(), "configuration file", file = file.as_str());
+/// When the boot refused a folder others can reach, says which and the
+/// command that fixes it, ahead of the suite's report: an install made by
+/// an older build may have its folders at mode 0755.
+fn say_how_to_fix_a_folder(error: &wasp_core::suite::Error) {
+    use wasp_core::suite::path::Error as PathError;
+
+    if error.kind() != wasp_core::suite::ErrorKind::DirectoryInsecure {
         return;
     }
-    let here = std::path::Path::new("wasp.conf");
-    let why = if !here.is_file() {
-        "no wasp.conf in the working directory and WASP_CONFIG is not set"
-    } else if wasp_core::suite::sys::process::is_elevated().unwrap_or(true) {
-        "wasp.conf in the working directory is not read by a process running as root or administrator: name it with WASP_CONFIG"
-    } else {
-        "wasp.conf in the working directory was not read"
-    };
-    log::warn!(
-        foundation.log(),
-        "no configuration file: every setting is at its default",
-        why = why
-    );
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if let Some(PathError::Refused { path, .. }) = e.downcast_ref::<PathError>() {
+            let shown = path.display();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    eprintln!(
+                        "wasp: {shown} can be reached by other users (mode {mode:o}); run: chmod 700 {shown}"
+                    );
+                    return;
+                }
+            }
+            eprintln!(
+                "wasp: {shown} can be reached by other users; make it private to this account"
+            );
+            return;
+        }
+        cause = e.source();
+    }
 }
 
 /// Logs a warning when a provider (the content store, the database) stops
