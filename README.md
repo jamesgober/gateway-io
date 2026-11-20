@@ -152,7 +152,7 @@ fields = ["path", "referrer"]
 | `theme` | `site.theme` | its theme |
 | `content` | the profile's name | its content: a site of its own in nex-db, its own file with bison-db; `default` is the content from before profiles |
 | `realm` | `shared` | the accounts and sessions: `shared` (the site's realm, with `auth.admin`), or a name for a realm of its own; profiles naming the same realm share it |
-| `admin` | none | the boot account of a realm of its own (its password from `WASP_ADMIN_PASSWORD`, needed until it exists) |
+| `admin` | none | the boot account of a realm of its own. Its password comes from the realm's own variable, `WASP_ADMIN_PASSWORD_<REALM>` (`WASP_ADMIN_PASSWORD_BLOG` for `blog`), needed until it exists. It never takes `WASP_ADMIN_PASSWORD`, so one leaked password never opens another realm |
 
 An exact name wins over a wildcard, and the longest wildcard wins. A host belongs to one profile only. A host no profile names gets `[host] default`, or 421 when there is none, and never another profile's pages. A profile's `[host.<name>.errors.*]` and `[host.<name>.log_rule.*]` replace the top-level tables for its hosts; without them it uses `[errors]` and `[log_rule]`. The guest cache keeps every host's pages apart. A realm of its own has its own accounts, sessions, keys and account directory: a session of one realm is no one on a profile of another, and an account of one cannot sign in on the other. Without any `[host.*]` the site is the one `[site]` describes, as before.
 

@@ -308,6 +308,7 @@ fn boot_account(
     admin: &str,
     password: Option<&str>,
     key: &str,
+    env: &str,
 ) -> Result<(), String> {
     let roles = [nex::MEMBER_ROLE, nex::EDITOR_ROLE, nex::ADMIN_ROLE];
     // The password is needed only to make the account: once it exists, a
@@ -322,7 +323,7 @@ fn boot_account(
             .map_err(|e| e.to_string())? => {}
         None => {
             return Err(format!(
-                "{key} `{admin}` has no account yet: put its password in {ADMIN_PASSWORD_ENV} for the start that makes it"
+                "{key} `{admin}` has no account yet: put its password in {env} for the start that makes it"
             ));
         }
     }
@@ -343,7 +344,26 @@ enum Gates {
 /// database last for this run only (unless `auth.secret` or `nex.path` names
 /// one), and no boot account is made from the environment.
 pub fn wire(config: &Config) -> Result<Wiring, String> {
-    wire_with(config, std::path::Path::new("."), None, None)
+    wire_with(config, std::path::Path::new("."), None, None, &|_| None)
+}
+
+/// [`wire`], with the boot accounts' passwords: `main` for `auth.admin`, and
+/// `realm(name)` for the boot account of a realm of its own (what
+/// [`admin_password_env`] names in the process). For tests and tools.
+pub fn wire_with_passwords(
+    config: &Config,
+    main: Option<&str>,
+    realm: &dyn Fn(&str) -> Option<String>,
+) -> Result<Wiring, String> {
+    wire_with(config, std::path::Path::new("."), None, main, realm)
+}
+
+/// The environment variable that holds the boot account's password of the
+/// realm `realm` (`WASP_ADMIN_PASSWORD_BLOG` for `blog`): each realm's own,
+/// so one leaked password never opens another realm.
+#[must_use]
+pub fn admin_password_env(realm: &str) -> String {
+    format!("{ADMIN_PASSWORD_ENV}_{}", realm.to_ascii_uppercase())
 }
 
 /// Phases 1 to 3 for the process: the data folder holds the content store
@@ -355,7 +375,13 @@ pub fn wire_in(config: &Config, data_dir: &std::path::Path) -> Result<Wiring, St
     // empty host list.
     check_keys(config)?;
     check_hosts(config, std::env::var_os("PORT").is_some())?;
-    wire_with(config, data_dir, Some(data_dir), password.as_deref())
+    wire_with(
+        config,
+        data_dir,
+        Some(data_dir),
+        password.as_deref(),
+        &|realm| std::env::var(admin_password_env(realm)).ok(),
+    )
 }
 
 /// Behind an application server (`port`), `site.hosts` must name the site:
@@ -468,7 +494,11 @@ fn wire_with(
     data_dir: &std::path::Path,
     secret_dir: Option<&std::path::Path>,
     admin_password: Option<&str>,
+    realm_password: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Wiring, String> {
+    // Realms of their own are nex-db's.
+    #[cfg(not(feature = "store-nex"))]
+    let _ = realm_password;
     check_keys(config)?;
     let e = |e: wasp_core::suite::Error| e.to_string();
     let mut notices = Vec::new();
@@ -624,16 +654,20 @@ fn wire_with(
             let admin: Option<String> = config.get("auth.admin").map_err(|e| e.to_string())?;
             boot = admin.clone();
             if let Some(admin) = &admin {
-                boot_account(&a, admin, admin_password, "auth.admin")?;
+                boot_account(&a, admin, admin_password, "auth.admin", ADMIN_PASSWORD_ENV)?;
             }
             if let Some(p) = &profiles {
                 for (x, auth) in p.profiles.iter().zip(&nex_realms) {
                     if let Some(admin) = &x.admin {
+                        // The realm's own password, never the main one: one
+                        // leaked password must not open every realm.
+                        let password = realm_password(&x.realm);
                         boot_account(
                             auth,
                             admin,
-                            admin_password,
+                            password.as_deref(),
                             &format!("host.{}.admin", x.name),
+                            &admin_password_env(&x.realm),
                         )?;
                     }
                 }

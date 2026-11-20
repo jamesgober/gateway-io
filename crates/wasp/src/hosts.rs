@@ -14,7 +14,7 @@
 //! theme = "themes/blog"       # default: site.theme
 //! content = "blog"            # the content site; default: the profile's name
 //! realm = "blog"              # accounts and sessions of its own ("shared": the default)
-//! admin = "you@example.com"   # its realm's boot account (password: WASP_ADMIN_PASSWORD)
+//! admin = "you@example.com"   # its realm's boot account (password: WASP_ADMIN_PASSWORD_BLOG)
 //!
 //! [host.blog.errors.404]      # falls back to [errors.*]
 //! message = "No such post."
