@@ -43,7 +43,7 @@ pub use crate::load::{LoadSignal, ShedMarks};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::rules::LogRules;
-pub use crate::settings::{Driver, IngressMode, Settings, SettingsError};
+pub use crate::settings::{Driver, IngressMode, LaneRate, Settings, SettingsError};
 pub use crate::stages::StageTimes;
 pub use crate::tickets::RequestTickets;
 pub use crate::web::{Answered, Caller, WaspGate, WebGate, WebService, WebServices, Who};

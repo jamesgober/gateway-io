@@ -128,7 +128,8 @@ fn main() -> ExitCode {
     if let Err(error) = boot.start(
         Gateway::new(wiring.core)
             .web("web", wiring.site)
-            .stages(wiring.stages),
+            .stages(wiring.stages)
+            .lane_rates(wiring.api_budget.into_iter().collect()),
     ) {
         return failed(boot.foundation(), &error);
     }

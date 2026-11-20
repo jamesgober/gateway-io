@@ -279,11 +279,7 @@ impl NexAuth {
     /// locked out, disabled, banned, or gone).
     pub fn may_sign_in(&self, user: UserId) -> Result<bool, StoreError> {
         Ok(matches!(
-            self.db
-                .db()
-                .auth()
-                .standing(account_of(user))
-                .map_err(nex)?,
+            self.auth()?.standing(account_of(user)).map_err(nex)?,
             Some(nex_db::Standing::Active | nex_db::Standing::PendingVerification)
         ))
     }
@@ -338,9 +334,7 @@ impl NexAuth {
             return Ok(false);
         };
         Ok(matches!(
-            self.db
-                .db()
-                .auth()
+            self.auth()?
                 .verify_password(&identifier, password)
                 .map_err(nex)?,
             nex_db::PasswordCheck::Verified(a) | nex_db::PasswordCheck::NeedsSecondFactor { account: a }
@@ -471,12 +465,7 @@ impl NexAuth {
             return Ok(false);
         };
         let account = account_of(user);
-        let ended = self
-            .db
-            .db()
-            .auth()
-            .revoke_session(account, sid)
-            .map_err(nex)?;
+        let ended = self.auth()?.revoke_session(account, sid).map_err(nex)?;
         let content = self.db.db().content();
         let path = format!("/{}/s/{sid}", hex_of(account));
         if let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? {
@@ -500,12 +489,7 @@ impl NexAuth {
     /// Ends every session `user` holds (this one too) and forgets its
     /// remembered devices; how many sessions ended.
     pub fn sign_out_everywhere(&self, user: UserId) -> Result<u32, StoreError> {
-        let ended = self
-            .db
-            .db()
-            .auth()
-            .revoke_all(account_of(user))
-            .map_err(nex)?;
+        let ended = self.auth()?.revoke_all(account_of(user)).map_err(nex)?;
         self.forget_devices(user)?;
         Ok(ended)
     }
@@ -520,12 +504,7 @@ impl NexAuth {
         issuer: &str,
     ) -> Result<(crypt_io::Zeroizing<String>, crypt_io::Zeroizing<String>), StoreError> {
         let label = self.identifier_of(user)?.unwrap_or_default();
-        let enrollment = self
-            .db
-            .db()
-            .auth()
-            .add_totp(account_of(user))
-            .map_err(nex)?;
+        let enrollment = self.auth()?.add_totp(account_of(user)).map_err(nex)?;
         Ok((enrollment.secret(), enrollment.uri(issuer, &label)))
     }
 
@@ -554,9 +533,7 @@ impl NexAuth {
     pub fn recovery_codes(&self, user: UserId) -> Result<Vec<String>, StoreError> {
         let show = self.policy().recovery_codes;
         let codes = self
-            .db
-            .db()
-            .auth()
+            .auth()?
             .new_recovery_codes(account_of(user))
             .map_err(nex)?;
         Ok(codes.codes().take(show).map(str::to_owned).collect())
@@ -565,12 +542,7 @@ impl NexAuth {
     /// Turns two-step sign-in off for `user`.
     #[cfg(feature = "mfa")]
     pub fn remove_totp(&self, user: UserId) -> Result<(), StoreError> {
-        let _ = self
-            .db
-            .db()
-            .auth()
-            .remove_totp(account_of(user))
-            .map_err(nex)?;
+        let _ = self.auth()?.remove_totp(account_of(user)).map_err(nex)?;
         self.set_field(user, "totp", "")?;
         self.forget_devices(user)
     }
@@ -641,11 +613,7 @@ impl NexAuth {
     /// Removes `user`: the account, its sessions and secrets, and its
     /// directory entry.
     pub fn remove(&self, user: UserId) -> Result<(), StoreError> {
-        self.db
-            .db()
-            .auth()
-            .erase_account(account_of(user))
-            .map_err(nex)?;
+        self.auth()?.erase_account(account_of(user)).map_err(nex)?;
         if let Some((rid, _)) = self.entry(user)? {
             self.db.db().content().delete(rid).map_err(nex)?;
         }

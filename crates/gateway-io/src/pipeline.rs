@@ -92,6 +92,8 @@ pub struct Pipeline {
     web: Arc<WebServices>,
     stages: Arc<StageTimes>,
     access: Option<Arc<AccessLog>>,
+    /// The lanes with a budget per caller, by core lane.
+    budgeted: [bool; 6],
 }
 
 /// A passport out of its shelf for one call. If the call unwinds (a panic in
@@ -165,6 +167,44 @@ impl Pipeline {
             web,
             stages,
             access: None,
+            budgeted: [false; 6],
+        }
+    }
+
+    /// Charges the lanes in `rates` to each request's caller, once the core
+    /// has authenticated it (the bouncer holds the budgets).
+    #[must_use]
+    pub fn with_lane_rates(mut self, rates: &[crate::settings::LaneRate]) -> Pipeline {
+        for r in rates {
+            self.budgeted[usize::from(r.lane.0.min(5))] = true;
+        }
+        self
+    }
+
+    /// The request's caller, bound to its ticket, charged to its lane's
+    /// budget: `Some(status)` when it is over. Only for a lane with a
+    /// budget, so other requests pay nothing. A signed-in caller is its
+    /// session (or API key) by the id authentication gave it; a guest is its
+    /// address.
+    fn charge(&self, worker: u16, tag: TicketTag, h: &wasp_core::Handoff) -> Option<u16> {
+        let lane = h.trip().lane;
+        if !self.budgeted[usize::from(lane.0.min(5))] {
+            return None;
+        }
+        let session = h.identity().session();
+        let verdict = self.tickets.with_ticket(worker, tag, |ticket| {
+            if let Some(id) = session {
+                let bound =
+                    ticket.bind_session(bouncer_io::SessionKey::from_digest(id.0.to_le_bytes()));
+                if bound.is_deny() {
+                    return bound;
+                }
+            }
+            ticket.bind_lane(crate::bouncer::lane_class(lane))
+        });
+        match verdict {
+            Some(bouncer_io::Verdict::Deny(d)) => Some(d.code.http_status()),
+            _ => None,
         }
     }
 
@@ -176,11 +216,15 @@ impl Pipeline {
     }
 
     /// A checkpoint on this request's ticket: `Some(status)` when the bouncer
-    /// denies it. Two atomic loads while nothing is revoked.
+    /// denies it. Two atomic loads while nothing is revoked. A request over
+    /// its lane's budget is not denied here: the gateway answered it with
+    /// its own 429 (and `Retry-After`) when it charged the budget.
     #[inline]
     fn denied(&self, tag: TicketTag) -> Option<u16> {
         match self.bouncer.egress(tag) {
-            bouncer_io::Verdict::Deny(d) => Some(d.code.http_status()),
+            bouncer_io::Verdict::Deny(d) if d.code != bouncer_io::DenialCode::TooManyRequests => {
+                Some(d.code.http_status())
+            }
             _ => None,
         }
     }
@@ -250,51 +294,62 @@ impl Pipeline {
         }
         match routed {
             Routed::Exit(exit) => Flow::Exit(exit),
-            Routed::Handoff(h) => match self.web.get(h.service()) {
-                Some(web) => {
-                    // The gate's cookie first: a cookie of the same name the
-                    // service sets (a new session) comes later and wins.
-                    if let Some(cookie) = h.auth_cookie() {
-                        reply.header("set-cookie", cookie);
-                        // web-net decides caching without seeing this cookie:
-                        // forbid every cache. Field lines combine, so a
-                        // `public` web-net adds stays overruled by `no-store`.
-                        reply.header("cache-control", "private, no-store");
-                    }
-                    if let wasp_core::Subject::User(u) = h.identity().subject() {
-                        crate::note::set_user(u.0);
-                    }
-                    let caller = Caller::new(h.identity(), h.token_any());
-                    let answered = web.respond(req, env, &caller, reply);
-                    let outcome = answered.outcome;
-                    if let Some(m) = marks {
-                        m.service = Some(Instant::now());
-                    }
-                    if let (Some(ttl), Outcome::Done | Outcome::Close) = (answered.guests, outcome)
-                    {
-                        // A whole page every guest may share: the core's
-                        // guest cache gets a copy to consider.
-                        let exit = self
-                            .core
-                            .finish_for_guests(h, ttl, |copy| copy_reply(reply, copy));
-                        return Flow::Web(exit, outcome);
-                    }
-                    if outcome == Outcome::More {
-                        // A reply in parts: the request keeps its passport,
-                        // and later parts skip the pipeline (authorized once).
-                        match self.tickets.park(worker, tag, h) {
-                            Ok(()) => {
-                                loan.out = false;
-                                Flow::Parked(outcome)
-                            }
-                            Err(h) => Flow::Web(h.finish(), outcome),
-                        }
+            Routed::Handoff(h) => {
+                if let Some(status) = self.charge(worker, tag, &h) {
+                    let refusal = Refusal::status(status);
+                    return Flow::Exit(h.refuse_with(if status == 429 {
+                        refusal.retry_after(Duration::from_secs(1))
                     } else {
-                        Flow::Web(h.finish(), outcome)
-                    }
+                        refusal
+                    }));
                 }
-                None => Flow::Exit(h.refuse(500)),
-            },
+                match self.web.get(h.service()) {
+                    Some(web) => {
+                        // The gate's cookie first: a cookie of the same name the
+                        // service sets (a new session) comes later and wins.
+                        if let Some(cookie) = h.auth_cookie() {
+                            reply.header("set-cookie", cookie);
+                            // web-net decides caching without seeing this cookie:
+                            // forbid every cache. Field lines combine, so a
+                            // `public` web-net adds stays overruled by `no-store`.
+                            reply.header("cache-control", "private, no-store");
+                        }
+                        if let wasp_core::Subject::User(u) = h.identity().subject() {
+                            crate::note::set_user(u.0);
+                        }
+                        let caller = Caller::new(h.identity(), h.token_any());
+                        let answered = web.respond(req, env, &caller, reply);
+                        let outcome = answered.outcome;
+                        if let Some(m) = marks {
+                            m.service = Some(Instant::now());
+                        }
+                        if let (Some(ttl), Outcome::Done | Outcome::Close) =
+                            (answered.guests, outcome)
+                        {
+                            // A whole page every guest may share: the core's
+                            // guest cache gets a copy to consider.
+                            let exit = self
+                                .core
+                                .finish_for_guests(h, ttl, |copy| copy_reply(reply, copy));
+                            return Flow::Web(exit, outcome);
+                        }
+                        if outcome == Outcome::More {
+                            // A reply in parts: the request keeps its passport,
+                            // and later parts skip the pipeline (authorized once).
+                            match self.tickets.park(worker, tag, h) {
+                                Ok(()) => {
+                                    loan.out = false;
+                                    Flow::Parked(outcome)
+                                }
+                                Err(h) => Flow::Web(h.finish(), outcome),
+                            }
+                        } else {
+                            Flow::Web(h.finish(), outcome)
+                        }
+                    }
+                    None => Flow::Exit(h.refuse(500)),
+                }
+            }
         }
     }
 

@@ -35,6 +35,13 @@ admin = "you@example.com"
 # [auth.session]
 # idle = "1d"
 
+# The JSON API is on at /api/v1 (the README's "API"). Each caller gets 10
+# requests a second; move it, slow it down, or turn it off here:
+# [api]
+# prefix = "/api/v1"
+# rate = 10
+# enabled = false
+
 [nex]
 # The database, inside the application folder's data folder.
 path = "data/nex"

@@ -418,3 +418,106 @@ fn every_cookie_is_host_only() {
     }
     let _ = door.close(Duration::from_secs(2));
 }
+
+/// A GET on `host` with whole field lines (`Authorization: Bearer x`).
+fn get_with(addr: SocketAddr, host: &str, target: &str, fields: &[String]) -> Got {
+    let mut head = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n");
+    for f in fields {
+        head.push_str(f);
+        head.push_str("\r\n");
+    }
+    send(addr, &format!("{head}Connection: close\r\n\r\n"))
+}
+
+#[test]
+fn a_realm_keeps_its_sessions_and_keys_in_it() {
+    const BLOGGER: &str = "blogger@example.com";
+    let data = temp_dir("realm-keys");
+    let conf = config_with(
+        &data.0,
+        "realm = \"blog\"\n",
+        "[host.blog.api]\nprefix = \"/json\"\n",
+    );
+    let (door, addr, db) = open_db(&conf);
+    NexAuth::new(db)
+        .in_realm("blog")
+        .expect("realm")
+        .ensure_account(BLOGGER, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
+        .expect("blogger");
+    let one = sign_in_as(addr, "blog.test", BLOGGER, PASSWORD).expect("first");
+    let two = sign_in_as(addr, "blog.test", BLOGGER, PASSWORD).expect("second");
+
+    // Ending the other session ends it in the blog's realm.
+    let page = get(addr, "blog.test", "/account/security", &[&one]);
+    assert_eq!(page.status, 200, "{page:?}");
+    let other = {
+        let at = page
+            .body
+            .find("name=\"session\" value=\"")
+            .expect("the other")
+            + 22;
+        page.body[at..at + 32].to_owned()
+    };
+    let ended = post(
+        addr,
+        "blog.test",
+        "/account/sessions/revoke",
+        &[&one],
+        &format!("session={other}&csrf_token={}", encode(&page.csrf())),
+    );
+    assert_eq!(ended.status, 200, "{ended:?}");
+    assert!(
+        ended.body.contains("That session is signed out."),
+        "{}",
+        ended.body
+    );
+    assert_eq!(get(addr, "blog.test", "/account", &[&two]).status, 303);
+
+    // A key made on the blog works on the blog's own prefix, and nowhere
+    // else: the main site's realm does not know it.
+    let page = get(addr, "blog.test", "/account/security", &[&one]);
+    let made = post(
+        addr,
+        "blog.test",
+        "/account/keys",
+        &[&one],
+        &format!(
+            "label=blog&days=30&scope=account%3Aread&csrf_token={}",
+            encode(&page.csrf())
+        ),
+    );
+    assert_eq!(made.status, 200, "{made:?}");
+    let key = {
+        let at = made.body.find("class=\"key\">").expect("the key") + 12;
+        let rest = &made.body[at..];
+        rest[..rest.find('<').expect("end")].to_owned()
+    };
+    let bearer = vec![format!("Authorization: Bearer {key}")];
+    let me = get_with(addr, "blog.test", "/json/me", &bearer);
+    assert_eq!(me.status, 200, "{me:?}");
+    assert!(me.body.contains(BLOGGER), "{}", me.body);
+    let elsewhere = get_with(addr, "main.test", "/api/v1/me", &bearer);
+    assert_eq!(elsewhere.status, 401, "{elsewhere:?}");
+    assert!(
+        elsewhere.body.contains("\"code\":\"api.bad_key\""),
+        "{}",
+        elsewhere.body
+    );
+    let moved = get_with(addr, "blog.test", "/api/v1/me", &bearer);
+    assert_eq!(moved.status, 404, "{moved:?}");
+    assert!(!moved.body.contains("\"code\""), "{}", moved.body);
+
+    // Signing out everywhere ends the realm's sessions and leaves its keys.
+    let page = get(addr, "blog.test", "/account/security", &[&one]);
+    let out = post(
+        addr,
+        "blog.test",
+        "/account/sign-out-everywhere",
+        &[&one],
+        &format!("csrf_token={}", encode(&page.csrf())),
+    );
+    assert_eq!(out.status, 303, "{out:?}");
+    assert_eq!(get(addr, "blog.test", "/account", &[&one]).status, 303);
+    assert_eq!(get_with(addr, "blog.test", "/json/me", &bearer).status, 200);
+    let _ = door.close(Duration::from_secs(2));
+}

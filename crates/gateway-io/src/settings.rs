@@ -69,6 +69,21 @@ pub struct Settings {
     /// How clients reach the listener (`[gateway] ingress`, `direct` by
     /// default, or `proxy` behind a reverse proxy).
     pub ingress: IngressMode,
+    /// Budgets per caller on some lanes (none by default): the application
+    /// sets them (wasp's `[api] rate`), never the configuration reader.
+    pub lane_rates: Vec<LaneRate>,
+}
+
+/// A lane's budget for each caller: a signed-in caller (a session or an API
+/// key, by the id authentication gave it) or, for a guest, its address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneRate {
+    /// The lane.
+    pub lane: wasp_core::Lane,
+    /// Requests a second, at least 1.
+    pub per_second: u32,
+    /// The most at once after a quiet spell, at least `per_second`.
+    pub burst: u32,
 }
 
 /// How clients reach the listener.
@@ -164,6 +179,7 @@ impl Default for Settings {
             ban: Vec::new(),
             exempt: Vec::new(),
             ingress: IngressMode::Direct,
+            lane_rates: Vec::new(),
         }
     }
 }
@@ -313,6 +329,7 @@ impl Settings {
             ban: addresses(config, "door.ban")?,
             exempt: addresses(config, "door.exempt")?,
             ingress: ingress(config)?,
+            lane_rates: Vec::new(),
         };
         let explicit_ingress = config
             .get::<String>("gateway.ingress")

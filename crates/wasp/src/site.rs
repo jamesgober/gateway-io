@@ -75,6 +75,8 @@ pub struct SiteSettings {
     pub https_sign_in: bool,
     /// Where the admin pages' theme comes from (`[admin] theme`).
     pub admin_theme: AdminSource,
+    /// The API (`[api]`, or a host profile's `[host.<name>.api]`).
+    pub api: crate::api::ApiSettings,
 }
 
 impl Default for SiteSettings {
@@ -89,6 +91,7 @@ impl Default for SiteSettings {
             theme_poll: Duration::from_secs(1),
             https_sign_in: false,
             admin_theme: AdminSource::Builtin,
+            api: crate::api::ApiSettings::default(),
         }
     }
 }
@@ -111,6 +114,13 @@ fn admin_source(config: &Config) -> Result<AdminSource, String> {
         ));
     }
     Ok(AdminSource::Folder(PathBuf::from(theme)))
+}
+
+/// Whether the site's accounts are nex-db's (`auth.store = "nex"`).
+fn nex_accounts(config: &Config) -> bool {
+    config
+        .get_or("auth.store", crate::DEFAULT_AUTH_STORE.to_owned())
+        .is_ok_and(|s| s == "nex")
 }
 
 impl SiteSettings {
@@ -148,6 +158,7 @@ impl SiteSettings {
             https_sign_in: std::env::var_os("PORT").is_some()
                 && !config.get_or("site.development", false).map_err(e)?,
             admin_theme: admin_source(config)?,
+            api: crate::api::ApiSettings::from_config(config, !nex_accounts(config))?,
         })
     }
 }

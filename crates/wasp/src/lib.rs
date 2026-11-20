@@ -2,6 +2,7 @@
 //! profile uses which, the theme, and the web site attached to the gateway.
 //! `main` boots it; the tests open the same wiring on a loopback port.
 
+pub mod api;
 #[cfg(feature = "gatekeeper")]
 pub mod auth;
 pub mod content;
@@ -69,6 +70,9 @@ pub struct Wiring {
     /// Things the operator should know about the boot (written to the log
     /// as warnings).
     pub notices: Vec<String>,
+    /// The API's budget per caller, for the gateway (`None` when no site has
+    /// the API or `api.rate = 0`).
+    pub api_budget: Option<gateway_io::LaneRate>,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -273,7 +277,7 @@ pub fn import(
 
 /// The sign-in store when `auth.store` is not set: the gatekeeper when the
 /// build has it, else nex-db, else none (the build refuses to wire a site).
-const DEFAULT_AUTH_STORE: &str = if cfg!(feature = "gatekeeper") {
+pub(crate) const DEFAULT_AUTH_STORE: &str = if cfg!(feature = "gatekeeper") {
     "gatekeeper"
 } else if cfg!(feature = "store-nex") {
     "nex"
@@ -285,10 +289,10 @@ const DEFAULT_AUTH_STORE: &str = if cfg!(feature = "gatekeeper") {
 /// then signing in and out; everything else is browsing. Under load the
 /// browsing lanes are refused first (`Shed`), and they cannot take the
 /// passports held back for these (`gateway.reserve`).
-fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
+fn site_lanes(base: &str, apis: &[api::ApiSettings]) -> Vec<wasp_core::LaneRule> {
     use wasp_core::{Lane, LaneRule};
     let at = |path: &str| format!("{base}{path}");
-    vec![
+    let mut lanes = vec![
         LaneRule::exact(&at("/health"), Lane::CRITICAL),
         LaneRule::exact(&at("/ready"), Lane::CRITICAL),
         LaneRule::under(&at("/admin"), Lane::ADMIN),
@@ -296,7 +300,16 @@ fn site_lanes(base: &str) -> Vec<wasp_core::LaneRule> {
         LaneRule::exact(&at("/sign-in/code"), Lane::AUTH),
         LaneRule::exact(&at("/sign-in/setup"), Lane::AUTH),
         LaneRule::exact(&at("/sign-out"), Lane::AUTH).method("POST"),
-    ]
+    ];
+    // The API: programs, refused before people's page views under load, and
+    // each caller charged its own budget.
+    for a in apis.iter().filter(|a| a.enabled) {
+        let rule = LaneRule::under(&at(&a.prefix), Lane::BULK);
+        if !lanes.contains(&rule) {
+            lanes.push(rule);
+        }
+    }
+    lanes
 }
 
 /// Makes the boot account `admin` in `auth`'s realm with the password from
@@ -424,6 +437,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
+    ("api", &["burst", "enabled", "prefix", "rate"]),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];
@@ -557,6 +571,26 @@ fn wire_with(
         ));
     }
     let settings = site::SiteSettings::from_config(config)?;
+    // Each site's API: `[api]`, or a host profile's `[host.<name>.api]`.
+    let apis: Vec<api::ApiSettings> = match &profiles {
+        None => vec![settings.api.clone()],
+        Some(p) => p
+            .profiles
+            .iter()
+            .map(|x| api::ApiSettings::read(config, &format!("host.{}.api", x.name), &settings.api))
+            .collect::<Result<_, _>>()?,
+    };
+    let nex_accounts = config
+        .get_or("auth.store", DEFAULT_AUTH_STORE.to_owned())
+        .map_err(|e| e.to_string())?
+        == "nex";
+    if !nex_accounts && apis.iter().any(|a| a.enabled) {
+        return Err(
+            "a host profile's api.enabled needs nex-db accounts (auth.store = \"nex\"): the API's keys are kept there"
+                .to_owned(),
+        );
+    }
+    let api_budget = api::ApiBudget::from_config(config)?;
     #[cfg(not(feature = "gatekeeper"))]
     let _ = secret_dir;
     #[cfg(not(any(feature = "gatekeeper", feature = "store-nex")))]
@@ -720,7 +754,9 @@ fn wire_with(
                 Hello::new(ctx)
             }
         })
-        .profile("site", &service, |p| p.lanes = site_lanes(&settings.base))
+        .profile("site", &service, |p| {
+            p.lanes = site_lanes(&settings.base, &apis);
+        })
         .load()
         .map_err(|e| e.0)?;
     let core = Arc::new(core);
@@ -761,6 +797,7 @@ fn wire_with(
                 if let Some(t) = &x.theme {
                     s.theme.clone_from(t);
                 }
+                s.api = apis.get(i).cloned().unwrap_or_default();
                 (
                     s,
                     x.content.clone(),
@@ -858,6 +895,13 @@ fn wire_with(
         renders: renders.unwrap_or_default(),
         stages,
         notices,
+        api_budget: (api_budget.per_second > 0 && apis.iter().any(|a| a.enabled)).then_some(
+            gateway_io::LaneRate {
+                lane: wasp_core::Lane::BULK,
+                per_second: api_budget.per_second,
+                burst: api_budget.burst,
+            },
+        ),
     })
 }
 

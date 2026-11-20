@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bouncer_io::{
-    Actor, AllowList, Bouncer, BouncerError, Cidr, CloseKind, Directive, EJECTED, Ejector,
-    EventSink, Reason, TicketTag,
+    Actor, AllowList, Bouncer, BouncerError, Budgets, Cidr, CloseKind, Directive, EJECTED, Ejector,
+    EventSink, LaneClass, Rate, Reason, TicketTag,
 };
 use net_io::{ConnectionId, ServerHandle};
 use serve_net::{Checkpoint, CheckpointAt, Envelope, Verdict};
@@ -18,6 +18,31 @@ use crate::settings::Settings;
 /// it (a year is the longest timed ban; a permanent one could not be lifted
 /// by a reload as cleanly).
 pub const CONFIG_BAN: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// The bouncer's lane for a core lane.
+#[must_use]
+pub fn lane_class(lane: wasp_core::Lane) -> LaneClass {
+    match lane.0 {
+        0 => LaneClass::Critical,
+        1 => LaneClass::Admin,
+        2 => LaneClass::Auth,
+        3 => LaneClass::Write,
+        4 => LaneClass::Normal,
+        _ => LaneClass::Bulk,
+    }
+}
+
+/// The door's budgets (bouncer-io's defaults) with the settings' lane
+/// budgets.
+fn budgets(settings: &Settings) -> Budgets {
+    settings.lane_rates.iter().fold(Budgets::default(), |b, r| {
+        let per_second = r.per_second.max(1);
+        b.lane_rate(
+            lane_class(r.lane),
+            Rate::per_second(per_second).burst(r.burst.max(per_second)),
+        )
+    })
+}
 
 /// The allow list for `door.exempt`: addresses exempt from the door's
 /// budgets (they can still be banned).
@@ -107,7 +132,10 @@ pub fn build(
     events: Option<Arc<dyn EventSink>>,
 ) -> Result<(Bouncer, Arc<DoorEjector>), BouncerError> {
     let ejector = Arc::new(DoorEjector::default());
-    let mut builder = Bouncer::builder().maintainer(true).ejector(ejector.clone());
+    let mut builder = Bouncer::builder()
+        .maintainer(true)
+        .ejector(ejector.clone())
+        .budgets(budgets(settings));
     let proxies: Vec<Cidr> = settings
         .ingress
         .trusted()
@@ -158,10 +186,71 @@ impl Checkpoint for DoorCheckpoint {
             word => TicketTag::from_raw(word),
         };
         match self.bouncer.egress(tag) {
-            bouncer_io::Verdict::Deny(denial) => Verdict::Deny {
-                status: denial.code.http_status(),
-            },
+            // Over a lane's budget: the gateway already answered with its
+            // own 429 and `Retry-After`, on a connection that stays open.
+            bouncer_io::Verdict::Deny(denial)
+                if denial.code != bouncer_io::DenialCode::TooManyRequests =>
+            {
+                Verdict::Deny {
+                    status: denial.code.http_status(),
+                }
+            }
             _ => Verdict::Pass,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::LaneRate;
+    use bouncer_io::RequestId;
+
+    #[test]
+    fn core_lanes_map_to_the_bouncer_s_and_budgets_are_per_caller() {
+        let lanes = [
+            LaneClass::Critical,
+            LaneClass::Admin,
+            LaneClass::Auth,
+            LaneClass::Write,
+            LaneClass::Normal,
+            LaneClass::Bulk,
+        ];
+        for (i, want) in lanes.into_iter().enumerate() {
+            let lane = wasp_core::Lane(u8::try_from(i).expect("lane"));
+            assert_eq!(lane_class(lane), want);
+        }
+        assert_eq!(lane_class(wasp_core::Lane(9)), LaneClass::Bulk);
+
+        let settings = Settings {
+            lane_rates: vec![LaneRate {
+                lane: wasp_core::Lane::BULK,
+                per_second: 1,
+                burst: 1,
+            }],
+            ..Settings::default()
+        };
+        let (bouncer, _) = build(&settings, None).expect("bouncer");
+        let conn = bouncer
+            .door("192.0.2.9".parse().expect("addr"))
+            .expect("door");
+        let key = |n: u8| bouncer_io::SessionKey::from_digest([n; 16]);
+        let mut first = conn.request(RequestId(1)).expect("request");
+        assert!(first.bind_session(key(1)).is_pass());
+        assert!(first.bind_lane(LaneClass::Bulk).is_pass());
+        let mut again = conn.request(RequestId(2)).expect("request");
+        assert!(again.bind_session(key(1)).is_pass());
+        assert!(
+            again.bind_lane(LaneClass::Bulk).is_deny(),
+            "the same caller, over"
+        );
+        let mut other = conn.request(RequestId(3)).expect("request");
+        assert!(other.bind_session(key(2)).is_pass());
+        assert!(other.bind_lane(LaneClass::Bulk).is_pass(), "another caller");
+        let mut page = conn.request(RequestId(4)).expect("request");
+        assert!(
+            page.bind_lane(LaneClass::Normal).is_pass(),
+            "no budget there"
+        );
     }
 }

@@ -123,6 +123,12 @@ impl Handoff {
     pub fn refuse(self, status: u16) -> Exit {
         self.p.refuse(status)
     }
+
+    /// [`refuse`](Self::refuse) with `Retry-After` or a close: the gateway
+    /// refusing a caller over its budget, for one.
+    pub fn refuse_with(self, refusal: crate::slot::Refusal) -> Exit {
+        self.p.refuse_with(refusal)
+    }
 }
 
 impl std::fmt::Debug for Handoff {

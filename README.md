@@ -152,6 +152,7 @@ fields = ["path", "referrer"]
 | `theme` | `site.theme` | its theme |
 | `content` | the profile's name | its content: a site of its own in nex-db, its own file with bison-db; `default` is the content from before profiles |
 | `realm` | `shared` | the accounts and sessions: `shared` (the site's realm, with `auth.admin`), or a name for a realm of its own; profiles naming the same realm share it |
+| `api` | `[api]` | the profile's own API, `[host.<name>.api]` with `enabled` and `prefix`; the budget is the process's |
 | `admin` | none | the boot account of a realm of its own. Its password comes from the realm's own variable, `WASP_ADMIN_PASSWORD_<REALM>` (`WASP_ADMIN_PASSWORD_BLOG` for `blog`), needed until it exists. It never takes `WASP_ADMIN_PASSWORD`, so one leaked password never opens another realm |
 
 An exact name wins over a wildcard, and the longest wildcard wins. A host belongs to one profile only. A host no profile names gets `[host] default`, or 421 when there is none, and never another profile's pages. A profile's `[host.<name>.errors.*]` and `[host.<name>.log_rule.*]` replace the top-level tables for its hosts; without them it uses `[errors]` and `[log_rule]`. The guest cache keeps every host's pages apart. A realm of its own has its own accounts, sessions, keys and account directory: a session of one realm is no one on a profile of another, and an account of one cannot sign in on the other. Without any `[host.*]` the site is the one `[site]` describes, as before.
@@ -211,6 +212,7 @@ With nex-db, every signed-in account has `/account/security`:
 - **Password.** Change it with the current one. Every other session ends.
 - **Sessions.** Every session of the account, with the device and address it signed in from, when it signed in and when it was last used. Sign out any one of them, or all but this one.
 - **Sign out everywhere.** Ends every session of the account, this one too, and forgets its remembered devices.
+- **API keys.** With the API on, make a key for a program, with a label, its scopes and an expiry, and revoke it. See [API](#api).
 - **Two-step sign-in.** Turn it on with an authenticator app and your password. You get the key to type in and its setup link, then a code to confirm, then recovery codes shown once. With it on, signing in asks for a code, or a recovery code, on a second page. "Don't ask on this device" skips the code for `auth.mfa.remember_device`. A password change, turning two-step off, signing out everywhere and "Forget remembered devices" undo that.
 
 An account with the `admin` role has `/admin/accounts`. It lists every account with its roles and standing, and disables or removes one, or enables one that is disabled or locked out (a ban stays). Disabling ends its sessions. Neither your own account nor the boot account can be changed there.
@@ -351,6 +353,39 @@ rate = 20
 
 Lines are written by the access log's thread, never by the worker serving the request. A line that can't be written in time is dropped and counted, and the rule's next line says how many were dropped (`dropped`). That covers a full queue, a rule over its rate, and a file that can't be written or rotated. The rules are read again on every reload, and a bad rule stops the boot or refuses the reload.
 
+## API
+
+With nex-db accounts, a site has a JSON API under `/api/v1`:
+
+| Request | Who | Answer |
+|---|---|---|
+| `GET /api/v1/me` | signed in; a key needs `account:read` | the account: `id`, `email`, `roles`, `signed_in_with` (`session` or `key`), and a key's `scopes` |
+| `GET /api/v1/posts` | anyone | the posts, newest first: `posts`, `total`, `limit` (1 to 100, default 20) and `offset` |
+| `GET /api/v1/posts/<slug>` | anyone | a post: title, summary, date, address, the body as HTML and as written, the search and sharing fields, the custom fields |
+| `GET /api/v1/pages/<slug>` | anyone | a page, the same way |
+
+A browser is signed in by its session cookie. A program sends a key:
+
+```bash
+curl -H "Authorization: Bearer <key>" https://example.com/api/v1/me
+```
+
+Keys are made and revoked on `/account/security`. A key has a label, its scopes and an expiry of 30, 90 or 365 days. Its text is shown once, on the page that made it. wasp never logs it or keeps it, and nex-db keeps only a keyed digest. A key acts with its account's roles cut down to its scopes, so it reads only what it was made for. It never reaches the account pages, the content editor or the admin pages, even when its account could, and it can't make more keys. Public content needs no scope. An account holds at most 20 keys. Changing the password or signing out everywhere leaves keys alone, so revoke them one by one.
+
+A request with a key is judged by the key alone. A key that is malformed, unknown, revoked or expired gets 401 `api.bad_key` on every API request, so a program knows at once that its key stopped working. A key whose account is disabled gets 403 `api.account_disabled`.
+
+Errors are JSON, with the same code, message and reference an error page shows, and they go to the log the same way:
+
+```json
+{"status":404,"code":"post.unknown","message":"There is nothing at this address.","reference":"fa6e3a6d3ffd6269"}
+```
+
+An unknown address under the prefix is 404 `api.not_found`, and any method but `GET` is 405 `api.method`. What the gateway refuses before the site runs (429, 503) is a plain answer.
+
+API requests run in the bulk lane, so under load they are refused before page views. Each caller has a budget of its own, `api.rate` requests a second in bursts of `api.burst`: a key, a signed-in browser, or a guest's address. Over it the answer is 429 with `Retry-After`, and no other caller slows down.
+
+`[api] prefix` moves the API and `[api] enabled = false` turns it off. A host profile sets its own in `[host.<name>.api]`. With the gatekeeper there is no API.
+
 ## Configuration
 
 A key wasp does not know, in any section, refuses the boot with its name, so a typo never leaves a setting at its default.
@@ -395,6 +430,10 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `auth.admin` | none | an account made at boot (given the `member`, `editor` and `admin` roles with nex-db, at every start); its password from `WASP_ADMIN_PASSWORD`, needed with nex-db only until the account exists |
 | `auth.secret` | `gate.key` beside `nex.path` with nex-db, else `<data folder>/gate.key` | the site's 32-byte master secret, made on the first run (owner-only on Unix), kept with the site's database so it follows the site and its backups: the gatekeeper's keys and, with nex-db, the forms' CSRF key come from it, so a form opened before a restart still posts after it. Move the file away (while stopped) to change it; open forms are then refused once |
 | `auth.origin` | `https://<first site.hosts entry>` | the site's origin, for the CSRF origin check (none on a development site: the token decides) |
+| `api.enabled` | true with nex-db accounts | the JSON API (none with the gatekeeper) |
+| `api.prefix` | `/api/v1` | where the API lives, under `site.base`; never a path the site uses (`/admin`, `/account`, `/posts`, ...) |
+| `api.rate` | 10 | API requests a second for each caller (a key, a browser's session, a guest's address); `0` for no budget. Read at boot |
+| `api.burst` | twice `api.rate` | the most at once after a quiet spell, at least `api.rate` |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`; refused unless `gateway.listen` is a loopback address) |
