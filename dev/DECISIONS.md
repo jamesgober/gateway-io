@@ -114,6 +114,33 @@ Left, with the reason:
 - **Spent sign-in steps are known to one process only** (G-69). A half-done sign-in is good once because the process that completes it records its nonce in memory. With more than one node behind the same site, a step cookie could be finished once on each node. Before WASP runs on several nodes, the spent set moves to the shared store (or is shared over relay-io), and the same goes for the per-address sign-in counts and the wrong-code counts.
 - **The default local port 8080 may be in use** on a shared machine; the boot then fails cleanly at phase 4 and unwinds the core (tested). Use `gateway.listen` or `WASP_CONFIG`.
 
+## Before beta (2026-11-20)
+
+What is left before the first real deploy on cPanel, and before calling it a beta. Each item says when it is done.
+
+### Before the first cPanel deploy
+
+- **Two-step sign-in in the static build.** The `mfa` feature brings crypt-io's C backend (AWS-LC), so the musl bundle CI makes has no TOTP. A site there cannot offer or require two-step sign-in, and `auth.mfa.enabled = true` stops its boot. The way out: crypt-io's `otp` in pure Rust, a `totp` feature in nex-db on it, and wasp's `mfa` mapped to that. Done when the CI bundle is built with `mfa`, and its release smoke turns two-step sign-in on and signs in with a code.
+- **Who may claim to be a proxy on a shared server.** Behind `PORT`, wasp trusts loopback as its front end, and any other account on the same server can reach that port and name any client in `X-Forwarded-For`. On plain http a client's own `X-Forwarded-Proto` is believed too. Done when the front end reaches wasp over a Unix socket checked by peer credentials (serve-net's `UnixPeerTrust`), or the host is shown to give each account its own network namespace. Until then, https is forced at Apache (the deploy checklist).
+- **The host itself.** Learn what the cPanel server offers: the Passenger version, whether a generic app (`passenger_app_start_command` with `$PORT`) runs, and whether a process may keep a loopback port. Then do one full dry run from `deploy/CPANEL.md` on that host: upload, start, sign in, restart, stop. Done when the steps in `deploy/CPANEL.md` match what the host did, with no step missing.
+- **Backups.** The site is the data folder: `nex/` and `gate.key` beside it. Done when a backup taken from the running site restores into a fresh folder and serves the same accounts, content and API keys, and the steps are in `deploy/CPANEL.md`.
+- **The API, before it is public.** The first deploy runs with `[api] enabled = false` until the API has had its security check and the fixes are in.
+
+### Before beta
+
+- **The launchd job, for real.** `deploy/launchd/com.example.wasp.plist` has been checked only as a property list. Done when, on a Mac, it starts the binary (`/health` 200), `launchctl kill SIGHUP` logs "configuration reloaded", and `launchctl bootout` stops it with exit code 0 in the log. In agent mode: copy it to `~/Library/LaunchAgents/` with its paths changed, make the log folder (`mkdir -m 700 -p /usr/local/var/log/wasp`), then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.wasp.plist`.
+- **nex-db guards wasp keeps for now.** wasp checks these itself, but nex-db should not rely on every application doing so: `issue_session` should refuse an account that may not sign in; adding TOTP should refuse while TOTP is on unless a code of the current secret is checked; `Session::id()` (G-78 pairs sessions by a per-account lock until then); a listing of an account's API keys (wasp keeps its own list until then); and API keys kept as a keyed hash rather than sealed, so a stolen database and its seal key give no key a program could use. Done when nex-db has each, and wasp drops its own copy of the guard (the pairing lock and the key list).
+- **Sign-in off the worker.** Argon2id runs on the reactor worker that holds the connection (37 to 64 ms here, two at once at most). Done when the offloading dispatcher (`Work::Cpu`) runs it, with a test that a page view on the same worker is answered while a sign-in hashes.
+- **Benchmarks against nginx and h2o.** The same machine, quiet, over loopback: a static file, a themed page, and a guest-cached page, at 1, 8 and 32 connections, reporting requests a second, p50, p99 and p99.9, three runs each, by the method in `MEASUREMENTS.md`. nginx and h2o are not on the build machine yet; containers are fine. Done when the table is in `MEASUREMENTS.md` with the versions and settings of all three servers.
+
+### Before more than one node
+
+- **Sign-in state that lives in one process.** The spent sign-in steps (G-69), the per-address sign-in counts and the wrong-code counts are in memory, so with two nodes a half-done sign-in could be finished once on each, and the limits would count per node. Done when they are kept in the shared store, or shared over relay-io.
+- **Pairing a new session with its id.** The per-account lock (G-78) is exact within one process only. Done with nex-db's `Session::id()`.
+- **The guest cache.** Each node drops its own copies when content changes. Done when a change on one node purges every node's copies (a purge over the coms bridge), with a test.
+- **The bouncer.** Bans, strikes and the API's budgets are per process, so a caller gets a budget on each node. Done when bans and lifts are shared between nodes, and a decision is written on whether budgets are shared or split per node.
+- **The database.** nex-db allows one process per database. Done when the accounts and content are served to every node (nex-db's split auth, or a store over the network behind the same traits), and wasp's stores are checked against it.
+
 ## Step 7 adapter (gatekeeper-io), agreed 2026-11-08
 
 Built on 2026-11-11 against gatekeeper-io 0.5, moved to 0.6 the same day with no code change (the in-memory stores are gatekeeper-io's own, so the new store-adapter methods do not reach this code; sessions end once on the upgrade) (G-31 to G-34). Two changes from the plan below: `duplicate_cookie_fields` is gone (several `Cookie` lines go to `Visit::cookie_lines`, and only a cookie name that appears twice is refused), and web-net's gate is a wrapper here rather than gatekeeper-io's own impl (web-net 0.7 there, 0.9 here).
