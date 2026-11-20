@@ -83,6 +83,7 @@ luminess::view!(Entry as "entry" {
     summary: text,
     body: html,
     date: text,
+    fields: list(object(crate::content::FieldValue)),
 });
 
 /// Site-wide values every page reads (`page.site`).
@@ -161,9 +162,59 @@ pub struct Editor {
     pub body: String,
     /// The search and sharing fields, as typed.
     pub meta: crate::content::Meta,
+    /// The declared custom fields of the entry's kind, with what was typed.
+    pub fields: Arc<Vec<Arc<FieldInput>>>,
     /// Whether the visitor manages the accounts (a link to them).
     pub admin: bool,
 }
+
+/// One declared custom field in the editor (`page.editor.fields`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldInput {
+    /// The form field's name (`f_<name>`).
+    pub name: String,
+    /// The label.
+    pub label: String,
+    /// The type (`text`, `textarea`, `url`, `number`, `bool`, `date`,
+    /// `select`, `media`).
+    pub kind: String,
+    /// What is in it.
+    pub value: String,
+    /// A save needs a value.
+    pub required: bool,
+    /// A line of help.
+    pub help: String,
+    /// A `select`'s options.
+    pub options: Vec<Choice>,
+}
+
+/// One option of a `select` field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Choice {
+    /// The option.
+    pub value: String,
+    /// It is the field's value.
+    pub selected: bool,
+}
+
+luminess::view!(Choice as "choice" { value: text, selected: bool });
+
+luminess::view!(FieldInput as "field" {
+    name: text,
+    label: text,
+    kind: text,
+    value: text,
+    required: bool,
+    help: text,
+    options: list(object(Choice)),
+});
+
+luminess::view!(crate::content::FieldValue as "field_value" {
+    name: text,
+    label: text,
+    kind: text,
+    value: text,
+});
 
 luminess::view!(Editor as "editor" {
     entries: list(object(Entry)),
@@ -182,6 +233,7 @@ luminess::view!(Editor as "editor" {
     date: text,
     body: text,
     meta: object(crate::content::Meta),
+    fields: list(object(FieldInput)),
     admin: bool,
 });
 

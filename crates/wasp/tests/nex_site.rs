@@ -417,6 +417,85 @@ fn meta_of(body: &str, attr: &str) -> Option<String> {
 }
 
 #[test]
+fn declared_fields_are_edited_kept_and_shown() {
+    let data = temp_dir("fields");
+    let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    let conf = Config::from_text(&format!(
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n\n[auth]\nstore = \"nex\"\n\n[content]\nstore = \"nex\"\n\n[nex]\npath = \"{}\"\n\n\
+         [content.fields.post.author]\ntype = \"text\"\nlabel = \"Author\"\nrequired = true\nhelp = \"Who wrote it\"\norder = 1\n\n\
+         [content.fields.post.size]\ntype = \"select\"\nlabel = \"Size\"\noptions = [\"small\", \"large\"]\norder = 2\n\n\
+         [content.fields.post.featured]\ntype = \"bool\"\nlabel = \"Featured\"\norder = 3\n\n\
+         [content.fields.post.source]\ntype = \"url\"\nlabel = \"Source\"\norder = 4\n",
+        slash(&theme),
+        slash(&data.0.join("nex"))
+    ))
+    .expect("config");
+    let (door, addr) = open(&conf);
+    let ed = sign_in_as(addr, EDITOR);
+    let blank = get(addr, "/admin/new/post", &[&ed]);
+    assert!(blank.body.contains("name=\"f_author\""), "{}", blank.body);
+    assert!(blank.body.contains("Who wrote it"), "{}", blank.body);
+    assert!(
+        blank
+            .body
+            .contains("<option value=\"large\">large</option>"),
+        "{}",
+        blank.body
+    );
+    let csrf = blank.csrf();
+    let save = |extra: &str| {
+        post(
+            addr,
+            "/admin/save",
+            &[&ed],
+            "same-origin",
+            &format!(
+                "{}{extra}",
+                entry_body("post", "fielded", "", "With fields", "Body.", &csrf)
+            ),
+        )
+    };
+    let missing = save("&f_size=small");
+    assert_eq!(missing.status, 422, "author is required: {missing:?}");
+    assert!(
+        missing.body.contains("Author is required"),
+        "{}",
+        missing.body
+    );
+    assert!(
+        missing.body.contains("<option value=\"small\" selected>"),
+        "kept: {}",
+        missing.body
+    );
+    let bad = save("&f_author=Ann&f_size=huge");
+    assert_eq!(bad.status, 422);
+    assert!(bad.body.contains("Size must be one of"), "{}", bad.body);
+    let unknown = save("&f_author=Ann&f_colour=red");
+    assert_eq!(unknown.status, 422, "{unknown:?}");
+    let saved = save("&f_author=Ann+Smith&f_size=large&f_featured=true&f_source=%2Fabout");
+    assert_eq!(saved.status, 303, "{saved:?}");
+
+    let page = get(addr, "/posts/fielded", &[]).body;
+    assert!(page.contains("<dt>Author</dt><dd>Ann Smith</dd>"), "{page}");
+    assert!(page.contains("<dt>Size</dt><dd>large</dd>"), "{page}");
+    assert!(page.contains("<dt>Featured</dt><dd>yes</dd>"), "{page}");
+    assert!(
+        page.contains("<dt>Source</dt><dd><a href=\"/about\">/about</a></dd>"),
+        "{page}"
+    );
+    let form = get(addr, "/admin/edit/fielded", &[&ed]).body;
+    assert!(form.contains("value=\"Ann Smith\""), "{form}");
+    assert!(form.contains("value=\"true\" checked"), "{form}");
+    let _ = door.close(Duration::from_secs(2));
+
+    // Kept by the store across a restart.
+    let (door, addr) = open(&conf);
+    let page = get(addr, "/posts/fielded", &[]).body;
+    assert!(page.contains("<dt>Author</dt><dd>Ann Smith</dd>"), "{page}");
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
 fn the_editor_sets_the_search_and_sharing_fields() {
     let data = temp_dir("meta");
     let conf = config(&data.0);

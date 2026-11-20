@@ -227,8 +227,9 @@ pub fn import(
     let mut notices = Vec::new();
     let store = open_store(config, data_dir, &mut notices, &mut Shared::default())?;
     let settings = site::SiteSettings::from_config(config)?;
-    let mut manifest =
-        content::Manifest::open(store.clone(), &settings.base, false).map_err(|e| e.to_string())?;
+    let fields = content::Fields::from_config(config)?;
+    let mut manifest = content::Manifest::open_with(store.clone(), &settings.base, false, fields)
+        .map_err(|e| e.to_string())?;
     let report = import::import_into(&mut manifest, from)?;
     store.flush().map_err(|e| e.0)?;
     Ok(report)
@@ -321,7 +322,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "theme_poll",
         ],
     ),
-    ("content", &["path", "recovery", "store"]),
+    ("content", &["fields", "path", "recovery", "store"]),
     (
         "auth",
         &[
@@ -565,8 +566,13 @@ fn wire_with(
         .get_or("gateway.stage_timing", false)
         .map_err(|e| e.to_string())?;
     let stages = Arc::new(gateway_io::StageTimes::new(timing));
-    let manifest =
-        content::Manifest::open(store, &settings.base, true).map_err(|e| e.to_string())?;
+    let manifest = content::Manifest::open_with(
+        store,
+        &settings.base,
+        true,
+        content::Fields::from_config(config)?,
+    )
+    .map_err(|e| e.to_string())?;
     let purge = guest_pages.clone();
     let manifest = content::Content::new(manifest).on_change(move || purge.purge());
     let admin = theme::load_admin(&settings.admin_theme).map_err(|e| e.0)?;

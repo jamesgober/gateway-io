@@ -89,6 +89,11 @@ fn imported_files_are_served_after_a_boot() {
     write(&from.0, "posts/typo.md", "tilte: Typo\n\nx\n");
     write(
         &from.0,
+        "posts/undeclared.md",
+        "title: Undeclared\ndate: 2026-11-18\nf_colour: red\n\nx\n",
+    );
+    write(
+        &from.0,
         "posts/bad-robots.md",
         "title: Bad robots\ndate: 2026-11-18\nrobots: noarchive\n\nx\n",
     );
@@ -96,7 +101,14 @@ fn imported_files_are_served_after_a_boot() {
 
     let report = wasp::import(&conf, &data.0, &from.0).expect("import");
     assert_eq!(report.saved, ["from-a-file", "colophon"], "{report:?}");
-    assert_eq!(report.refused.len(), 4, "{report:?}");
+    assert_eq!(report.refused.len(), 5, "{report:?}");
+    assert!(
+        report
+            .refused
+            .iter()
+            .any(|(_, why)| why.contains("no field `colour`")),
+        "{report:?}"
+    );
 
     // Imported again: replaced, not added twice.
     let again = wasp::import(&conf, &data.0, &from.0).expect("again");

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  wasp on macOS, started by launchd. See "Start at boot" in the README.
+
+  As a launch agent (starts when you log in, runs as you):
+    ~/Library/LaunchAgents/com.example.wasp.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.wasp.plist
+
+  As a launch daemon (starts at boot, no login): add a UserName key with the
+  account to run as, copy to /Library/LaunchDaemons/ (owned by root, mode
+  644), then: sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.wasp.plist
+
+  Change the label to your own reverse domain name, and the paths to where
+  wasp and its configuration are.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.wasp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/wasp/wasp</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/usr/local/wasp</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WASP_CONFIG</key>
+        <string>/usr/local/wasp/wasp.conf</string>
+    </dict>
+
+    <!-- Start at load (login or boot), and again after a crash or a failed
+         start, but not after a clean stop. A start that fails waits
+         ThrottleInterval seconds before the next try. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- launchd sends SIGTERM to stop it: wasp closes the door, drains
+         (gateway.drain, 10 s by default), then stops. SIGKILL comes after
+         this many seconds. -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <!-- Standard error (the log, with log.file = false). Make the folder
+         first, private to the account: mkdir -m 700 -p /usr/local/var/log/wasp -->
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/wasp/wasp.log</string>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/wasp/wasp.log</string>
+
+    <key>Umask</key>
+    <integer>63</integer>
+</dict>
+</plist>

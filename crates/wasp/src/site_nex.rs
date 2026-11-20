@@ -31,7 +31,7 @@ use crate::content::{Content, Draft, Entry, Kind, Meta, SaveError, StoreError};
 use crate::nex::{NexAuth, NexToken, PRE_COOKIE, SESSION_COOKIE, cookie};
 use crate::site::{Pages, SiteSettings, configure, content_routes, query_value};
 use crate::site_account::{Accounts, CookieKeys};
-use crate::theme::{Editor, Form, SiteEngine};
+use crate::theme::{Choice, Editor, FieldInput, Form, SiteEngine};
 
 /// The permission the account page needs (the `member` role's bit).
 pub const MEMBER: PermSet = PermSet(1);
@@ -113,43 +113,112 @@ pub type NexApp = App<NexGate, SiteEngine>;
 /// A route on this site.
 pub type NexRoute = Route<NexWho, Rule, SiteEngine>;
 
-form_net::form! {
-    /// The entry form (web-net checked its `csrf_token` before the handler).
-    struct EntryForm {
-        kind: String,
-        slug: String,
-        was: String,
-        title: String,
-        summary: String,
-        date: String,
-        body: String,
-        seo_title: Option<String>,
-        description: Option<String>,
-        og_title: Option<String>,
-        og_description: Option<String>,
-        canonical: Option<String>,
-        robots: Option<String>,
-        og_image: Option<String>,
-        twitter_card: Option<String>,
+/// The entry form (web-net checked its `csrf_token` before the handler):
+/// the built-in fields, the search and sharing fields, and the declared
+/// custom fields (`f_<name>`), each at most once. Written by hand so the
+/// custom fields, which the configuration declares, come through; any other
+/// name is refused.
+#[derive(Debug, Default)]
+struct EntryForm {
+    kind: String,
+    slug: String,
+    was: String,
+    title: String,
+    summary: String,
+    date: String,
+    body: String,
+    meta: Meta,
+    fields: Vec<(String, String)>,
+}
+
+/// The most custom fields one save carries.
+const FORM_FIELDS: usize = 2 * crate::content::MAX_FIELDS;
+
+#[derive(Default)]
+struct EntryFormBuilder {
+    form: EntryForm,
+    seen: std::collections::HashSet<String>,
+}
+
+impl form_net::FormBuilder for EntryFormBuilder {
+    type Output = EntryForm;
+
+    fn text(&mut self, name: &str, value: &str) -> Result<(), form_net::FormError> {
+        use form_net::{ExtractError, FormError};
+        let refuse = |reason| FormError::Extract {
+            reason,
+            field: None,
+        };
+        if name == "csrf_token" {
+            return Ok(());
+        }
+        if !self.seen.insert(name.to_owned()) {
+            return Err(refuse(ExtractError::Duplicate));
+        }
+        let f = &mut self.form;
+        let slot = match name {
+            "kind" => &mut f.kind,
+            "slug" => &mut f.slug,
+            "was" => &mut f.was,
+            "title" => &mut f.title,
+            "summary" => &mut f.summary,
+            "date" => &mut f.date,
+            "body" => &mut f.body,
+            other => {
+                if let Some(m) = f.meta.get_mut(other) {
+                    m
+                } else if let Some(custom) = other.strip_prefix(crate::content::FIELD_PREFIX) {
+                    if f.fields.len() >= FORM_FIELDS {
+                        return Err(refuse(ExtractError::Invalid("too many fields")));
+                    }
+                    f.fields.push((custom.to_owned(), value.to_owned()));
+                    return Ok(());
+                } else {
+                    return Err(refuse(ExtractError::Unknown));
+                }
+            }
+        };
+        value.clone_into(slot);
+        Ok(())
     }
-    ignore = ["csrf_token"];
+
+    fn file(
+        &mut self,
+        _name: &str,
+        _file: form_net::FileValue<'_>,
+    ) -> Result<(), form_net::FormError> {
+        Err(form_net::FormError::Extract {
+            reason: form_net::ExtractError::WrongKind,
+            field: None,
+        })
+    }
+
+    fn finish(self) -> Result<EntryForm, form_net::FormError> {
+        for required in ["kind", "slug", "title", "body"] {
+            if !self.seen.contains(required) {
+                return Err(form_net::FormError::Extract {
+                    reason: form_net::ExtractError::Missing,
+                    field: Some(match required {
+                        "kind" => "kind",
+                        "slug" => "slug",
+                        "title" => "title",
+                        _ => "body",
+                    }),
+                });
+            }
+        }
+        Ok(self.form)
+    }
+}
+
+impl form_net::FromForm for EntryForm {
+    type Builder = EntryFormBuilder;
 }
 
 impl EntryForm {
-    /// The search and sharing fields as typed (a field the form left out
-    /// is empty).
+    /// The search and sharing fields as typed.
     fn meta(&self) -> Meta {
-        let f = |v: &Option<String>| v.clone().unwrap_or_default();
-        Meta {
-            seo_title: f(&self.seo_title),
-            description: f(&self.description),
-            og_title: f(&self.og_title),
-            og_description: f(&self.og_description),
-            canonical: f(&self.canonical),
-            robots: f(&self.robots),
-            og_image: f(&self.og_image),
-            twitter_card: f(&self.twitter_card),
-        }
+        self.meta.clone()
     }
 }
 
@@ -178,6 +247,43 @@ fn editor(cx: &mut NexCx<'_>, pages: &Pages) -> Result<Editor, web_net::Error> {
         admin: cx.identity().identity.perms().contains(ADMIN),
         ..Editor::default()
     })
+}
+
+/// The editor with the declared fields of `kind`, filled from `values`.
+fn with_fields(editor: Editor, pages: &Pages, kind: Kind, values: &[(String, String)]) -> Editor {
+    let snapshot = pages.content.snapshot();
+    let inputs = snapshot
+        .fields()
+        .of(kind)
+        .iter()
+        .map(|d| {
+            let value = values
+                .iter()
+                .find(|(n, _)| *n == d.name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            Arc::new(FieldInput {
+                name: format!("{}{}", crate::content::FIELD_PREFIX, d.name),
+                label: d.label.clone(),
+                kind: d.kind.as_str().to_owned(),
+                options: d
+                    .options
+                    .iter()
+                    .map(|o| Choice {
+                        value: o.clone(),
+                        selected: *o == value,
+                    })
+                    .collect(),
+                value,
+                required: d.required,
+                help: d.help.clone(),
+            })
+        })
+        .collect();
+    Editor {
+        fields: Arc::new(inputs),
+        ..editor
+    }
 }
 
 /// The editor's form filled in from a stored entry.
@@ -232,11 +338,21 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
             "page" => ("New page", String::new()),
             _ => return Err(web_net::Error::not_found("admin.kind")),
         };
-        let view = Editor {
-            kind,
-            date,
-            ..editor(cx, &p)?
+        let of = if kind == "post" {
+            Kind::Post
+        } else {
+            Kind::Page
         };
+        let view = with_fields(
+            Editor {
+                kind,
+                date,
+                ..editor(cx, &p)?
+            },
+            &p,
+            of,
+            &[],
+        );
         cx.render(&p.editor_page(title, view))
     })
     .allow(EDITING)
@@ -254,7 +370,17 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
                 "No post or page has that slug. It may have been renamed or removed.",
             ));
         };
-        let view = filled(editor(cx, &p)?, &entry);
+        let values: Vec<(String, String)> = entry
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.value.clone()))
+            .collect();
+        let of = if entry.kind == "post" {
+            Kind::Post
+        } else {
+            Kind::Page
+        };
+        let view = with_fields(filled(editor(cx, &p)?, &entry), &p, of, &values);
         cx.render(&p.editor_page(&format!("Edit {}", entry.title), view))
     })
     .allow(EDITING)
@@ -277,6 +403,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
             body: &form.body,
             date: form.date.trim(),
             meta: form.meta(),
+            fields: form.fields.clone(),
         };
         let was = form.was.trim();
         match p.content.save(&draft, (!was.is_empty()).then_some(was)) {
@@ -296,6 +423,7 @@ fn editor_routes(pages: &Pages) -> [NexRoute; 5] {
                     meta: form.meta(),
                     ..editor(cx, &p)?
                 };
+                let view = with_fields(view, &p, kind, &form.fields);
                 cx.status(422);
                 cx.render(&p.editor_page("Not saved", view))
             }
