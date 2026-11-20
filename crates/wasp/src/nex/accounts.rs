@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use nex_db::Patch;
 use wasp_core::UserId;
 
-use super::{DIRECTORY, MAX_ENTRIES, NexAuth, StoreError, StoreErrorKind, account_of, hex_of, nex};
+use super::{MAX_ENTRIES, NexAuth, StoreError, StoreErrorKind, account_of, hex_of, nex};
 use crate::policy::Rules;
 use wasp_core::SessionId;
 
@@ -216,7 +216,7 @@ impl NexAuth {
     fn entry(&self, user: UserId) -> Result<Option<(nex_db::EntityId, nex_db::Entry)>, StoreError> {
         let content = self.db.db().content();
         let path = format!("/{}", hex_of(account_of(user)));
-        let Some(route) = content.resolve(DIRECTORY, &path).map_err(nex)? else {
+        let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? else {
             return Ok(None);
         };
         let rid = route.entity();
@@ -292,7 +292,7 @@ impl NexAuth {
     /// a recovery code. Wrong codes count toward the lockout.
     pub fn check_code(&self, user: UserId, code: &str) -> Result<CodeCheck, StoreError> {
         let account = account_of(user);
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         if !self.may_sign_in(user)? {
             return Ok(CodeCheck::Blocked);
         }
@@ -323,7 +323,7 @@ impl NexAuth {
 
     #[cfg(feature = "mfa")]
     fn app_code_good(&self, account: nex_db::AccountId, code: &str) -> Result<bool, StoreError> {
-        self.db.db().auth().check_totp(account, code).map_err(nex)
+        self.auth()?.check_totp(account, code).map_err(nex)
     }
 
     #[cfg(not(feature = "mfa"))]
@@ -365,7 +365,7 @@ impl NexAuth {
         if let Some(why) = self.rules(user)?.refuse(new) {
             return Ok(Err(why));
         }
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let hashed = auth.hash_password(new).map_err(nex)?;
         let account = account_of(user);
         auth.set_password(account, &hashed).map_err(nex)?;
@@ -385,7 +385,7 @@ impl NexAuth {
     ) -> Result<(), StoreError> {
         let content = self.db.db().content();
         let entity = nex_db::Entity::new(SESSION_KIND)
-            .site(DIRECTORY)
+            .site(self.directory.as_ref())
             .path(format!("/{}/s/{id}", hex_of(account_of(user))))
             .field("token", format!("{:032x}", token.0))
             .field("device", from.device.as_str())
@@ -408,12 +408,12 @@ impl NexAuth {
     ) -> Result<Vec<SessionRow>, StoreError> {
         let account = account_of(user);
         let content = self.db.db().content();
-        let live = self.db.db().auth().sessions(account).map_err(nex)?;
+        let live = self.auth()?.sessions(account).map_err(nex)?;
         let prefix = format!("/{}/s/", hex_of(account));
         let mut rows = Vec::with_capacity(live.len());
         for s in &live {
             let path = format!("{prefix}{}", s.id());
-            let record = match content.resolve(DIRECTORY, &path).map_err(nex)? {
+            let record = match content.resolve(&self.directory, &path).map_err(nex)? {
                 Some(route) => content.get(route.entity()).map_err(nex)?,
                 None => None,
             };
@@ -438,7 +438,7 @@ impl NexAuth {
         let mut page = content
             .list(
                 &nex_db::Listing::latest(SESSION_KIND)
-                    .site(DIRECTORY)
+                    .site(self.directory.as_ref())
                     .limit(1000),
             )
             .map_err(nex)?;
@@ -479,7 +479,7 @@ impl NexAuth {
             .map_err(nex)?;
         let content = self.db.db().content();
         let path = format!("/{}/s/{sid}", hex_of(account));
-        if let Some(route) = content.resolve(DIRECTORY, &path).map_err(nex)? {
+        if let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? {
             let _ = content.delete(route.entity());
         }
         Ok(ended)
@@ -540,7 +540,7 @@ impl NexAuth {
     ) -> Result<Option<Vec<String>>, StoreError> {
         let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
         let account = account_of(user);
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         if !app_code(&code) || !auth.confirm_totp(account, &code).map_err(nex)? {
             return Ok(None);
         }
@@ -577,7 +577,7 @@ impl NexAuth {
 
     /// Every account, for the administrator.
     pub fn account_rows(&self) -> Result<Vec<AccountRow>, StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let mut rows = Vec::new();
         for (identifier, user) in self.accounts()? {
             let account = account_of(user);
@@ -605,7 +605,7 @@ impl NexAuth {
     /// Disables `user` until enabled: every session it holds ends, and its
     /// remembered devices are forgotten.
     pub fn disable(&self, user: UserId, by: UserId) -> Result<(), StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let account = account_of(user);
         auth.set_standing(
             account,
@@ -624,7 +624,7 @@ impl NexAuth {
     /// nothing changed, for any other standing (a ban, an unverified account
     /// stay as they are).
     pub fn enable(&self, user: UserId, by: UserId) -> Result<bool, StoreError> {
-        let auth = self.db.db().auth();
+        let auth = self.auth()?;
         let account = account_of(user);
         if !matches!(
             auth.standing(account).map_err(nex)?,

@@ -51,6 +51,12 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn open(conf: &Config) -> (Door, SocketAddr) {
+    let (door, addr, _) = open_db(conf);
+    (door, addr)
+}
+
+/// [`open`], with the database (for accounts in another realm).
+fn open_db(conf: &Config) -> (Door, SocketAddr, wasp::nex::NexDb) {
     let t = Instant::now();
     let wiring = loop {
         match wasp::wire(conf) {
@@ -64,7 +70,14 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
             Err(e) => panic!("wiring: {e}"),
         }
     };
-    let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
+    serve(wiring)
+}
+
+/// The site `wiring` built, open on a loopback port, with the editor in the
+/// shared realm.
+fn serve(wiring: wasp::Wiring) -> (Door, SocketAddr, wasp::nex::NexDb) {
+    let db = wiring.nex.clone().expect("nex-db");
+    let auth = NexAuth::new(db.clone());
     auth.ensure_account(EDITOR, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
         .expect("editor");
     let mut web = WebServices::new();
@@ -78,7 +91,7 @@ fn open(conf: &Config) -> (Door, SocketAddr) {
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     let addr = door.local_addr().expect("addr");
-    (door, addr)
+    (door, addr, db)
 }
 
 #[derive(Debug)]
@@ -176,6 +189,12 @@ fn encode(s: &str) -> String {
 }
 
 fn sign_in(addr: SocketAddr, host: &str) -> String {
+    sign_in_as(addr, host, EDITOR, PASSWORD).expect("signed in")
+}
+
+/// A sign-in on `host`: the session cookie, or the status it was refused
+/// with.
+fn sign_in_as(addr: SocketAddr, host: &str, email: &str, password: &str) -> Result<String, u16> {
     let first = get(addr, host, "/sign-in", &[]);
     assert_eq!(first.status, 303, "{first:?}");
     let pre = first.cookie("__Host-nexpre").expect("pre");
@@ -187,16 +206,23 @@ fn sign_in(addr: SocketAddr, host: &str) -> String {
         &[&pre],
         &format!(
             "email={}&password={}&csrf_token={}",
-            encode(EDITOR),
-            encode(PASSWORD),
+            encode(email),
+            encode(password),
             encode(&page.csrf())
         ),
     );
-    assert_eq!(done.status, 303, "{done:?}");
-    done.cookie("__Host-nex").expect("session")
+    match done.cookie("__Host-nex") {
+        Some(c) if done.status == 303 => Ok(c),
+        _ => Err(done.status),
+    }
 }
 
 fn config(data: &Path, extra: &str) -> Config {
+    config_with(data, "", extra)
+}
+
+/// [`config`], with `blog_extra` added to the blog profile's table.
+fn config_with(data: &Path, blog_extra: &str, extra: &str) -> Config {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     let blog = data.join("blog-theme");
     copy_dir(&theme, &blog);
@@ -208,7 +234,7 @@ fn config(data: &Path, extra: &str) -> Config {
         "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n\
          [errors.404]\nmessage = \"Nothing at this address.\"\n\
          [host.main]\nhosts = [\"main.test\"]\ncontent = \"default\"\n\
-         [host.blog]\nhosts = [\"blog.test\", \"*.blog.test\"]\nname = \"The Blog\"\ntheme = \"{}\"\ncontent = \"blog\"\n\
+         [host.blog]\nhosts = [\"blog.test\", \"*.blog.test\"]\nname = \"The Blog\"\ntheme = \"{}\"\ncontent = \"blog\"\n{blog_extra}\
          [host.blog.errors.404]\nmessage = \"No such post.\"\n{extra}",
         slash(&theme),
         slash(&data.join("nex")),
@@ -282,5 +308,113 @@ fn a_default_profile_takes_the_hosts_no_profile_names() {
     let other = get(addr, "other.test", "/", &[]);
     assert_eq!(other.status, 200, "{other:?}");
     assert!(!other.body.contains("blog theme"));
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_realm_of_its_own_keeps_its_accounts_and_sessions_apart() {
+    const BLOGGER: &str = "blogger@example.com";
+    let data = temp_dir("realms");
+    let conf = config_with(&data.0, "realm = \"blog\"\n", "");
+    let (door, addr, db) = open_db(&conf);
+    NexAuth::new(db)
+        .in_realm("blog")
+        .expect("realm")
+        .ensure_account(BLOGGER, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
+        .expect("blogger");
+
+    // The main realm's account signs in on main, not on the blog.
+    let ed = sign_in(addr, "main.test");
+    assert_eq!(get(addr, "main.test", "/account", &[&ed]).status, 200);
+    assert_eq!(
+        get(addr, "blog.test", "/account", &[&ed]).status,
+        303,
+        "a main session is no one on the blog"
+    );
+    assert_eq!(sign_in_as(addr, "blog.test", EDITOR, PASSWORD), Err(401));
+
+    // And the other way round.
+    let blogger = sign_in_as(addr, "blog.test", BLOGGER, PASSWORD).expect("blog sign-in");
+    assert_eq!(get(addr, "blog.test", "/account", &[&blogger]).status, 200);
+    assert_eq!(
+        get(addr, "ann.blog.test", "/account", &[&blogger]).status,
+        200
+    );
+    assert_eq!(get(addr, "main.test", "/account", &[&blogger]).status, 303);
+    assert_eq!(sign_in_as(addr, "main.test", BLOGGER, PASSWORD), Err(401));
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_realm_s_boot_account_takes_its_own_password_only() {
+    const BOSS: &str = "boss@example.com";
+    const MAIN_PASSWORD: &str = "the main site password";
+    const BLOG_PASSWORD: &str = "the blog realm password";
+    let data = temp_dir("realm-admin");
+    let conf = config_with(
+        &data.0,
+        &format!("realm = \"blog\"\nadmin = \"{BOSS}\"\n"),
+        "",
+    );
+    // The main password is never used for a realm of its own.
+    let refused = wasp::wire_with_passwords(&conf, Some(MAIN_PASSWORD), &|_| None)
+        .expect_err("no realm password");
+    assert!(refused.contains("WASP_ADMIN_PASSWORD_BLOG"), "{refused}");
+    assert_eq!(wasp::admin_password_env("blog"), "WASP_ADMIN_PASSWORD_BLOG");
+
+    let wiring = wasp::wire_with_passwords(&conf, Some(MAIN_PASSWORD), &|realm| {
+        (realm == "blog").then(|| BLOG_PASSWORD.to_owned())
+    })
+    .expect("wiring");
+    let (door, addr, _) = serve(wiring);
+    assert!(sign_in_as(addr, "blog.test", BOSS, BLOG_PASSWORD).is_ok());
+    assert_eq!(sign_in_as(addr, "blog.test", BOSS, MAIN_PASSWORD), Err(401));
+    assert_eq!(sign_in_as(addr, "main.test", BOSS, BLOG_PASSWORD), Err(401));
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn every_cookie_is_host_only() {
+    let data = temp_dir("cookies");
+    let conf = config(&data.0, "");
+    let (door, addr) = open(&conf);
+    let mut set: Vec<String> = Vec::new();
+    let mut keep = |g: &Got| {
+        set.extend(
+            g.fields
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, v)| v.clone()),
+        );
+    };
+    let first = get(addr, "blog.test", "/sign-in", &[]);
+    keep(&first);
+    let pre = first.cookie("__Host-nexpre").expect("pre");
+    let page = get(addr, "blog.test", "/sign-in", &[&pre]);
+    let done = post(
+        addr,
+        "blog.test",
+        "/sign-in",
+        &[&pre],
+        &format!(
+            "email={}&password={}&csrf_token={}",
+            encode(EDITOR),
+            encode(PASSWORD),
+            encode(&page.csrf())
+        ),
+    );
+    keep(&done);
+    let session = done.cookie("__Host-nex").expect("session");
+    let out = get(addr, "blog.test", "/account/security", &[&session]);
+    keep(&out);
+    assert!(set.len() >= 3, "{set:?}");
+    for c in &set {
+        assert!(c.starts_with("__Host-"), "{c}");
+        assert!(
+            !c.to_ascii_lowercase().contains("domain="),
+            "no Domain: {c}"
+        );
+        assert!(c.contains("Path=/") && c.contains("Secure"), "{c}");
+    }
     let _ = door.close(Duration::from_secs(2));
 }
