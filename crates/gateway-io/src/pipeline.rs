@@ -261,6 +261,9 @@ impl Pipeline {
                         // `public` web-net adds stays overruled by `no-store`.
                         reply.header("cache-control", "private, no-store");
                     }
+                    if let wasp_core::Subject::User(u) = h.identity().subject() {
+                        crate::note::set_user(u.0);
+                    }
                     let caller = Caller::new(h.identity(), h.token_any());
                     let answered = web.respond(req, env, &caller, reply);
                     let outcome = answered.outcome;
@@ -490,7 +493,8 @@ impl HttpService for Pipeline {
         let line = self
             .access
             .as_ref()
-            .map(|_| Line::new(head.method_str(), head.path()));
+            .and_then(|a| a.capture())
+            .map(|wants| Line::of(head, wants));
         match self.tickets.hold_at(env.worker().get(), ticket, hook, line) {
             Some(tag) => {
                 env.set_user_word(tag.get());
@@ -505,7 +509,16 @@ impl HttpService for Pipeline {
         // (`note::path_under`); what it notes is taken when the call ends.
         crate::note::begin(req.path());
         let outcome = self.call_noted(req, env, reply);
-        let _ = crate::note::end();
+        if let Some(note) = crate::note::end()
+            && self.access.is_some()
+            && env.user_word() != 0
+        {
+            self.tickets.set_note(
+                env.worker().get(),
+                TicketTag::from_raw(env.user_word()),
+                note,
+            );
+        }
         outcome
     }
 

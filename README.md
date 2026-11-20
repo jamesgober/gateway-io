@@ -283,6 +283,36 @@ return Err(site::fail(cx, 410, "content.gone", "This post was taken down."));
 
 A status outside 400 to 599 there is a 500 with the code `site.bad_status`.
 
+## Log rules
+
+`[log_rule.<name>]` writes a line for the requests that end with chosen statuses, with chosen fields, to the log or a file of its own:
+
+```toml
+[log_rule.server_errors]
+codes = ["5xx"]
+fields = ["client", "method", "path", "status", "code", "message", "user", "request"]
+
+[log_rule.broken_links]
+codes = ["404"]
+fields = ["path", "referrer"]
+destination = "file:/var/log/wasp/404.log"
+rate = 20
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `codes` | required | statuses (`"404"`) or classes (`"5xx"`), from 100 to 599 |
+| `fields` | `client`, `method`, `path`, `status`, `code`, `request` | any of `client`, `method`, `path`, `query`, `status`, `code`, `message`, `user`, `user_agent`, `referrer`, `request` |
+| `include_query` | false | the query is written only when this is true, whatever `fields` says |
+| `destination` | `log` | `log` (info for 1xx to 4xx, warn for 5xx) or `file:<path>` (one JSON line per request, owner-only) |
+| `max_size` | 10485760 | a file's size before it is rotated (to `<path>.1`, `<path>.2`, ...), in bytes: 64 KiB to 1 GiB |
+| `keep` | 5 | rotated files kept, 0 to 100 |
+| `rate` | 100 | lines a second at most, `0` for no cap |
+
+`client` is the address the door judges: the peer, or the forwarded address only when the peer is one of `gateway.trusted_proxies`. A forwarded header from anyone else is never written. `code` and `message` are what the site said (`site::fail`, or web-net's error code), `request` is the reference the visitor's error page shows, and `user` is the account id, never an email. The user agent and referrer are cut to 256 bytes and the query to 512.
+
+Lines are written by the access log's thread, never by the worker serving the request. A line that can't be written in time is dropped and counted, and the rule's next line says how many were dropped (`dropped`). That covers a full queue, a rule over its rate, and a file that can't be written or rotated. The rules are read again on every reload, and a bad rule stops the boot or refuses the reload.
+
 ## Configuration
 
 A key wasp does not know, in any section, refuses the boot with its name, so a typo never leaves a setting at its default.

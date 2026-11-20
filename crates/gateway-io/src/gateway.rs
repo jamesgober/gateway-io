@@ -296,6 +296,9 @@ pub struct Gateway {
     /// The settings in force: written at start and by a reload's commit.
     applied: Arc<Mutex<Settings>>,
     stages: Option<Arc<StageTimes>>,
+    /// The access log and the log rules, with whether the access line is on
+    /// (set at start; a reload swaps the rules).
+    access: Option<(Arc<AccessLog>, bool)>,
 }
 
 impl Gateway {
@@ -309,6 +312,7 @@ impl Gateway {
             link: None,
             applied: Arc::new(Mutex::new(Settings::default())),
             stages: None,
+            access: None,
         }
     }
 
@@ -349,11 +353,12 @@ impl Subsystem for Gateway {
             .take()
             .ok_or_else(|| Failure::new("a web service names no service the core declares"))?;
         let events: Arc<dyn EventSink> = LogSink::spawn(link.foundation().clone())?;
-        let access = if settings.access_log {
-            Some(AccessLog::spawn(link.foundation().clone())?)
-        } else {
-            None
-        };
+        let rules = crate::rules::LogRules::from_config(&link.foundation().config())
+            .map_err(Failure::new)?;
+        // Always there: a reload can add the first rule.
+        let access = AccessLog::spawn(link.foundation().clone(), settings.access_log, rules)?;
+        self.access = Some((access.clone(), settings.access_log));
+        let access = Some(access);
         let open = Door::open_with(
             self.core.clone(),
             &settings,
@@ -447,6 +452,8 @@ impl Subsystem for Gateway {
     /// next start and is logged as such.
     fn reload(&mut self, config: &Config) -> Result<Commit, Failure> {
         let next = Settings::from_config(config)?;
+        let rules = crate::rules::LogRules::from_config(config).map_err(Failure::new)?;
+        let access = self.access.clone();
         let (Some(open), Some(link)) = (&self.open, &self.link) else {
             return Ok(Commit::none());
         };
@@ -498,6 +505,9 @@ impl Subsystem for Gateway {
         let applied = self.applied.clone();
         let foundation = link.foundation().clone();
         Ok(Commit::new(move || {
+            if let Some((log, on)) = &access {
+                log.set_rules(rules, *on);
+            }
             let mut failed = 0_u64;
             let exempt_applied = bouncer.replace_allow(allow).is_ok();
             if !exempt_applied {

@@ -128,6 +128,18 @@ impl RequestTickets {
         }
     }
 
+    /// Keeps what the service noted with the request's line (the access log
+    /// and the log rules).
+    pub(crate) fn set_note(&self, worker: u16, tag: TicketTag, note: crate::note::Note) {
+        if let Some(shelf) = self.shelves.get(usize::from(worker))
+            && let Ok(mut live) = shelf.live.lock()
+            && let Some(entry) = live.iter_mut().find(|e| e.ticket.tag() == tag)
+            && let Some(line) = entry.line.as_mut()
+        {
+            line.set_note(note);
+        }
+    }
+
     /// Releases the ticket with `tag`, when its request is done, and hands
     /// back the request's stage marks if it had any.
     #[inline]
