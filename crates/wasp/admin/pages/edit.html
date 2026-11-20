@@ -19,6 +19,29 @@
 <label>Summary <input name="summary" value="{{ page.editor.summary }}"></label>
 <label>Date <input type="date" name="date" value="{{ page.editor.date }}"></label>
 <label>Body <textarea name="body" rows="18">{{ page.editor.body }}</textarea></label>
+{%- for f in page.editor.fields %}
+{%- if f.kind == "textarea" %}
+<label>{{ f.label }} <textarea name="{{ f.name }}" rows="6"{% if f.required %} required{% endif %}>{{ f.value }}</textarea></label>
+{%- elif f.kind == "bool" %}
+<label class="check"><input type="checkbox" name="{{ f.name }}" value="true"{% if f.value == "true" %} checked{% endif %}{% if f.required %} required{% endif %}> {{ f.label }}</label>
+{%- elif f.kind == "select" %}
+<label>{{ f.label }} <select name="{{ f.name }}"{% if f.required %} required{% endif %}>
+<option value="">-</option>
+{%- for o in f.options %}
+<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.value }}</option>
+{%- endfor %}
+</select></label>
+{%- elif f.kind == "number" %}
+<label>{{ f.label }} <input name="{{ f.name }}" value="{{ f.value }}" inputmode="decimal"{% if f.required %} required{% endif %}></label>
+{%- elif f.kind == "date" %}
+<label>{{ f.label }} <input type="date" name="{{ f.name }}" value="{{ f.value }}"{% if f.required %} required{% endif %}></label>
+{%- elif f.kind == "url" or f.kind == "media" %}
+<label>{{ f.label }} <input name="{{ f.name }}" value="{{ f.value }}" placeholder="/path or https://..."{% if f.required %} required{% endif %}></label>
+{%- else %}
+<label>{{ f.label }} <input name="{{ f.name }}" value="{{ f.value }}"{% if f.required %} required{% endif %}></label>
+{%- endif %}
+{%- if f.help %}<p class="muted">{{ f.help }}</p>{% endif %}
+{%- endfor %}
 <fieldset class="stack wide">
 <legend>Search and sharing</legend>
 <p class="muted">All optional. Left empty, the title and summary are used.</p>
