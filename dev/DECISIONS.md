@@ -104,6 +104,7 @@ Left, with the reason:
 - **A handler that blocks its worker cannot be cut by the drain deadline.** The transport closes everything it owns at the deadline, but a thread inside a service call finishes the call first; the kernel's shutdown deadline (exit 79) is the backstop. This is what `Work::Io`/`Work::Cpu` plus an offloading dispatcher fix.
 - **The slow-head defence is net-io's minimum rate** (256 B/s after a 5 s grace): a half-sent head is reset at about 5 s, before the 10 s head deadline would answer 408. No passport is ever taken for it.
 - **Sign-in hashes on the reactor worker.** Argon2id at the default (OWASP) cost takes 37 to 64 ms per sign-in on this machine, inline on the worker that holds the connection, at most two at once (G-57). The offloading dispatcher (`Work::Cpu`) moves it off the worker.
+- **Spent sign-in steps are known to one process only** (G-69). A half-done sign-in is good once because the process that completes it records its nonce in memory. With more than one node behind the same site, a step cookie could be finished once on each node. Before WASP runs on several nodes, the spent set moves to the shared store (or is shared over relay-io), and the same goes for the per-address sign-in counts and the wrong-code counts.
 - **The default local port 8080 may be in use** on a shared machine; the boot then fails cleanly at phase 4 and unwinds the core (tested). Use `gateway.listen` or `WASP_CONFIG`.
 
 ## Step 7 adapter (gatekeeper-io), agreed 2026-11-08
