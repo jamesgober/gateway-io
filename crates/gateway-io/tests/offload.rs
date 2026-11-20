@@ -1,11 +1,16 @@
 //! A route marked `WorkClass::Cpu` (password hashing) runs on the gateway's
 //! CPU pool: while it works, the reactor worker that holds its connection
 //! answers other connections at once (G-80).
+//!
+//! No clock decides these tests: the slow route holds its thread until the
+//! test releases it, and each test checks what was answered while it was
+//! still held.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use gateway_io::{Door, Settings, WaspGate, WebServices, Who};
 use serve_net::WorkClass;
@@ -13,10 +18,56 @@ use wasp_core::suite::kernel::UrgentLine;
 use wasp_core::{Core, Rule};
 use web_net::{App, Context, Route, get, post};
 
-/// How long the slow route works: far longer than a page view takes.
-const SLOW: Duration = Duration::from_millis(800);
+/// What the slow route waits on: it says when it has started, then holds its
+/// thread until the test opens the gate.
+#[derive(Default)]
+struct Gate {
+    started: Mutex<u32>,
+    started_cv: Condvar,
+    open: Mutex<bool>,
+    open_cv: Condvar,
+    /// Set just before the gate opens, so a reply can tell whether it came
+    /// before.
+    opened: AtomicBool,
+}
 
-fn open(cpu_threads: u16) -> (Door, SocketAddr) {
+/// Long enough for any machine; only a broken test waits this long.
+const LIMIT: Duration = Duration::from_secs(20);
+
+impl Gate {
+    /// The slow route's side: counts itself in, then waits for the gate.
+    fn hold(&self) {
+        if let Ok(mut n) = self.started.lock() {
+            *n += 1;
+            self.started_cv.notify_all();
+        }
+        let open = self.open.lock().expect("gate");
+        let _ = self.open_cv.wait_timeout_while(open, LIMIT, |o| !*o);
+    }
+
+    /// Waits until `n` slow requests are being held.
+    fn wait_started(&self, n: u32) {
+        let started = self.started.lock().expect("gate");
+        let (started, _) = self
+            .started_cv
+            .wait_timeout_while(started, LIMIT, |s| *s < n)
+            .expect("gate");
+        assert!(*started >= n, "the slow route never started");
+    }
+
+    /// Lets every held request go.
+    fn release(&self) {
+        self.opened.store(true, Ordering::SeqCst);
+        *self.open.lock().expect("gate") = true;
+        self.open_cv.notify_all();
+    }
+
+    fn is_open(&self) -> bool {
+        self.opened.load(Ordering::SeqCst)
+    }
+}
+
+fn open(cpu_threads: u16, gate: &Arc<Gate>) -> (Door, SocketAddr) {
     let core = Arc::new(
         Core::builder()
             .external("web")
@@ -24,13 +75,10 @@ fn open(cpu_threads: u16) -> (Door, SocketAddr) {
             .load()
             .expect("core"),
     );
-    let slow: Route<Who, Rule> = post("/sign-in", |cx: &mut Context<'_, Who>| {
-        // Stands in for Argon2id: the thread is busy, not waiting on I/O.
-        let until = Instant::now() + SLOW;
-        let mut n = 0u64;
-        while Instant::now() < until {
-            n = std::hint::black_box(n.wrapping_add(1));
-        }
+    let g = Arc::clone(gate);
+    let slow: Route<Who, Rule> = post("/sign-in", move |cx: &mut Context<'_, Who>| {
+        // Stands in for Argon2id: the thread is held, not free.
+        g.hold();
         cx.text(
             200,
             &format!("hashed on {}", std::thread::current().name().unwrap_or("?")),
@@ -65,8 +113,7 @@ fn open(cpu_threads: u16) -> (Door, SocketAddr) {
 /// The status and body of one request on its own connection.
 fn send(addr: SocketAddr, request: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("timeout");
+    s.set_read_timeout(Some(LIMIT)).expect("timeout");
     s.write_all(request.as_bytes()).expect("write");
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf);
@@ -83,45 +130,57 @@ const SIGN_IN: &str =
     "POST /sign-in HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const PAGE: &str = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
-/// How long a page view takes while a sign-in works on another connection
-/// of the same worker, and the sign-in's answer.
-fn page_during_sign_in(addr: SocketAddr) -> (Duration, (u16, String)) {
-    let slow = std::thread::spawn(move || send(addr, SIGN_IN));
-    // Let the sign-in reach its handler first.
-    std::thread::sleep(Duration::from_millis(150));
-    let t = Instant::now();
-    let (status, body) = send(addr, PAGE);
-    let took = t.elapsed();
-    assert_eq!((status, body.as_str()), (200, "page"));
-    (took, slow.join().expect("sign-in"))
-}
-
 #[test]
 fn a_page_view_is_answered_while_a_sign_in_hashes() {
-    let (door, addr) = open(2);
-    let (took, (status, body)) = page_during_sign_in(addr);
+    let gate = Arc::new(Gate::default());
+    let (door, addr) = open(2, &gate);
+    let slow = std::thread::spawn(move || send(addr, SIGN_IN));
+    gate.wait_started(1);
+    // The sign-in holds its thread; the worker answers the page anyway.
+    let page = send(addr, PAGE);
+    assert_eq!(page, (200, "page".to_owned()));
+    assert!(!gate.is_open(), "answered while the sign-in was still held");
+    gate.release();
+    let (status, body) = slow.join().expect("sign-in");
     assert_eq!(status, 200, "{body}");
     assert!(body.starts_with("hashed on gateway-cpu-"), "{body}");
-    // The worker was free: the page did not wait for the hashing (which
-    // has well over half of its time still to go when the page is asked).
-    assert!(took < SLOW / 2, "the page waited {took:?}");
     let _ = door.close(Duration::from_secs(2));
 }
 
 #[test]
 fn with_no_cpu_threads_the_worker_does_the_work_as_before() {
-    let (door, addr) = open(0);
-    let (took, (status, body)) = page_during_sign_in(addr);
+    let gate = Arc::new(Gate::default());
+    let (door, addr) = open(0, &gate);
+    let slow = std::thread::spawn(move || send(addr, SIGN_IN));
+    gate.wait_started(1);
+    // The one worker is held by the sign-in: the page cannot be answered
+    // until the gate opens, however long that takes.
+    let g = Arc::clone(&gate);
+    let page = std::thread::spawn(move || {
+        let got = send(addr, PAGE);
+        (got, g.is_open())
+    });
+    // A moment for a wrong answer to show; the check below does not depend
+    // on how long it is.
+    std::thread::sleep(Duration::from_millis(200));
+    gate.release();
+    let (got, opened_first) = page.join().expect("page");
+    assert_eq!(got, (200, "page".to_owned()));
+    assert!(
+        opened_first,
+        "the page did not answer before the gate opened"
+    );
+    let (status, body) = slow.join().expect("sign-in");
     assert_eq!(status, 200, "{body}");
     assert!(!body.contains("gateway-cpu-"), "{body}");
-    // The one worker was busy hashing: the page waited for it.
-    assert!(took >= SLOW / 2, "the page did not wait: {took:?}");
     let _ = door.close(Duration::from_secs(2));
 }
 
 #[test]
 fn the_pool_answers_as_the_worker_would() {
-    let (door, addr) = open(1);
+    let gate = Arc::new(Gate::default());
+    gate.release();
+    let (door, addr) = open(1, &gate);
     // Several at once: each answered whole, one at a time on the pool.
     let all: Vec<_> = (0..3)
         .map(|_| std::thread::spawn(move || send(addr, SIGN_IN)))
@@ -129,6 +188,7 @@ fn the_pool_answers_as_the_worker_would() {
     for h in all {
         let (status, body) = h.join().expect("sign-in");
         assert_eq!(status, 200, "{body}");
+        assert!(body.starts_with("hashed on gateway-cpu-"), "{body}");
     }
     // HTTP/1.0: the connection closes after the reply, which still arrives
     // whole from the pool.
