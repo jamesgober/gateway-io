@@ -103,10 +103,12 @@ cargo run -p wasp -- import ./content
 Each file is validated and escaped like any save (the body is plain text, blank lines between paragraphs); a file that does not pass is reported and skipped, and a slug already in the store is replaced.
 
 ```text
-themes/default/pages/    base, home, post, page, sign-in, account, admin, edit   (view: page)
+themes/default/pages/    base, home, post, page, sign-in, account   (view: page)
 themes/default/errors/   error, error/404         (view: error)
-themes/default/static/   site.css                 (served under /theme/)
+themes/default/static/   site.css, favicon.svg    (served under /theme/)
 ```
+
+The admin pages (`/admin` and below) have their own theme, built into the binary, so they work whatever the site theme is, and a site theme can neither restyle them nor put anything into them. They are sent with a stricter content security policy than the site's (nothing inline, nothing from another origin, never framed). An install that wants its own admin theme sets `[admin] custom_theme = true` and names a folder in `[admin] theme`, shaped like the built-in one (`crates/wasp/admin/`: `pages/` with `base`, `list`, `edit`, and `static/`, served under `/admin/static/`). The sign-in and account pages stay with the site theme: every visitor sees them.
 
 ## Configuration
 
@@ -141,6 +143,8 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `site.name` | `WASP` | the site's name, in every page title |
 | `site.theme` | `themes/default` | the theme folder (`pages/`, `errors/`, `static/`) |
 | `site.theme_poll` | `1s` | how often the theme folder is checked for changes (`0s` turns live reload off) |
+| `admin.theme` | `builtin` | the admin pages' theme: `builtin`, or a folder (`pages/`, `static/`) when `admin.custom_theme` allows it |
+| `admin.custom_theme` | false | whether `admin.theme` may name a folder; without it a folder refuses the boot |
 | `content.store` | `memory` | where content is kept: `memory` (lost at exit), `bison` (a bison-db file), or `nex` (a nex-db database, feature `store-nex`: one entity per entry, published at its route); the durable stores allow one process at a time (a second instance refuses to boot); an empty store is given the sample content |
 | `content.recovery` | `strict` | a bison-db file damaged before its end refuses to boot and is left as it was; after backing it up, start once with `salvage` to keep every record that still verifies (bison-db keeps a copy as `<path>.damaged`) |
 | `content.path` | `<data folder>/content.bison` | the bison-db file |

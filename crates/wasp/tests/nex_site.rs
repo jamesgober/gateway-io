@@ -436,6 +436,20 @@ fn the_editor_writes_renames_and_removes_content() {
     assert_eq!(list.status, 200, "{list:?}");
     assert_eq!(list.field("cache-control"), Some("no-store"));
     assert!(list.body.contains("The passport"), "{}", list.body);
+    // The admin pages come from the built-in admin theme, under their own
+    // content security policy.
+    assert!(
+        list.body.contains("/admin/static/admin.css"),
+        "{}",
+        list.body
+    );
+    assert_eq!(
+        list.field("content-security-policy"),
+        Some(wasp::theme::ADMIN_CSP)
+    );
+    let css = get(addr, "/admin/static/admin.css", &[]);
+    assert_eq!(css.status, 200, "{css:?}");
+    assert_eq!(css.field("content-type"), Some("text/css; charset=utf-8"));
 
     // A new page: saved, then served at its own path, escaped. The body's
     // line breaks are CRLF, as a browser sends a textarea's.
@@ -549,5 +563,106 @@ fn the_editor_writes_renames_and_removes_content() {
     assert_eq!(gone.status, 303, "{gone:?}");
     assert_eq!(gone.field("location"), Some("/admin"));
     assert_eq!(get(addr, "/write-to-us", &[]).status, 404);
+    let _ = door.close(Duration::from_secs(2));
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("dir");
+    for e in std::fs::read_dir(src).expect("read") {
+        let e = e.expect("entry");
+        let to = dst.join(e.file_name());
+        if e.file_type().expect("type").is_dir() {
+            copy_dir(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), &to).expect("copy");
+        }
+    }
+}
+
+/// The site with its theme in `theme` and `admin` added to the config.
+fn config_with_themes(data: &Path, theme: &Path, admin: &str) -> Config {
+    Config::from_text(&format!(
+        "[site]
+theme = \"{}\"
+theme_poll = \"0s\"
+
+[auth]
+store = \"nex\"
+
+[content]
+store = \"nex\"
+
+[nex]
+path = \"{}\"
+lock_wait = \"0s\"
+
+[admin]
+{admin}
+",
+        slash(theme),
+        slash(&data.join("nex"))
+    ))
+    .expect("config")
+}
+
+#[test]
+fn a_site_theme_cannot_replace_the_admin_pages() {
+    let data = temp_dir("admin-split");
+    let site = data.0.join("site-theme");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default"),
+        &site,
+    );
+    // A site theme that tries: its own admin templates, by both names.
+    for name in ["admin.html", "admin/list.html"] {
+        let path = site.join("pages").join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "SITE THEME ADMIN <script>alert(1)</script>").expect("write");
+    }
+    let conf = config_with_themes(&data.0, &site, "");
+    let (door, addr) = open(&conf);
+    let ed = sign_in_as(addr, EDITOR);
+    let list = get(addr, "/admin", &[&ed]);
+    assert_eq!(list.status, 200, "{list:?}");
+    assert!(!list.body.contains("SITE THEME ADMIN"), "{}", list.body);
+    assert!(
+        list.body.contains("/admin/static/admin.css"),
+        "{}",
+        list.body
+    );
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_custom_admin_theme_needs_the_operator_to_allow_it() {
+    let data = temp_dir("admin-custom");
+    let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
+    let admin = data.0.join("admin-theme");
+    copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("admin"), &admin);
+    std::fs::write(
+        admin.join("pages/list.html"),
+        "{% extends \"base\" %}{% block content %}CUSTOM ADMIN{% endblock %}",
+    )
+    .expect("write");
+    let refused = config_with_themes(&data.0, &theme, &format!("theme = \"{}\"", slash(&admin)));
+    let err = wasp::wire(&refused).expect_err("refused without custom_theme");
+    assert!(err.contains("admin.custom_theme"), "{err}");
+
+    let allowed = config_with_themes(
+        &data.0,
+        &theme,
+        &format!(
+            "theme = \"{}\"
+custom_theme = true",
+            slash(&admin)
+        ),
+    );
+    let (door, addr) = open(&allowed);
+    let ed = sign_in_as(addr, EDITOR);
+    let list = get(addr, "/admin", &[&ed]);
+    assert_eq!(list.status, 200, "{list:?}");
+    assert!(list.body.contains("CUSTOM ADMIN"), "{}", list.body);
+    let css = get(addr, "/admin/static/admin.css", &[]);
+    assert_eq!(css.status, 200, "the custom theme's static folder: {css:?}");
     let _ = door.close(Duration::from_secs(2));
 }

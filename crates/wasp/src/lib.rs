@@ -305,6 +305,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("content", &["path", "recovery", "store"]),
     ("auth", &["admin", "origin", "secret", "store"]),
     ("nex", &["lock_wait", "path"]),
+    ("admin", &["custom_theme", "theme"]),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];
@@ -504,7 +505,8 @@ fn wire_with(
         content::Manifest::open(store, &settings.base, true).map_err(|e| e.to_string())?;
     let purge = guest_pages.clone();
     let manifest = content::Content::new(manifest).on_change(move || purge.purge());
-    let engine = theme::Timed::new(theme, stages.clone());
+    let admin = theme::load_admin(&settings.admin_theme).map_err(|e| e.0)?;
+    let engine = theme::Timed::new(theme::SiteRender::new(theme, admin), stages.clone());
     let renders = engine.counts().clone();
     // `/ready`: 503 while any provider (the content store, the database)
     // cannot serve, for the front end and the supervisor.
