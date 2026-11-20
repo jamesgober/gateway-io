@@ -32,7 +32,7 @@ use crate::content::{ContentStore, FIELD_PREFIX, Meta, StoreError, StoreErrorKin
 use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
 
 mod accounts;
-pub use accounts::{AccountRow, CodeCheck};
+pub use accounts::{AccountRow, CodeCheck, SessionRow, SignInFrom};
 
 /// The site in nex-db's routes.
 const SITE: &str = nex_db::DEFAULT_SITE;
@@ -477,6 +477,9 @@ pub struct NexAuth {
     checked: Arc<Checked>,
     policy: PolicyCell,
     failures: Arc<accounts::Failures>,
+    /// Sessions are issued under their account's stripe, so the new one is
+    /// told apart from the others exactly (see `open_session`).
+    issuing: Arc<[std::sync::Mutex<()>; 64]>,
 }
 
 /// What a session's last recheck read (its account's permissions and
@@ -554,6 +557,7 @@ impl NexAuth {
             checked: Arc::default(),
             policy: PolicyCell::default(),
             failures: Arc::default(),
+            issuing: Arc::new(std::array::from_fn(|_| std::sync::Mutex::new(()))),
         }
     }
 
@@ -808,9 +812,15 @@ impl NexAuth {
     }
 
     /// Opens a session for `user` (its password, and its code when it needs
-    /// one, already checked): the session cookie's value. Past the account's
-    /// session cap, its oldest sessions end.
-    pub fn open_session(&self, user: UserId) -> Result<String, StoreError> {
+    /// one, already checked), signed in `from` a device and address: the
+    /// session cookie's value. Past the account's session cap, its oldest
+    /// sessions end.
+    ///
+    /// The session is issued under its account's lock, between two listings
+    /// of the account's sessions: the one id the second has and the first
+    /// does not is the new session's, whatever else signs in at the same
+    /// moment, so its device and address are kept with the right session.
+    pub fn open_session(&self, user: UserId, from: &SignInFrom) -> Result<String, StoreError> {
         let account = account_of(user);
         let policy = self.policy();
         let (perms, names) = self.roles_of(account)?;
@@ -822,7 +832,27 @@ impl NexAuth {
             .payload(&perms.0.to_le_bytes())
             .map_err(nex)?;
         let auth = self.db.db().auth();
+        let stripe = usize::try_from(user.0 % 64).unwrap_or(0);
+        let _issuing = self.issuing[stripe]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before: std::collections::HashSet<nex_db::SessionId> = auth
+            .sessions(account)
+            .map_err(nex)?
+            .iter()
+            .map(nex_db::SessionInfo::id)
+            .collect();
         let token = auth.issue_session(account, spec).map_err(nex)?;
+        let new: Vec<nex_db::SessionId> = auth
+            .sessions(account)
+            .map_err(nex)?
+            .iter()
+            .map(nex_db::SessionInfo::id)
+            .filter(|id| !before.contains(id))
+            .collect();
+        if let [id] = new.as_slice() {
+            self.record_session(user, *id, session_id(token.as_str()), from)?;
+        }
         if rules.max_sessions > 0 {
             let mut sessions = auth.sessions(account).map_err(nex)?;
             let cap = usize::try_from(rules.max_sessions).unwrap_or(usize::MAX);
@@ -847,7 +877,7 @@ impl NexAuth {
     /// an account that needs a code or two-step set-up first.
     pub fn sign_in(&self, identifier: &str, password: &str) -> Result<Option<String>, StoreError> {
         match self.check_password(identifier, password)? {
-            PasswordStep::Done(user) => self.open_session(user).map(Some),
+            PasswordStep::Done(user) => self.open_session(user, &SignInFrom::default()).map(Some),
             _ => Ok(None),
         }
     }

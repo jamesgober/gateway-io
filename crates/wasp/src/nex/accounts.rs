@@ -15,6 +15,7 @@ use wasp_core::UserId;
 
 use super::{DIRECTORY, MAX_ENTRIES, NexAuth, StoreError, StoreErrorKind, account_of, hex_of, nex};
 use crate::policy::Rules;
+use wasp_core::SessionId;
 
 /// Wrong codes per account, counted toward `[auth.lockout]`: nex-db counts
 /// wrong passwords itself, and a wrong code here locks the account the same
@@ -83,6 +84,117 @@ pub struct AccountRow {
     /// Whether two-step sign-in is on.
     pub totp: bool,
 }
+
+/// Where a sign-in came from: kept with its session for the account page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignInFrom {
+    /// The device, named from its user agent (`Firefox on Windows`).
+    pub device: String,
+    /// The client's address.
+    pub address: Option<std::net::IpAddr>,
+}
+
+impl SignInFrom {
+    /// From a request's `User-Agent` and client address.
+    #[must_use]
+    pub fn new(user_agent: Option<&str>, address: Option<std::net::IpAddr>) -> SignInFrom {
+        SignInFrom {
+            device: device_of(user_agent.unwrap_or("")),
+            address,
+        }
+    }
+}
+
+/// A short name for the device a user agent describes.
+#[must_use]
+pub fn device_of(ua: &str) -> String {
+    let has = |s: &str| ua.contains(s);
+    let browser = if has("Edg/") {
+        "Edge"
+    } else if has("OPR/") {
+        "Opera"
+    } else if has("Firefox/") {
+        "Firefox"
+    } else if has("Chrome/") {
+        "Chrome"
+    } else if has("Safari/") {
+        "Safari"
+    } else if has("curl/") {
+        "curl"
+    } else {
+        ""
+    };
+    let system = if has("iPhone") || has("iPad") {
+        "iOS"
+    } else if has("Android") {
+        "Android"
+    } else if has("Windows") {
+        "Windows"
+    } else if has("Mac OS X") || has("Macintosh") {
+        "macOS"
+    } else if has("Linux") {
+        "Linux"
+    } else {
+        ""
+    };
+    match (browser, system) {
+        ("", "") => "Unknown device".to_owned(),
+        (b, "") => b.to_owned(),
+        ("", s) => format!("A browser on {s}"),
+        (b, s) => format!("{b} on {s}"),
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::device_of;
+
+    #[test]
+    fn devices_are_named_from_the_user_agent() {
+        for (ua, name) in [
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+                "Firefox on Windows",
+            ),
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+                "Safari on macOS",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36",
+                "Chrome on Android",
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/130.0 Safari/537.36 Edg/130.0",
+                "Edge on Windows",
+            ),
+            ("curl/8.5.0", "curl"),
+            ("", "Unknown device"),
+        ] {
+            assert_eq!(device_of(ua), name, "{ua}");
+        }
+    }
+}
+
+/// One session of an account, for its page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRow {
+    /// nex-db's id for it (32 hex digits), for the revoke button.
+    pub id: String,
+    /// The device it signed in from, or empty when not known.
+    pub device: String,
+    /// The address it signed in from, or empty.
+    pub address: String,
+    /// When it signed in.
+    pub signed_in: SystemTime,
+    /// When it was last used.
+    pub last_used: SystemTime,
+    /// The session that asked (`this one`).
+    pub current: bool,
+}
+
+/// The directory's session records: `/<account>/s/<session>`.
+const SESSION_KIND: &str = "session";
 
 /// The suspension reason a disable writes.
 const DISABLED: u32 = 2;
@@ -245,6 +357,7 @@ impl NexAuth {
         user: UserId,
         current: &str,
         new: &str,
+        from: &SignInFrom,
     ) -> Result<Result<String, String>, StoreError> {
         if !self.password_is(user, current)? {
             return Ok(Err("The current password is not right.".to_owned()));
@@ -258,7 +371,130 @@ impl NexAuth {
         auth.set_password(account, &hashed).map_err(nex)?;
         let _ = auth.revoke_all(account).map_err(nex)?;
         self.forget_devices(user)?;
-        self.open_session(user).map(Ok)
+        self.open_session(user, from).map(Ok)
+    }
+
+    /// Keeps where session `id` of `user` signed in from, and the digest of
+    /// its token (to tell "this one" on the account page).
+    pub(super) fn record_session(
+        &self,
+        user: UserId,
+        id: nex_db::SessionId,
+        token: SessionId,
+        from: &SignInFrom,
+    ) -> Result<(), StoreError> {
+        let content = self.db.db().content();
+        let entity = nex_db::Entity::new(SESSION_KIND)
+            .site(DIRECTORY)
+            .path(format!("/{}/s/{id}", hex_of(account_of(user))))
+            .field("token", format!("{:032x}", token.0))
+            .field("device", from.device.as_str())
+            .field(
+                "address",
+                from.address.map(|a| a.to_string()).unwrap_or_default(),
+            );
+        match content.put(entity) {
+            Ok(_) | Err(nex_db::Error::AlreadyExists { .. }) => Ok(()),
+            Err(e) => Err(nex(e)),
+        }
+    }
+
+    /// Every live session of `user`, newest first, `current` marking the
+    /// one with the token digest `this`. Records of sessions that ended go.
+    pub fn sessions_of(
+        &self,
+        user: UserId,
+        this: SessionId,
+    ) -> Result<Vec<SessionRow>, StoreError> {
+        let account = account_of(user);
+        let content = self.db.db().content();
+        let live = self.db.db().auth().sessions(account).map_err(nex)?;
+        let prefix = format!("/{}/s/", hex_of(account));
+        let mut rows = Vec::with_capacity(live.len());
+        for s in &live {
+            let path = format!("{prefix}{}", s.id());
+            let record = match content.resolve(DIRECTORY, &path).map_err(nex)? {
+                Some(route) => content.get(route.entity()).map_err(nex)?,
+                None => None,
+            };
+            let field = |name: &str| {
+                record
+                    .as_ref()
+                    .and_then(|r| r.field(name))
+                    .and_then(nex_db::Value::as_text)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            rows.push(SessionRow {
+                id: s.id().to_string(),
+                current: field("token") == format!("{:032x}", this.0),
+                device: field("device"),
+                address: field("address"),
+                signed_in: s.created_at(),
+                last_used: s.last_used_at(),
+            });
+        }
+        // Records of sessions nex-db no longer has.
+        let mut page = content
+            .list(
+                &nex_db::Listing::latest(SESSION_KIND)
+                    .site(DIRECTORY)
+                    .limit(1000),
+            )
+            .map_err(nex)?;
+        let mut gone = Vec::new();
+        loop {
+            for e in page.items() {
+                if let Some((_, p)) = e.route()
+                    && let Some(id) = p.strip_prefix(&prefix)
+                    && !live.iter().any(|s| s.id().to_string() == id)
+                {
+                    gone.push(e.id());
+                }
+            }
+            match page.next() {
+                Some(c) => page = content.next_page(c).map_err(nex)?,
+                None => break,
+            }
+        }
+        for rid in gone {
+            let _ = content.delete(rid);
+        }
+        rows.sort_by_key(|r| std::cmp::Reverse(r.signed_in));
+        Ok(rows)
+    }
+
+    /// Ends `user`'s session `id` (32 hex digits): `false` when it has no
+    /// such session.
+    pub fn revoke_session(&self, user: UserId, id: &str) -> Result<bool, StoreError> {
+        let Ok(sid) = id.parse::<nex_db::SessionId>() else {
+            return Ok(false);
+        };
+        let account = account_of(user);
+        let ended = self
+            .db
+            .db()
+            .auth()
+            .revoke_session(account, sid)
+            .map_err(nex)?;
+        let content = self.db.db().content();
+        let path = format!("/{}/s/{sid}", hex_of(account));
+        if let Some(route) = content.resolve(DIRECTORY, &path).map_err(nex)? {
+            let _ = content.delete(route.entity());
+        }
+        Ok(ended)
+    }
+
+    /// Ends every session of `user` but the one with the token digest
+    /// `this`; how many ended.
+    pub fn revoke_others(&self, user: UserId, this: SessionId) -> Result<usize, StoreError> {
+        let mut ended = 0;
+        for row in self.sessions_of(user, this)? {
+            if !row.current && self.revoke_session(user, &row.id)? {
+                ended += 1;
+            }
+        }
+        Ok(ended)
     }
 
     /// Ends every session `user` holds (this one too) and forgets its
