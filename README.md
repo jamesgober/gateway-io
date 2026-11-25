@@ -32,10 +32,10 @@ Rust 1.89 or newer. On Windows, set `AWS_LC_SYS_PREBUILT_NASM=1` so the crypto d
 cargo build --release -p wasp
 ```
 
-Two-step sign-in (TOTP) for nex-db accounts is the `mfa` feature. It builds the same C crypto backend as the default gatekeeper, so the static musl build (`--no-default-features --features store-nex`) leaves it out:
+Two-step sign-in (TOTP) for nex-db accounts is the `mfa` feature. It is pure Rust, so the static musl build has it too:
 
 ```bash
-cargo build --release -p wasp --features store-nex,mfa
+cargo build --release -p wasp --no-default-features --features store-nex,mfa
 ```
 
 ## Run

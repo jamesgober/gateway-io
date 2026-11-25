@@ -10,10 +10,10 @@ A static Linux binary, so the host's C library does not matter:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex
+cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex,mfa
 ```
 
-`--no-default-features --features store-nex` builds the site on nex-db alone (accounts with `auth.store = "nex"`, content with `content.store = "nex"`) and with no C dependency, so it needs no C toolchain. The default build has the in-memory gatekeeper instead, whose crypto library needs a C compiler for musl (`musl-tools`).
+`--no-default-features --features store-nex,mfa` builds the site on nex-db alone (accounts with `auth.store = "nex"`, content with `content.store = "nex"`), with two-step sign-in, and with no C dependency, so it needs no C toolchain. The default build has the in-memory gatekeeper instead, whose crypto library needs a C compiler for musl (`musl-tools`).
 
 Then pack it with the theme, the start shim, these notes and the example configuration:
 

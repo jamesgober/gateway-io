@@ -38,9 +38,9 @@ gatekeeper = ["gateway-io/gatekeeper", "dep:gatekeeper-io", "dep:key-vault", "de
 # nex-db as a store: `content.store = "nex"` and `auth.store = "nex"`.
 # Optional: no part of the process outside its adapter depends on it.
 store-nex = ["dep:nex-db", "dep:crypt-io"]
-# Two-step sign-in (TOTP) for nex-db accounts. It brings crypt-io's C backend
-# (AWS-LC), so the static musl build leaves it out.
-mfa = ["store-nex", "nex-db/mfa"]
+# Two-step sign-in (TOTP) for nex-db accounts, through nex-db's `totp`:
+# pure Rust, so the static musl build has it too.
+mfa = ["store-nex", "nex-db/totp"]
 # An echo WebSocket route (`site.ws_echo`), for tests and trials: off by
 # default, so no build ships a WebSocket route it was not asked for.
 ws-echo = ["store-nex"]

@@ -70,8 +70,8 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Build (nex-db only, no C toolchain)
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex
+      - name: Build (nex-db with two-step sign-in, no C toolchain)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p wasp --no-default-features --features store-nex,mfa
       - name: Statically linked
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/wasp

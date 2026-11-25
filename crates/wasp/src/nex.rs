@@ -536,9 +536,6 @@ pub struct NexAuth {
     realm: Arc<str>,
     /// The realm's account directory (a content site of its own).
     directory: Arc<str>,
-    /// Sessions are issued under their account's stripe, so the new one is
-    /// told apart from the others exactly (see `open_session`).
-    issuing: Arc<[std::sync::Mutex<()>; 64]>,
     /// Ends open WebSockets (and running requests) when an account, a
     /// session or a key is revoked.
     revoker: gateway_io::Revoker,
@@ -621,7 +618,6 @@ impl NexAuth {
             failures: Arc::default(),
             realm: Arc::from(DEFAULT_REALM),
             directory: Arc::from(DIRECTORY),
-            issuing: Arc::new(std::array::from_fn(|_| std::sync::Mutex::new(()))),
             revoker: gateway_io::Revoker::new(),
         }
     }
@@ -937,10 +933,9 @@ impl NexAuth {
     /// session cookie's value. Past the account's session cap, its oldest
     /// sessions end.
     ///
-    /// The session is issued under its account's lock, between two listings
-    /// of the account's sessions: the one id the second has and the first
-    /// does not is the new session's, whatever else signs in at the same
-    /// moment, so its device and address are kept with the right session.
+    /// The new session's id comes from nex-db itself (`Session::id`), so its
+    /// device and address are kept with the right session whatever else signs
+    /// in at the same moment.
     pub fn open_session(&self, user: UserId, from: &SignInFrom) -> Result<String, StoreError> {
         let account = account_of(user);
         let policy = self.policy();
@@ -953,26 +948,9 @@ impl NexAuth {
             .payload(&perms.0.to_le_bytes())
             .map_err(nex)?;
         let auth = self.auth()?;
-        let stripe = usize::try_from(user.0 % 64).unwrap_or(0);
-        let _issuing = self.issuing[stripe]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before: std::collections::HashSet<nex_db::SessionId> = auth
-            .sessions(account)
-            .map_err(nex)?
-            .iter()
-            .map(nex_db::SessionInfo::id)
-            .collect();
         let token = auth.issue_session(account, spec).map_err(nex)?;
-        let new: Vec<nex_db::SessionId> = auth
-            .sessions(account)
-            .map_err(nex)?
-            .iter()
-            .map(nex_db::SessionInfo::id)
-            .filter(|id| !before.contains(id))
-            .collect();
-        if let [id] = new.as_slice() {
-            self.record_session(user, *id, session_id(token.as_str()), from)?;
+        if let Validation::Valid(s) = auth.validate(token.as_str()).map_err(nex)? {
+            self.record_session(user, s.id(), session_id(token.as_str()), from)?;
         }
         if rules.max_sessions > 0 {
             let mut sessions = auth.sessions(account).map_err(nex)?;
