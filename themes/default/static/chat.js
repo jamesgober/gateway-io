@@ -19,6 +19,8 @@
   let current = null; // the open conversation's id
   let more = null; // where older messages start, or null
   let nonce = 0;
+  let pages = 0; // pages of the conversation list read since the first
+  const MAX_PAGES = 20;
   const conversations = new Map(); // id -> summary
   const shown = new Set(); // numbers on the page, for the open conversation
 
@@ -37,7 +39,7 @@
     if (marks.includes('italic')) wrap('em');
     if (marks.includes('strike')) wrap('s');
     if (marks.includes('quote')) wrap('blockquote');
-    if (marks.includes('link') && typeof s.href === 'string' && /^(https?:\/\/|\/(?!\/))/.test(s.href)) {
+    if (marks.includes('link') && typeof s.href === 'string' && /^(https?:\/\/|\/(?!\/))/.test(s.href) && !/\\|%5c/i.test(s.href)) {
       const a = document.createElement('a');
       a.href = s.href;
       a.rel = 'noopener noreferrer';
@@ -99,9 +101,12 @@
     conversations(f) {
       me = f.me || me;
       $('chat-me').textContent = me;
-      conversations.clear();
+      // The first page starts the list again; later ones add to it.
+      if (f.after === null) { conversations.clear(); pages = 0; }
       for (const c of f.items || []) conversations.set(c.id, c);
       drawList();
+      pages += 1;
+      if (typeof f.more === 'string' && pages < MAX_PAGES) send({ op: 'conversations', after: f.more });
     },
     conversation(f) {
       if (!conversations.has(f.id)) conversations.set(f.id, { id: f.id, members: f.members, unread: 0, read: 0, last: 0 });

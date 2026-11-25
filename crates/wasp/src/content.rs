@@ -554,8 +554,13 @@ impl Meta {
 pub(crate) fn address_ok(value: &str) -> bool {
     if value.len() > META_URL_MAX
         || value.chars().any(|c| {
-            c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`')
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\')
         })
+        // A browser reads `/\x` as `//x`, another site; `%5c` is the same
+        // backslash, written for a server that decodes it.
+        || value.to_ascii_lowercase().contains("%5c")
     {
         return false;
     }
@@ -1577,6 +1582,23 @@ fn unix_newlines(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_never_holds_a_backslash() {
+        for bad in [
+            r"/\evil.example",
+            "/%5cevil.example",
+            "/%5Cevil.example",
+            r"https:\\evil.example",
+            r"https://a.example/\x",
+            "//evil.example",
+        ] {
+            assert!(!address_ok(bad), "{bad}");
+        }
+        for good in ["/posts/a", "https://a.example/x?y=1", "http://a.example"] {
+            assert!(address_ok(good), "{good}");
+        }
+    }
 
     fn fields(text: &str) -> Result<Fields, String> {
         Fields::from_config(&Config::from_text(text).expect("toml"))

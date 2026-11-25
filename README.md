@@ -398,7 +398,7 @@ ws_echo = "/ws/echo"
 
 The caller is signed in as for a page: the session cookie, or `Authorization: Bearer <key>` for a program, in the realm the host picks, with the same standing checks. The route's rule is checked before the switch (the echo route takes a signed-in member; a key needs `account:read`), and a refusal is the HTTP status (401, 403), with nothing switched. A page may open one only from the site's own hosts (`Origin`); a request without `Origin` is not a browser and is judged by its credential alone.
 
-While a connection is open it stays held to those rules. Disabling, banning or removing the account, a password change and signing out everywhere end its connections at once, even idle ones; so do revoking one session or one API key. Every `ws.recheck` the caller is checked again, so an expired session or key, or a role taken away, ends it too.
+While a connection is open it stays held to those rules. Disabling, banning or removing the account, a password change and signing out everywhere end its connections at once, even idle ones; so do revoking one session or one API key. Every `ws.recheck` the caller is checked again, so an expired session or key, or a role given or taken away, ends it too.
 
 Each account may hold `ws.per_account` connections (then 429), each connection may send `ws.rate` messages a second in bursts of `ws.burst` (then the connection closes with 1008), and a frame or message over its size is refused by the protocol (1009). The connection is pinged after `ws.ping` of quiet and closed if a second interval passes without a byte. It works through the Unix socket behind the start shim too.
 
@@ -410,6 +410,8 @@ With nex-db accounts, members can send each other direct messages. It is off unt
 [chat]
 enabled = true
 max_length = 4000      # characters in one message
+max_conversations = 500  # conversations one account may start
+max_messages = 100000  # messages one account may keep sent; 0 for no cap
 
 [chat.role.member]
 page = 50              # messages in one page of history
@@ -426,21 +428,21 @@ Every frame is one JSON object with an `op`. Account and conversation ids are 32
 
 | Send | Answer |
 |---|---|
-| `{"op":"conversations"}` | `{"op":"conversations","me":..,"items":[..]}`, newest first; each item has `id`, `members`, `last`, `read`, `unread`, `muted` and the last `message`. Sent on connect too, so a member who was away sees what is new |
-| `{"op":"open","with":"<account>"}` | `{"op":"conversation","id":..,"members":[..]}`; two accounts have one conversation, so opening it again gives the same id |
+| `{"op":"conversations","after":".."}` | `{"op":"conversations","me":..,"after":..,"items":[..],"more":".."}`, 50 at a time, the most recent first; each item has `id`, `members`, `last`, `at`, `read`, `unread` and `muted`. `more` is the `after` for the next page, or `null`. The first page is sent on connect too, so a member who was away sees what is new |
+| `{"op":"open","with":"<account>"}` | `{"op":"conversation","id":..,"members":[..]}`; two accounts have one conversation, so opening it again gives the same id. It shows in the other's list once it has a message |
 | `{"op":"history","conversation":..,"before":n,"limit":n}` | `{"op":"history","conversation":..,"messages":[..],"more":n}`, oldest first; `before` and `limit` are optional, and `more` is the `before` for the next page back, or `null` |
 | `{"op":"send","conversation":..,"body":[..],"nonce":".."}` | `{"op":"sent","nonce":..,"conversation":..,"number":n}` |
-| `{"op":"read","conversation":..,"number":n}` | `{"op":"read","conversation":..,"member":..,"number":n}` |
+| `{"op":"read","conversation":..,"number":n}` | `{"op":"read","conversation":..,"member":..,"number":n}`, with the marker as it stands (it never goes back) |
 | `{"op":"mute","conversation":..,"on":true}` | `{"op":"muted","conversation":..,"on":true}` |
 | `{"op":"block","account":..,"on":true}` | `{"op":"blocked","account":..,"on":true}` |
 
-A message is `{"conversation","number","author","at","body"}`: messages are numbered from 1 in each conversation and `at` is milliseconds since 1970. Every open connection of each member gets `{"op":"message","message":..}` when one is sent, and `{"op":"read",..}` when a member reads. A member who muted a conversation gets no pushes from it, but its history is the same.
+A message is `{"conversation","number","author","at","body"}`: messages are numbered from 1 in each conversation and `at` is milliseconds since 1970. Every open connection of each member gets `{"op":"message","message":..}` when one is sent. The other member gets `{"op":"read",..}` when your read marker moves, but not across a block. A member who muted a conversation gets no pushes from it, but its history is the same. A connection that stops reading its pushes misses them: it is closed with 1013 at its next frame, and catches up when it connects again.
 
-A body is a list of spans, never HTML: `{"text":"hello","marks":["bold"]}`, with `href` for a link. Members may use `bold`, `italic` and `link` (an `http(s)://` address or one on the site). Editors and admins may also use `code`, `pre`, `quote` and `strike`. A body holds at most 64 spans and `chat.max_length` characters, and no control characters but newlines. The page puts every span on the screen as text.
+A body is a list of spans, never HTML: `{"text":"hello","marks":["bold"]}`, with `href` for a link. Members may use `bold`, `italic` and `link` (an `http(s)://` address or one on the site, never with a backslash). Editors and admins may also use `code`, `pre`, `quote` and `strike`. A body holds at most 64 spans and `chat.max_length` characters, and no control characters but newlines. The page puts every span on the screen as text.
 
-Each frame is checked on its own: the caller must be a member of the conversation (`chat.not_a_member`), nobody can open a conversation with an account that doesn't exist in the realm, and a block in either direction stops opening and sending both ways (`chat.blocked`). An error is `{"op":"error","code":..,"message":..}`, with the `nonce` when the frame had one. The `[ws]` budgets apply to the connection, and so do the standing checks: a disabled or banned account, a password change or a revoked key ends the connection at once.
+Each frame is checked on its own: the caller must be a member of the conversation (`chat.not_a_member`). You can write only to an active member of the realm, and a block in either direction stops opening and sending both ways. All of these get the same answer, `chat.cannot_write`, so it never tells whether an account exists or who blocked whom. Past a quota the answer is `chat.quota`. An error is `{"op":"error","code":..,"message":..}`, with the `nonce` when the frame had one. The `[ws]` budgets apply to the connection, and so do the standing checks: a disabled or banned account, a password change or a revoked key ends the connection at once, and a change of roles ends it at the next recheck, so the new limits apply when it connects again.
 
-Messages are kept in nex-db, in a content site of their own for each realm, so they survive a restart. One process numbers the messages for now; several nodes sharing one store is still to come.
+Messages are kept in nex-db, in a content site of their own for each realm, so they survive a restart. A message is written once: its number is taken only if it is free, so nothing is ever written over, even after a crash in the middle of a send. One process sends at a time per conversation for now; several nodes sharing one store is still to come.
 
 ## Configuration
 
@@ -501,6 +503,8 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `chat.enabled` | false | the messenger, with nex-db accounts |
 | `chat.path` | `/ws/chat` | the messenger's WebSocket route, under `site.base` |
 | `chat.max_length` | 4000 | characters in one message |
+| `chat.max_conversations` | 500 | conversations one account may start |
+| `chat.max_messages` | 100000 | messages one account may keep sent; `0` for no cap |
 | `chat.role.<role>.page` | 50 (100 for `editor` and `admin`) | messages in one page of history, 1 to 500 |
 | `chat.role.<role>.history` | 1000 (all for `editor` and `admin`) | how many messages back a role can page; `0` for all |
 | `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |

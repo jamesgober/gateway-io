@@ -472,7 +472,17 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
     ("api", &["burst", "enabled", "prefix", "rate"]),
-    ("chat", &["enabled", "max_length", "path", "role"]),
+    (
+        "chat",
+        &[
+            "enabled",
+            "max_conversations",
+            "max_length",
+            "max_messages",
+            "path",
+            "role",
+        ],
+    ),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];

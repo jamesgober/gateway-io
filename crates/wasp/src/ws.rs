@@ -180,11 +180,23 @@ pub fn routes(settings: &SiteSettings) -> Vec<WsRoute> {
     let mut routes = Vec::new();
     #[cfg(feature = "ws-echo")]
     if let Some(path) = &settings.ws_echo {
-        routes.push(WsRoute::shared(
-            format!("{}{path}", settings.base.trim_end_matches('/')),
-            ECHO_RULE,
-            Arc::new(Echo),
-        ));
+        let echo: Arc<dyn WebSocketService> = Arc::new(Echo);
+        routes.push(WsRoute {
+            path: format!("{}{path}", settings.base.trim_end_matches('/')),
+            rule: ECHO_RULE,
+            make: Arc::new(move |_caller| {
+                // A key needs `account:read`: one made for something else
+                // (`chat`) holds the member bit too.
+                #[cfg(feature = "store-nex")]
+                if let Some(token) = _caller.token::<crate::nex::NexToken>()
+                    && let crate::nex::Via::Key(scopes) = token.via()
+                    && !scopes.has("account:read")
+                {
+                    return Err(403);
+                }
+                Ok(Arc::clone(&echo))
+            }),
+        });
     }
     #[cfg(not(feature = "ws-echo"))]
     let _ = settings;

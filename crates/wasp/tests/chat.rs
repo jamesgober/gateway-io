@@ -21,6 +21,7 @@ const ANN: &str = "ann@example.com";
 const BOB: &str = "bob@example.com";
 const EVE: &str = "eve@example.com";
 const ED: &str = "ed@example.com";
+const NOBODY: &str = "nobody@example.com";
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -51,6 +52,12 @@ fn open(data: &Path) -> (Door, SocketAddr) {
 }
 
 fn open_with(data: &Path, more: &str) -> (Door, SocketAddr) {
+    let (door, addr, _) = open_auth(data, more);
+    (door, addr)
+}
+
+/// The site, and its accounts (with `NOBODY`, an account with no roles).
+fn open_auth(data: &Path, more: &str) -> (Door, SocketAddr, NexAuth) {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     let conf = Config::from_text(&format!(
         "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{more}",
@@ -78,20 +85,24 @@ fn open_with(data: &Path, more: &str) -> (Door, SocketAddr) {
     }
     auth.ensure_account(ED, PASSWORD, &[MEMBER_ROLE, EDITOR_ROLE])
         .expect("editor");
+    auth.ensure_account(NOBODY, PASSWORD, &[])
+        .expect("no roles");
     let revoker = wiring.revoker.clone();
     let mut web = WebServices::new();
     web.attach(wiring.core.service_tag("web").expect("web"), wiring.site);
+    // The gateway's own settings from the same text (`[ws]`), on a free
+    // port.
     let settings = Settings {
         listen: "127.0.0.1:0".into(),
         workers: 2,
         passports: 8,
         exempt: vec![std::net::IpAddr::from([127, 0, 0, 1])],
-        ..Settings::default()
+        ..Settings::from_config(&conf).expect("gateway settings")
     };
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     revoker.attach_to(&door);
     let addr = door.local_addr().expect("addr");
-    (door, addr)
+    (door, addr, auth)
 }
 
 struct Got {
@@ -507,14 +518,14 @@ fn the_rules_hold_for_every_frame() {
     let e = ann.ask(&format!(
         r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hi"}}]}}"#
     ));
-    assert_eq!(s(&e, "code"), "chat.blocked");
+    assert_eq!(s(&e, "code"), "chat.cannot_write");
     let e = ann.ask(&format!(r#"{{"op":"open","with":"{bob_id}"}}"#));
-    assert_eq!(s(&e, "code"), "chat.blocked");
+    assert_eq!(s(&e, "code"), "chat.cannot_write");
     // Not a frame, not an op, no such account.
     assert_eq!(s(&ann.ask("hello"), "code"), "chat.bad_frame");
     assert_eq!(s(&ann.ask(r#"{"op":"dance"}"#), "code"), "chat.bad_op");
     let e = ann.ask(&format!(r#"{{"op":"open","with":"{:032x}"}}"#, 7));
-    assert_eq!(s(&e, "code"), "chat.unknown_account");
+    assert_eq!(s(&e, "code"), "chat.cannot_write", "the same answer");
 
     // Who may open the socket: no one, a key without `chat`, with it.
     assert_eq!(Client::connect(addr, "").err(), Some(401));
@@ -605,6 +616,171 @@ fn the_messenger_is_off_until_a_site_turns_it_on() {
         slash(&data.0.join("nex"))
     ))
     .expect("config");
-    let err = wasp::wire(&conf).err().expect("refused");
+    let Err(err) = wasp::wire(&conf) else {
+        panic!("a profile chat key wasp does not know is refused");
+    };
     assert!(err.contains("host.a.chat.max_length"), "{err}");
+}
+
+impl Client {
+    /// Sends `frame` and returns every push that came before its answer,
+    /// with the answer last.
+    fn frames_until_answer(&mut self, frame: &str, answer_op: &str) -> Vec<Value> {
+        self.send(frame);
+        let mut out = Vec::new();
+        loop {
+            let f = self.next();
+            let done = s(&f, "op") == answer_op;
+            out.push(f);
+            if done {
+                return out;
+            }
+        }
+    }
+
+    /// Whether the server ends the connection within `secs` seconds.
+    fn ends_within(&mut self, secs: u64) -> bool {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < until {
+            match self.c.poll() {
+                Ok(Event::Close(_)) | Err(_) => return true,
+                Ok(Event::NeedInput) => match self.s.read(self.c.read_buf()) {
+                    Ok(0) => return true,
+                    Ok(n) => self.c.commit(n),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return true,
+                },
+                Ok(_) => {}
+            }
+            self.flush();
+        }
+        false
+    }
+}
+
+fn reads(frames: &[Value]) -> usize {
+    frames.iter().filter(|f| s(f, "op") == "read").count()
+}
+
+#[test]
+fn a_read_reaches_the_other_member_once_and_never_across_a_block() {
+    let data = temp_dir("reads");
+    let (door, addr) = open(&data.0);
+    let (ann_s, bob_s) = (sign_in(addr, ANN), sign_in(addr, BOB));
+    let (mut ann, ann_id) = member(addr, &ann_s);
+    let (mut ann2, _) = member(addr, &ann_s);
+    let (mut bob, bob_id) = member(addr, &bob_s);
+    let (mut bob2, _) = member(addr, &bob_s);
+    let id = s(
+        &ann.ask(&format!(r#"{{"op":"open","with":"{bob_id}"}}"#)),
+        "id",
+    );
+    for t in ["one", "two"] {
+        ann.ask(&format!(
+            r#"{{"op":"send","conversation":"{id}","body":[{{"text":"{t}"}}]}}"#
+        ));
+    }
+    // Every connection takes in the message pushes before what follows.
+    let drain = |c: &mut Client| {
+        c.frames_until_answer(r#"{"op":"conversations"}"#, "conversations");
+    };
+    drain(&mut ann2);
+    drain(&mut bob);
+    drain(&mut bob2);
+
+    let read = format!(r#"{{"op":"read","conversation":"{id}","number":1}}"#);
+    bob.ask(&read);
+    // Each of Ann's connections hears it once; Bob's other one does not.
+    for c in [&mut ann, &mut ann2] {
+        let frames = c.frames_until_answer(r#"{"op":"conversations"}"#, "conversations");
+        assert_eq!(reads(&frames), 1, "{frames:?}");
+        let pushed = frames.iter().find(|f| s(f, "op") == "read").expect("read");
+        assert_eq!(
+            (s(pushed, "member"), n(pushed, "number")),
+            (bob_id.clone(), 1)
+        );
+    }
+    let frames = bob2.frames_until_answer(r#"{"op":"conversations"}"#, "conversations");
+    assert_eq!(reads(&frames), 0, "not to the reader's own: {frames:?}");
+
+    // The same read again moves nothing, so no one hears of it.
+    for _ in 0..5 {
+        assert_eq!(n(&bob.ask(&read), "number"), 1);
+    }
+    let frames = ann.frames_until_answer(r#"{"op":"conversations"}"#, "conversations");
+    assert_eq!(reads(&frames), 0, "{frames:?}");
+
+    // Ann blocks Bob: his reads no longer reach her.
+    ann.ask(&format!(
+        r#"{{"op":"block","account":"{bob_id}","on":true}}"#
+    ));
+    bob.ask(&format!(
+        r#"{{"op":"read","conversation":"{id}","number":2}}"#
+    ));
+    let frames = ann.frames_until_answer(r#"{"op":"conversations"}"#, "conversations");
+    assert_eq!(reads(&frames), 0, "never across a block: {frames:?}");
+    let _ = ann_id;
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn only_members_can_be_written_to_and_changed_permissions_end_a_connection() {
+    let data = temp_dir("perms");
+    // Both rechecks every second: the session's (its roles read again) and
+    // the connection's.
+    let (door, addr, auth) = open_auth(
+        &data.0,
+        &format!("{CHAT_ON}[ws]\nrecheck = \"1s\"\n[auth.session]\nrecheck = \"1s\"\n"),
+    );
+    let (mut ann, _) = member(addr, &sign_in(addr, ANN));
+    // An account without the member role is not one to write to: the same
+    // answer as for none.
+    let nobody = auth.known(NOBODY).expect("lookup").expect("there");
+    let e = ann.ask(&format!(r#"{{"op":"open","with":"{:032x}"}}"#, nobody.0));
+    assert_eq!(s(&e, "code"), "chat.cannot_write");
+    // Ann becomes an editor: the connection that read her member limits
+    // ends, and a new one has the editor's.
+    auth.ensure_roles(ANN, &[EDITOR_ROLE]).expect("grant");
+    assert!(ann.ends_within(10), "a change of roles ends the connection");
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_taken_number_is_never_written_over() {
+    use wasp::chat::{ChatStore, ConvId, Message, Span};
+    let data = temp_dir("numbers");
+    let (door, addr, auth) = open_auth(&data.0, CHAT_ON);
+    let (mut ann, ann_id) = member(addr, &sign_in(addr, ANN));
+    let (mut bob, bob_id) = member(addr, &sign_in(addr, BOB));
+    let id = s(
+        &ann.ask(&format!(r#"{{"op":"open","with":"{bob_id}"}}"#)),
+        "id",
+    );
+    // Message 1 is kept, but whoever wrote it stopped before it moved the
+    // conversation's last number (a crash, or another node).
+    let store = auth.chat_store();
+    let planted = Message {
+        conversation: id.parse::<ConvId>().expect("id"),
+        number: 1,
+        author: u128::from_str_radix(&ann_id, 16).expect("hex"),
+        at_ms: 1,
+        body: vec![Span {
+            text: "first".to_owned(),
+            marks: 0,
+            href: None,
+        }],
+    };
+    assert!(store.append(&planted).expect("append"));
+    assert!(!store.append(&planted).expect("append"), "create only");
+    let sent = ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"second"}}]}}"#
+    ));
+    assert_eq!(n(&sent, "number"), 2, "{sent:?}");
+    let page = bob.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(texts(&page), ["first", "second"]);
+    let _ = door.close(Duration::from_secs(2));
 }
