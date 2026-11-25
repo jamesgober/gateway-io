@@ -15,8 +15,9 @@
 //! - every `ws.recheck` the upgrade head is authenticated again, and a
 //!   connection whose caller changed, is suspended, or may no longer use
 //!   the route is closed;
-//! - each connection has a message budget, and each account at most
-//!   `ws.per_account` connections.
+//! - each account has a message budget across its connections (a bouncer
+//!   budget class charged once per message), and at most `ws.per_account`
+//!   connections.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use bouncer_io::{Bouncer, Directive, Ticket};
+use bouncer_io::{AccountKey, Bouncer, BudgetClass, Directive, SessionKey, Ticket};
 use serve_net::{Envelope, HttpHead, Version};
 pub use serve_net::{WebSocketConn, WebSocketService, WsMessage, WsSendError, WsSender};
 use wasp_core::{
@@ -80,8 +81,8 @@ pub struct WsSettings {
     /// Open connections per account (`ws.per_account`, default 8; 0 for no
     /// cap).
     pub per_account: u32,
-    /// Messages a second per connection (`ws.rate`, default 20; 0 for no
-    /// budget).
+    /// Messages a second per account, across its connections (`ws.rate`,
+    /// default 20; 0 for no budget).
     pub rate: u32,
     /// The most messages at once after a quiet spell (`ws.burst`, default
     /// twice the rate).
@@ -112,15 +113,22 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// open before its record goes.
 const PENDING_FOR: Duration = Duration::from_secs(60);
 
+/// The bouncer budget class every WebSocket message is charged to
+/// (`ws.rate`, `ws.burst`): keyed by account, so all of one account's
+/// connections share it.
+pub(crate) const WS_MESSAGES: BudgetClass = BudgetClass(1);
+
 /// Ends open WebSockets (and running requests) when an account, a session
 /// or an API key is revoked: the application calls it on those events. Until
 /// the gateway opens it does nothing.
 ///
-/// It ends the connections themselves, each by its own connection id, never
-/// by revoking the account's or the session's key in the bouncer: a bind is
-/// checked against every revocation of its key until the bouncer clears it,
-/// so a key revocation would also refuse the account's next connection for a
-/// while, which is a ban, not a revocation.
+/// [`Revoker::account`] and [`Revoker::session`] revoke the key in the
+/// bouncer with eject-now: everything running under it ends, idle WebSockets
+/// too, and the account's next sign-in or upgrade binds as usual (a
+/// revocation reaches only what existed when it was made). When the account
+/// itself asked (a password change, signing out everywhere), its own request
+/// is running under that key, so [`Revoker::account_sockets`] ends only its
+/// WebSockets.
 #[derive(Clone, Default)]
 pub struct Revoker(Arc<OnceLock<Weak<WsHub>>>);
 
@@ -149,19 +157,31 @@ impl Revoker {
         self.0.get().and_then(Weak::upgrade)
     }
 
-    /// Every open WebSocket of `account` ends now, idle or not: disabled,
-    /// banned, removed, password changed, signed out everywhere.
+    /// Everything `account` has running ends now, its WebSockets idle or
+    /// not: disabled, banned or removed by someone else.
     pub fn account(&self, account: u128) {
+        if let Some(hub) = self.hub() {
+            let _ = hub
+                .bouncer
+                .apply(Directive::revoke(AccountKey(account)).eject_now());
+        }
+    }
+
+    /// Every open WebSocket of `account` ends now, idle or not, and nothing
+    /// else: for when the account itself asked (password changed, signed out
+    /// everywhere), so the request that asked still gets its answer.
+    pub fn account_sockets(&self, account: u128) {
         if let Some(hub) = self.hub() {
             hub.eject_where(|l| account_of(&l.identity) == Some(account));
         }
     }
 
-    /// What one session or API key opened ends now, by the id the
+    /// What one session or API key has running ends now, by the id the
     /// authenticator gave it (the identity's session id).
     pub fn session(&self, session: u128) {
         if let Some(hub) = self.hub() {
-            hub.eject_where(|l| l.identity.session() == Some(wasp_core::SessionId(session)));
+            let key = SessionKey::from_digest(session.to_le_bytes());
+            let _ = hub.bouncer.apply(Directive::revoke(key).eject_now());
         }
     }
 }
@@ -440,6 +460,15 @@ impl WsHub {
         true
     }
 
+    /// Charges one message of connection `tag` to its account's budget:
+    /// `false` when it is over, or the ticket was revoked.
+    fn charge(&self, tag: u64) -> bool {
+        lock(&self.live)
+            .get_mut(&tag)
+            .and_then(|l| l.ticket.as_mut())
+            .is_none_or(|t| !t.charge(WS_MESSAGES).is_deny())
+    }
+
     /// The connection ended: its ticket goes, and its account's place.
     fn close(&self, tag: u64) {
         let Some(live) = lock(&self.live).remove(&tag) else {
@@ -530,60 +559,21 @@ fn recheck_loop(hub: &Weak<WsHub>, stop: &Receiver<()>, every: Duration) {
     }
 }
 
-/// A token bucket: `rate` a second, at most `burst`.
-struct Bucket {
-    tokens: f64,
-    at: Instant,
-    rate: f64,
-    burst: f64,
-}
-
-impl Bucket {
-    fn new(rate: u32, burst: u32) -> Bucket {
-        Bucket {
-            tokens: f64::from(burst),
-            at: Instant::now(),
-            rate: f64::from(rate),
-            burst: f64::from(burst),
-        }
-    }
-
-    /// Takes one message's place: `false` when over the budget.
-    fn take(&mut self) -> bool {
-        if self.rate <= 0.0 {
-            return true;
-        }
-        let now = Instant::now();
-        let refill = now.duration_since(self.at).as_secs_f64() * self.rate;
-        self.at = now;
-        self.tokens = (self.tokens + refill).min(self.burst);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// The gateway around a site's WebSocket service, for one connection: the
 /// account's room, the message budget, and the record the recheck reads.
 pub(crate) struct GatewayWs {
     hub: Arc<WsHub>,
     inner: Arc<dyn WebSocketService>,
     tag: u64,
-    bucket: Mutex<Bucket>,
     opened: AtomicBool,
 }
 
 impl GatewayWs {
     pub(crate) fn new(hub: Arc<WsHub>, inner: Arc<dyn WebSocketService>, tag: u64) -> GatewayWs {
-        let bucket = Bucket::new(hub.settings.rate, hub.settings.burst);
         GatewayWs {
             hub,
             inner,
             tag,
-            bucket: Mutex::new(bucket),
             opened: AtomicBool::new(false),
         }
     }
@@ -617,7 +607,9 @@ impl WebSocketService for GatewayWs {
         if !self.opened.load(Ordering::Acquire) {
             return;
         }
-        if !lock(&self.bucket).take() {
+        // The account's message budget (and the ticket's revocation): over
+        // it, the connection closes.
+        if !self.hub.charge(self.tag) {
             let _ = conn.close(1008, "too many messages");
             return;
         }
@@ -629,22 +621,5 @@ impl WebSocketService for GatewayWs {
             self.inner.closed(env, code);
             self.hub.close(self.tag);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_bucket_gives_its_burst_then_its_rate() {
-        let mut b = Bucket::new(1, 3);
-        assert!(b.take() && b.take() && b.take());
-        assert!(!b.take(), "the burst is spent");
-        b.at -= Duration::from_secs(2);
-        assert!(b.take() && b.take());
-        assert!(!b.take());
-        let mut free = Bucket::new(0, 0);
-        assert!((0..1000).all(|_| free.take()), "no budget");
     }
 }

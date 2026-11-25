@@ -303,6 +303,31 @@ fn budgets_hold_connections_messages_and_sizes() {
 }
 
 #[test]
+fn the_message_budget_is_the_account_s_across_its_connections() {
+    let (door, addr, tokens) = open(WsSettings {
+        per_account: 2,
+        rate: 1,
+        burst: 2,
+        ..WsSettings::default()
+    });
+    tokens.set("ann", 7, 1);
+    let mut one = connect(addr, "/ws", MEMBER).expect("101");
+    let mut two = connect(addr, "/ws", MEMBER).expect("101");
+    wait_open(&door, 2);
+    for t in ["a", "b"] {
+        one.send_text(t).expect("send");
+        assert_eq!(one.read().expect("echo"), Message::Text(t.into()));
+    }
+    // The burst is spent on the first: the second's first message is over.
+    two.send_text("c").expect("send");
+    match two.read() {
+        Ok(Message::Close(Some((code, _)))) => assert_eq!(code, CloseCode::POLICY_VIOLATION),
+        other => panic!("expected 1008, got {other:?}"),
+    }
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
 fn a_revoked_account_s_idle_connection_ends_at_once_and_may_come_back() {
     let (door, addr, tokens) = open(WsSettings::default());
     tokens.set("ann", 7, 1);
@@ -333,6 +358,16 @@ fn a_revoked_account_s_idle_connection_ends_at_once_and_may_come_back() {
     // One session or key, by its id.
     revoker.session(9 + 1000);
     assert!(ended(&mut bob), "bob's session ended");
+    // The key was revoked, not banned: a new ticket binds it as usual.
+    let bob_header = "Authorization: Bearer bob\r\nOrigin: https://example.com\r\n";
+    let mut bob = connect(addr, "/ws", bob_header).expect("bob comes back");
+    bob.send_text("back").expect("send");
+    assert_eq!(bob.read().expect("echo"), Message::Text("back".into()));
+    // The account's own request asked: only its sockets end.
+    revoker.account_sockets(7);
+    assert!(ended(&mut again), "ann's socket ended");
+    bob.send_text("still").expect("send");
+    assert_eq!(bob.read().expect("echo"), Message::Text("still".into()));
     let _ = door.close(Duration::from_secs(2));
 }
 

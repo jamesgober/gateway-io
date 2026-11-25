@@ -368,7 +368,7 @@ impl NexAuth {
         // A key made by whoever had the old password goes with it, and so
         // does everything open with the old sessions.
         self.revoke_api_keys(user)?;
-        self.revoker.account(user.0);
+        self.revoker.account_sockets(user.0);
         self.open_session(user, from).map(Ok)
     }
 
@@ -507,7 +507,7 @@ impl NexAuth {
         let ended = self.auth()?.revoke_all(account_of(user)).map_err(nex)?;
         self.forget_devices(user)?;
         self.revoke_api_keys(user)?;
-        self.revoker.account(user.0);
+        self.revoker.account_sockets(user.0);
         Ok(ended)
     }
 
