@@ -12,6 +12,8 @@ publish.workspace = true
 wasp-core = { path = "../wasp-core" }
 # Listeners, the connection engine, HTTP/1.1 through http-net, drain.
 serve-net = { workspace = true }
+# WebSocket limits and origin policy (serve-net's `ws` drives the protocol).
+ws-net = { workspace = true }
 # The transport under serve-net (gate, control line, ids).
 net-io = { workspace = true }
 # The door before any byte is read, request tickets, egress on every write.
@@ -28,6 +30,8 @@ gatekeeper = ["dep:gatekeeper-io"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
+# A WebSocket client for the tests.
+ws-net = { workspace = true, features = ["std"] }
 
 [[bench]]
 name = "request_path"

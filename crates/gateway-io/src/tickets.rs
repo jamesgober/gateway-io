@@ -170,8 +170,25 @@ impl RequestTickets {
         worker: u16,
         tag: TicketTag,
     ) -> (Option<Stamps>, Option<Handoff>, Option<Line>) {
+        let (stamps, parked, line, ticket) = self.release_keeping(worker, tag);
+        drop(ticket);
+        (stamps, parked, line)
+    }
+
+    /// [`release_all`](Self::release_all), handing the ticket back instead
+    /// of dropping it (an upgraded connection keeps it for its life).
+    pub(crate) fn release_keeping(
+        &self,
+        worker: u16,
+        tag: TicketTag,
+    ) -> (
+        Option<Stamps>,
+        Option<Handoff>,
+        Option<Line>,
+        Option<Ticket>,
+    ) {
         let Some(shelf) = self.shelves.get(usize::from(worker)) else {
-            return (None, None, None);
+            return (None, None, None, None);
         };
         // Taken out under the lock, dropped after it.
         let gone = shelf.live.lock().ok().and_then(|mut live| {
@@ -185,11 +202,8 @@ impl RequestTickets {
                 stamps,
                 parked,
                 line,
-            }) => {
-                drop(ticket);
-                (stamps, parked, line)
-            }
-            None => (None, None, None),
+            }) => (stamps, parked, line, Some(ticket)),
+            None => (None, None, None, None),
         }
     }
 

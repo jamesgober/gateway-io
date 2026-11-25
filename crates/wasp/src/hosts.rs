@@ -345,6 +345,19 @@ impl WebService for HostRouter {
             .map_or(WorkClass::Quick, |s| s.classify(head))
     }
 
+    fn upgrade(
+        &self,
+        head: &HttpHead<'_>,
+        env: &Envelope,
+        caller: &Caller<'_>,
+    ) -> gateway_io::Upgrade {
+        // Only the site the host names, never another profile's routes.
+        match self.site_for(head.header_str("host")) {
+            Some(site) => site.upgrade(head, env, caller),
+            None => gateway_io::Upgrade::Refuse(421),
+        }
+    }
+
     fn done(&self, env: &Envelope, finished: &Finished) {
         // The request's head is gone by now: every site forgets what it kept
         // for it (each keeps only its own requests).

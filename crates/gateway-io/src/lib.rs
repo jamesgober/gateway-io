@@ -35,6 +35,7 @@ pub mod settings;
 pub mod stages;
 pub mod tickets;
 pub mod web;
+pub mod ws;
 
 pub use crate::access::{AccessEntry, AccessLog};
 pub use crate::control::UrgentControl;
@@ -48,3 +49,4 @@ pub use crate::settings::{Driver, IngressMode, LaneRate, Settings, SettingsError
 pub use crate::stages::StageTimes;
 pub use crate::tickets::RequestTickets;
 pub use crate::web::{Answered, Caller, WaspGate, WebGate, WebService, WebServices, Who};
+pub use crate::ws::{Revoker, Upgrade, WsAccept, WsSettings};

@@ -62,6 +62,12 @@ const TAKEN: &[&str] = &[
     "/about",
 ];
 
+/// `path` checked as [`checked_prefix`] checks a prefix: a path the site
+/// does not use itself.
+pub(crate) fn checked_path(path: &str, key: &str) -> Result<String, String> {
+    checked_prefix(path, key)
+}
+
 /// `prefix`, or why it is refused (named by `key`).
 fn checked_prefix(prefix: &str, key: &str) -> Result<String, String> {
     let ok = prefix.len() > 1

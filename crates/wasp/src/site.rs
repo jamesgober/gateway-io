@@ -77,6 +77,8 @@ pub struct SiteSettings {
     pub admin_theme: AdminSource,
     /// The API (`[api]`, or a host profile's `[host.<name>.api]`).
     pub api: crate::api::ApiSettings,
+    /// The echo WebSocket route's path (`site.ws_echo`, feature `ws-echo`).
+    pub ws_echo: Option<String>,
 }
 
 impl Default for SiteSettings {
@@ -92,6 +94,7 @@ impl Default for SiteSettings {
             https_sign_in: false,
             admin_theme: AdminSource::Builtin,
             api: crate::api::ApiSettings::default(),
+            ws_echo: None,
         }
     }
 }
@@ -114,6 +117,25 @@ fn admin_source(config: &Config) -> Result<AdminSource, String> {
         ));
     }
     Ok(AdminSource::Folder(PathBuf::from(theme)))
+}
+
+/// `site.ws_echo`: a path for the echo WebSocket route, with the `ws-echo`
+/// feature and nex-db accounts only.
+fn ws_echo(config: &Config) -> Result<Option<String>, String> {
+    let e = |e: wasp_core::suite::Error| e.to_string();
+    let Some(path) = config.get::<String>("site.ws_echo").map_err(e)? else {
+        return Ok(None);
+    };
+    if !cfg!(feature = "ws-echo") {
+        return Err(
+            "site.ws_echo needs a build with the `ws-echo` feature: it is for tests and trials"
+                .to_owned(),
+        );
+    }
+    if !nex_accounts(config) {
+        return Err("site.ws_echo needs nex-db accounts (auth.store = \"nex\")".to_owned());
+    }
+    crate::api::checked_path(&path, "site.ws_echo").map(Some)
 }
 
 /// Whether the site's accounts are nex-db's (`auth.store = "nex"`).
@@ -159,6 +181,7 @@ impl SiteSettings {
                 && !config.get_or("site.development", false).map_err(e)?,
             admin_theme: admin_source(config)?,
             api: crate::api::ApiSettings::from_config(config, !nex_accounts(config))?,
+            ws_echo: ws_echo(config)?,
         })
     }
 }

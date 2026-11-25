@@ -169,6 +169,19 @@ pub trait WebService: Send + Sync + 'static {
         WorkClass::Quick
     }
 
+    /// A request that offers a WebSocket upgrade, with the caller the core
+    /// authenticated: whether this is one of the service's WebSocket routes
+    /// and the caller may open it. By default there are none.
+    fn upgrade(
+        &self,
+        head: &HttpHead<'_>,
+        env: &Envelope,
+        caller: &Caller<'_>,
+    ) -> crate::ws::Upgrade {
+        let _ = (head, env, caller);
+        crate::ws::Upgrade::NotHere
+    }
+
     /// serve-net reports the request done (its last byte handed over, or the
     /// connection gone): what the service kept for it can go (web-net's
     /// record of a reply in parts).
@@ -230,6 +243,15 @@ impl WebService for Box<dyn WebService> {
 
     fn classify(&self, head: &HttpHead<'_>) -> WorkClass {
         (**self).classify(head)
+    }
+
+    fn upgrade(
+        &self,
+        head: &HttpHead<'_>,
+        env: &Envelope,
+        caller: &Caller<'_>,
+    ) -> crate::ws::Upgrade {
+        (**self).upgrade(head, env, caller)
     }
 
     fn done(&self, env: &Envelope, finished: &Finished) {

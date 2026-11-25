@@ -392,6 +392,34 @@ impl Core {
         }
     }
 
+    /// Authentication only, for a request that is decided before its body
+    /// and never reaches a service call (a WebSocket upgrade, answered in
+    /// the transport's head hook): the same authenticator as
+    /// [`route`](Self::route), so the same realm, credential and standing
+    /// checks, but no guest cache and no service. A hand-off carries the
+    /// identity and the gate's token; give its passport back with
+    /// [`Handoff::finish`].
+    pub fn authenticate(&self, p: Passport<Inspected>) -> Routed {
+        let Some(profile) = self.profiles.get(usize::from(p.trip().profile.0)) else {
+            return Routed::Exit(p.refuse(500));
+        };
+        let mut p = p;
+        let mut out = AuthOut::from_parts(p.take_auth_cookie());
+        let decided = self.authenticator.authenticate(p.view(), profile, &mut out);
+        let (cookie, token) = out.into_parts();
+        p.put_auth_out(cookie, token);
+        match decided {
+            Authentication::Identified(identity) => Routed::Handoff(Handoff {
+                p: p.identify(identity),
+                service: profile.service,
+            }),
+            Authentication::Refused(refusal) => Routed::Exit(p.refuse_with(refusal)),
+            Authentication::Unavailable => {
+                Routed::Exit(p.refuse_with(Refusal::status(503).retry_after(AUTH_RETRY_AFTER)))
+            }
+        }
+    }
+
     /// Finishes a hand-off whose service said every guest may be given the
     /// same reply for `ttl` (web-net's `Served::cache`). For a guest, `copy`
     /// writes that reply (status, fields, body) into the passport and the

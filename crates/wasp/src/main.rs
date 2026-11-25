@@ -129,7 +129,8 @@ fn main() -> ExitCode {
         Gateway::new(wiring.core)
             .web("web", wiring.site)
             .stages(wiring.stages)
-            .lane_rates(wiring.api_budget.into_iter().collect()),
+            .lane_rates(wiring.api_budget.into_iter().collect())
+            .revoker(wiring.revoker),
     ) {
         return failed(boot.foundation(), &error);
     }

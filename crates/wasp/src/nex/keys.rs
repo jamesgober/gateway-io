@@ -328,6 +328,8 @@ impl NexAuth {
             .unwrap_or("")
             .to_owned();
         self.auth()?.revoke_api_key(kid).map_err(nex)?;
+        // What the key opened (a WebSocket) ends with it.
+        self.revoker.session(key_session(kid).0);
         content.delete(route.entity()).map_err(nex)?;
         Ok(Some(label))
     }

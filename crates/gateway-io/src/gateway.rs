@@ -67,6 +67,8 @@ pub struct Door {
     ejector: Arc<bouncer::DoorEjector>,
     /// The load watch, while it runs.
     load: Option<Watcher>,
+    /// The open WebSockets.
+    ws: Arc<crate::ws::WsHub>,
 }
 
 impl Door {
@@ -175,6 +177,13 @@ impl Door {
                 pool.workers()
             )));
         }
+        let ws = crate::ws::WsHub::start(
+            settings.ws.clone(),
+            core.clone(),
+            pool.clone(),
+            bouncer.clone(),
+        )
+        .map_err(|e| OpenError(format!("websockets: {e}")))?;
         let bound = built
             .bind(
                 Pipeline::with_stages(
@@ -187,6 +196,7 @@ impl Door {
                 )
                 .with_access(access)
                 .with_lane_rates(&settings.lane_rates)
+                .with_ws(Some(ws.clone()))
                 .with_cpu(match settings.driver {
                     // One thread per connection already: nothing to gain.
                     Driver::Blocking => None,
@@ -214,7 +224,18 @@ impl Door {
             time,
             ejector,
             load,
+            ws,
         })
+    }
+
+    /// WebSocket connections open now.
+    #[must_use]
+    pub fn websockets(&self) -> usize {
+        self.ws.open_count()
+    }
+
+    pub(crate) fn ws_hub(&self) -> &Arc<crate::ws::WsHub> {
+        &self.ws
     }
 
     /// The first listener's address.
@@ -393,6 +414,9 @@ pub struct Gateway {
     access: Option<(Arc<AccessLog>, bool)>,
     /// Lane budgets per caller the application sets (wasp's API budget).
     lane_rates: Vec<crate::settings::LaneRate>,
+    /// Attached to the door when it opens: the application's account
+    /// events end open WebSockets through it.
+    revoker: Option<crate::ws::Revoker>,
 }
 
 impl Gateway {
@@ -408,7 +432,15 @@ impl Gateway {
             stages: None,
             access: None,
             lane_rates: Vec::new(),
+            revoker: None,
         }
+    }
+
+    /// The application's revoker, attached when the door opens.
+    #[must_use]
+    pub fn revoker(mut self, revoker: crate::ws::Revoker) -> Gateway {
+        self.revoker = Some(revoker);
+        self
     }
 
     /// Charges these lanes to each caller (a session, an API key, or a
@@ -476,6 +508,9 @@ impl Subsystem for Gateway {
                 access,
             },
         )?;
+        if let Some(r) = &self.revoker {
+            r.attach_to(&open);
+        }
         let addr = open
             .local_addr()
             .map_or_else(|| settings.listen.clone(), |a| a.to_string());
@@ -670,6 +705,7 @@ impl Subsystem for Gateway {
                     cpu_threads: running.cpu_threads,
                     ingress: running.ingress,
                     lane_rates: running.lane_rates,
+                    ws: running.ws,
                     ban: applied_ban,
                     exempt: if exempt_applied {
                         next.exempt
