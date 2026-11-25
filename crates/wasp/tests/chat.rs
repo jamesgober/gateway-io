@@ -330,7 +330,8 @@ impl Client {
         loop {
             let f = self.next();
             match f.get("op").and_then(Value::as_str) {
-                Some("message" | "read") if !frame.contains("\"op\":\"read\"") => {}
+                Some("message" | "read" | "member" | "invited" | "removed")
+                    if !frame.contains("\"op\":\"read\"") => {}
                 _ => return f,
             }
         }
@@ -782,5 +783,91 @@ fn a_taken_number_is_never_written_over() {
     assert_eq!(n(&sent, "number"), 2, "{sent:?}");
     let page = bob.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
     assert_eq!(texts(&page), ["first", "second"]);
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_group_reaches_its_members_live_and_outlives_a_restart() {
+    let data = temp_dir("group");
+    let (door, addr) = open(&data.0);
+    let (ann_s, bob_s, eve_s, ed_s) = (
+        sign_in(addr, ANN),
+        sign_in(addr, BOB),
+        sign_in(addr, EVE),
+        sign_in(addr, ED),
+    );
+    let (mut ann, ann_id) = member(addr, &ann_s);
+    let (mut bob, bob_id) = member(addr, &bob_s);
+    let (mut eve, eve_id) = member(addr, &eve_s);
+    let (mut ed, ed_id) = member(addr, &ed_s);
+    let made = ann.ask(r#"{"op":"create","name":"Crew"}"#);
+    assert_eq!(s(&made, "op"), "group", "{made:?}");
+    let id = s(&made, "id");
+    for (who, c) in [(&bob_id, &mut bob), (&eve_id, &mut eve), (&ed_id, &mut ed)] {
+        let inv = ann.ask(&format!(
+            r#"{{"op":"invite","conversation":"{id}","account":"{who}"}}"#
+        ));
+        assert_eq!(s(&inv, "op"), "invite", "{inv:?}");
+        // The invitee hears of it at once.
+        let heard = c.next_op("invited");
+        assert_eq!(
+            (s(&heard, "conversation"), s(&heard, "name")),
+            (id.clone(), "Crew".into())
+        );
+        let joined = c.ask(&format!(r#"{{"op":"join","conversation":"{id}"}}"#));
+        assert_eq!(s(&joined, "op"), "group", "{joined:?}");
+    }
+    // Eve mutes the group; Ed blocks Ann.
+    eve.ask(&format!(
+        r#"{{"op":"mute","conversation":"{id}","on":true}}"#
+    ));
+    ed.ask(&format!(
+        r#"{{"op":"block","account":"{ann_id}","on":true}}"#
+    ));
+    let sent = ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hello crew"}}]}}"#
+    ));
+    assert_eq!(n(&sent, "number"), 1, "{sent:?}");
+    let pushed = bob.next_op("message");
+    assert_eq!(
+        s(pushed.get("message").expect("message"), "conversation"),
+        id
+    );
+    for (c, why) in [(&mut eve, "muted"), (&mut ed, "blocked the author")] {
+        let frames = c.frames_until_answer(r#"{"op":"invites"}"#, "invites");
+        assert!(
+            !frames.iter().any(|f| s(f, "op") == "message"),
+            "no push to one who {why}: {frames:?}"
+        );
+    }
+    // Kicked: Ed's socket hears it, and the group is shut to him.
+    let kicked = ann.ask(&format!(
+        r#"{{"op":"kick","conversation":"{id}","account":"{ed_id}"}}"#
+    ));
+    assert_eq!(s(&kicked, "op"), "kicked", "{kicked:?}");
+    assert_eq!(s(&ed.next_op("removed"), "conversation"), id);
+    let e = ed.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(s(&e, "code"), "chat.not_a_member");
+    let _ = door.close(Duration::from_secs(2));
+    drop((ann, bob, eve, ed));
+
+    // The record and the messages are kept in nex-db.
+    let (door, addr) = open(&data.0);
+    let (mut bob, _) = member(addr, &sign_in(addr, BOB));
+    let g = bob.ask(&format!(r#"{{"op":"group","conversation":"{id}"}}"#));
+    assert_eq!(
+        (s(&g, "name"), n(&g, "count"), s(&g, "owner")),
+        ("Crew".into(), 3, ann_id.clone())
+    );
+    let page = bob.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(texts(&page), ["hello crew"]);
+    // Everyone leaves: the group is gone.
+    bob.ask(&format!(r#"{{"op":"leave","conversation":"{id}"}}"#));
+    let (mut ann, _) = member(addr, &sign_in(addr, ANN));
+    let (mut eve, _) = member(addr, &sign_in(addr, EVE));
+    eve.ask(&format!(r#"{{"op":"leave","conversation":"{id}"}}"#));
+    ann.ask(&format!(r#"{{"op":"leave","conversation":"{id}"}}"#));
+    let e = ann.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(s(&e, "code"), "chat.not_a_member");
     let _ = door.close(Duration::from_secs(2));
 }

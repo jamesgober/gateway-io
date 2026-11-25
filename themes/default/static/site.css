@@ -34,4 +34,6 @@ button.danger { background: var(--danger); border-color: var(--danger); margin-t
 .chat-log .mine{text-align:right}
 .chat-send{display:flex;gap:.5rem}
 .chat-send textarea{flex:1}
+.chat-invites{list-style:none;padding:0}
+.chat-invites li{margin:.25rem 0}
 @media (max-width:40rem){.chat-panes{grid-template-columns:1fr}}

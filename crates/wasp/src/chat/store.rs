@@ -6,14 +6,16 @@ use std::sync::Mutex;
 
 use crate::content::StoreError;
 
-use super::{ConvId, Message, Span};
+use super::{ConvId, Group, Message, Span};
 
 /// One conversation: its id, its members, and its last message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     /// Its id.
     pub id: ConvId,
-    /// Its members' accounts, in order.
+    /// Whether it is a group (its members are in its group record).
+    pub group: bool,
+    /// A direct conversation's two members, in order; empty for a group.
     pub members: Vec<u128>,
     /// The number of its last message; 0 for none.
     pub last: u64,
@@ -80,6 +82,19 @@ pub trait ChatStore: Send + Sync + 'static {
     fn usage(&self, account: u128) -> Result<Usage, StoreError>;
     /// Keeps what `account` has used.
     fn set_usage(&self, account: u128, usage: Usage) -> Result<(), StoreError>;
+    /// The record of group `id`, when there is one.
+    fn group(&self, id: &ConvId) -> Result<Option<Group>, StoreError>;
+    /// Keeps group `id`'s record.
+    fn put_group(&self, id: &ConvId, group: &Group) -> Result<(), StoreError>;
+    /// Takes conversation `id` out of `account`'s list.
+    fn unindex(&self, account: u128, id: &ConvId) -> Result<(), StoreError>;
+    /// Notes, or forgets, that `account` holds an invite to group `id`.
+    fn set_invited(&self, account: u128, id: &ConvId, on: bool) -> Result<(), StoreError>;
+    /// The groups `account` holds invites to (at most 1,000).
+    fn invites_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError>;
+    /// Deletes conversation `id`: its record, its group record, and its
+    /// messages up to `last`.
+    fn delete_conversation(&self, id: &ConvId, last: u64) -> Result<(), StoreError>;
 }
 
 /// Everything in memory: gone at a restart. For tests and trials.
@@ -99,6 +114,8 @@ struct Inner {
     muted: BTreeSet<(ConvId, u128)>,
     blocked: BTreeSet<(u128, u128)>,
     usage: HashMap<u128, Usage>,
+    groups: HashMap<ConvId, Group>,
+    invites: BTreeSet<(u128, ConvId)>,
 }
 
 impl MemoryChat {
@@ -246,6 +263,60 @@ impl ChatStore for MemoryChat {
     fn set_usage(&self, account: u128, usage: Usage) -> Result<(), StoreError> {
         self.with(|i| {
             i.usage.insert(account, usage);
+        });
+        Ok(())
+    }
+
+    fn group(&self, id: &ConvId) -> Result<Option<Group>, StoreError> {
+        Ok(self.with(|i| i.groups.get(id).cloned()))
+    }
+
+    fn put_group(&self, id: &ConvId, group: &Group) -> Result<(), StoreError> {
+        self.with(|i| {
+            i.groups.insert(*id, group.clone());
+        });
+        Ok(())
+    }
+
+    fn unindex(&self, account: u128, id: &ConvId) -> Result<(), StoreError> {
+        self.with(|i| {
+            if let Some(l) = i.lists.get_mut(&account) {
+                l.remove(id);
+            }
+        });
+        Ok(())
+    }
+
+    fn set_invited(&self, account: u128, id: &ConvId, on: bool) -> Result<(), StoreError> {
+        self.with(|i| {
+            if on {
+                i.invites.insert((account, *id));
+            } else {
+                i.invites.remove(&(account, *id));
+            }
+        });
+        Ok(())
+    }
+
+    fn invites_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError> {
+        Ok(self.with(|i| {
+            i.invites
+                .iter()
+                .filter(|(a, _)| *a == account)
+                .map(|(_, id)| *id)
+                .take(1000)
+                .collect()
+        }))
+    }
+
+    fn delete_conversation(&self, id: &ConvId, _last: u64) -> Result<(), StoreError> {
+        self.with(|i| {
+            i.conversations.remove(id);
+            i.messages.remove(id);
+            i.groups.remove(id);
+            for l in i.lists.values_mut() {
+                l.remove(id);
+            }
         });
         Ok(())
     }

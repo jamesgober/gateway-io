@@ -404,7 +404,7 @@ Each account may hold `ws.per_account` connections (then 429), each connection m
 
 ## Messenger
 
-With nex-db accounts, members can send each other direct messages. It is off until `[chat] enabled = true`. Then the site has a WebSocket route at `/ws/chat` and a page at `/chat` that uses it (the default theme has one; a theme without `pages/chat.html` gets the route only).
+With nex-db accounts, members can send each other direct messages and talk in groups. It is off until `[chat] enabled = true`. Then the site has a WebSocket route at `/ws/chat` and a page at `/chat` that uses it (the default theme has one; a theme without `pages/chat.html` gets the route only).
 
 ```toml
 [chat]
@@ -412,10 +412,17 @@ enabled = true
 max_length = 4000      # characters in one message
 max_conversations = 500  # conversations one account may start
 max_messages = 100000  # messages one account may keep sent; 0 for no cap
+rate = 5               # sends a second, per account
+fanout = 2000          # deliveries a second, per account
+
+[chat.group]
+max_members = 200
+invite_days = 14
 
 [chat.role.member]
 page = 50              # messages in one page of history
 history = 1000         # how far back a member can page; 0 for all
+groups = true          # whether members may start groups
 ```
 
 With host profiles, each profile takes `[chat]`'s switch and path unless its own `[host.<name>.chat]` sets `enabled` or `path`, so one profile can have the messenger and another not. Profiles in the same realm share its conversations.
@@ -441,6 +448,30 @@ A message is `{"conversation","number","author","at","body"}`: messages are numb
 A body is a list of spans, never HTML: `{"text":"hello","marks":["bold"]}`, with `href` for a link. Members may use `bold`, `italic` and `link` (an `http(s)://` address or one on the site, never with a backslash). Editors and admins may also use `code`, `pre`, `quote` and `strike`. A body holds at most 64 spans and `chat.max_length` characters, and no control characters but newlines. The page puts every span on the screen as text.
 
 Each frame is checked on its own: the caller must be a member of the conversation (`chat.not_a_member`). You can write only to an active member of the realm, and a block in either direction stops opening and sending both ways. All of these get the same answer, `chat.cannot_write`, so it never tells whether an account exists or who blocked whom. Past a quota the answer is `chat.quota`. An error is `{"op":"error","code":..,"message":..}`, with the `nonce` when the frame had one. The `[ws]` budgets apply to the connection, and so do the standing checks: a disabled or banned account, a password change or a revoked key ends the connection at once, and a change of roles ends it at the next recheck, so the new limits apply when it connects again.
+
+### Groups
+
+A group is a conversation with a name, one owner, moderators and members. People join by invite only. The roles are the group's own: owning a group gives nothing on the site, and a site admin gets nothing special in someone else's group.
+
+| Send | Who | Answer |
+|---|---|---|
+| `{"op":"create","name":".."}` | a role with `groups` (members, by default) | `{"op":"group","id":..,"name":..,"owner":..,"moderators":[..],"count":n,"settings":{..}}`; it counts as a conversation started |
+| `{"op":"invite","conversation":..,"account":..}` | the owner and moderators, or any member with `members_invite` | `{"op":"invite",..}`; the account gets `{"op":"invited","conversation","name","by"}` |
+| `{"op":"invites"}` | anyone | `{"op":"invites","items":[{"conversation","name","by","until"}]}` |
+| `{"op":"join","conversation":..}` / `decline` | the one invited | the group's record / `{"op":"declined"}` |
+| `{"op":"leave","conversation":..}` | a member | `{"op":"left"}`; an owner who leaves hands the group to the longest-standing moderator, else member, and the last one out deletes the group and its messages |
+| `{"op":"kick","conversation":..,"account":..,"ban":true}` | the owner (anyone), a moderator (members) | `{"op":"kicked",..}`; the account gets `{"op":"removed"}`. A ban keeps it from being invited again until `unban` |
+| `{"op":"role","conversation":..,"account":..,"role":"moderator"}` | the owner | `{"op":"role",..}`; `member` takes it back |
+| `{"op":"transfer","conversation":..,"account":..}` | the owner | the group's record; the old owner stays as a moderator |
+| `{"op":"settings","conversation":..,"name":..,"cap":n,"marks":"advanced","history":n,"before_join":true,"members_invite":true}` | the owner | the group's record, pushed to every member too; any key may be left out |
+| `{"op":"members","conversation":..,"after":n}` | a member | `{"op":"members","items":[{"account","role","joined"}],"more":n}`, 100 at a time |
+| `{"op":"group","conversation":..}` | a member | the group's record |
+
+`history`, `send`, `read` and `mute` work in a group as in a direct conversation. A group's `cap` counts members and open invites together (50 by default, at most `chat.group.max_members`). With `marks = "advanced"`, an author may use the advanced marks only as far as their site role allows. A reader pages back as far as the smaller of the group's `history` and their role's, and a new member sees only what came after they joined unless the group sets `before_join`. Every member's connections get `{"op":"member","conversation","account","event","by"}` when someone joins, leaves, is kicked, changes role or becomes owner. Groups send no read receipts.
+
+An invite is refused with the same `chat.cannot_write` as everywhere else when the account isn't an active member of the realm, is banned from the group, or has a block either way with whoever invites it. A block never takes anyone out of a group, but the blocker gets none of the blocked account's messages, live or in history. Kicks, bans, role changes, transfers and settings go to the log as audit lines, with account ids and never message text. Group ops on a direct conversation answer `chat.not_a_group`, and an op the caller's place doesn't allow answers `chat.not_allowed`.
+
+Every send is charged to two budgets of the account, across all its connections: `chat.rate` sends a second (bursts of `chat.burst`), and `chat.fanout` deliveries a second (bursts of twice that), where a message costs one delivery for each other member. Over either, the answer is `chat.slow_down` with `retry_ms`, and nothing is kept.
 
 Messages are kept in nex-db, in a content site of their own for each realm, so they survive a restart. A message is written once: its number is taken only if it is free, so nothing is ever written over, even after a crash in the middle of a send. One process sends at a time per conversation for now; several nodes sharing one store is still to come.
 
@@ -505,6 +536,12 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `chat.max_length` | 4000 | characters in one message |
 | `chat.max_conversations` | 500 | conversations one account may start |
 | `chat.max_messages` | 100000 | messages one account may keep sent; `0` for no cap |
+| `chat.rate` | 5 | sends a second for one account, across its connections; `0` for no budget |
+| `chat.burst` | four times `chat.rate` | the most sends at once after a quiet spell |
+| `chat.fanout` | 2000 | deliveries a second for one account (a message costs one per other member); `0` for no budget |
+| `chat.group.max_members` | 200 | the most members and open invites a group may have (2 to 1,000) |
+| `chat.group.invite_days` | 14 | how long an invite lasts, in days |
+| `chat.role.<role>.groups` | true | whether the role may start groups |
 | `chat.role.<role>.page` | 50 (100 for `editor` and `admin`) | messages in one page of history, 1 to 500 |
 | `chat.role.<role>.history` | 1000 (all for `editor` and `admin`) | how many messages back a role can page; `0` for all |
 | `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |

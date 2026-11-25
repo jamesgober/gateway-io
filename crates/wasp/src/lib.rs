@@ -475,11 +475,15 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "chat",
         &[
+            "burst",
             "enabled",
+            "fanout",
+            "group",
             "max_conversations",
             "max_length",
             "max_messages",
             "path",
+            "rate",
             "role",
         ],
     ),
