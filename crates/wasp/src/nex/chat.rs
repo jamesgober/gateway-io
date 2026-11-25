@@ -9,7 +9,7 @@ use nex_db::Patch;
 
 use super::{NexDb, StoreError, nex};
 use crate::chat::store::{ChatStore, Conversation, Usage};
-use crate::chat::{ConvId, Group, Message};
+use crate::chat::{ConvId, Group, Message, Room};
 
 const CONV_KIND: &str = "chat_conv";
 const MEMBER_KIND: &str = "chat_member";
@@ -20,6 +20,7 @@ const BLOCK_KIND: &str = "chat_block";
 const USAGE_KIND: &str = "chat_usage";
 const GROUP_KIND: &str = "chat_group";
 const INVITE_KIND: &str = "chat_invite";
+const ROOM_KIND: &str = "chat_room";
 
 /// The messenger's store for one realm.
 #[derive(Clone, Debug)]
@@ -151,7 +152,7 @@ impl ChatStore for NexChat {
             .collect();
         Ok(Some(Conversation {
             id: *id,
-            group: Self::text(&e, "kind") == "group",
+            kind: crate::chat::store::ConvKind::from_name(&Self::text(&e, "kind")),
             members,
             last: Self::number(&e, "last"),
             at_ms: Self::number(&e, "at"),
@@ -170,7 +171,7 @@ impl ChatStore for NexChat {
             &format!("/c/{}", c.id),
             None,
             &[
-                ("kind", if c.group { "group" } else { "direct" }.to_owned()),
+                ("kind", c.kind.as_str().to_owned()),
                 ("members", members),
                 ("last", "0".to_owned()),
                 ("at", "0".to_owned()),
@@ -396,6 +397,62 @@ impl ChatStore for NexChat {
             self.remove(&format!("/c/{id}/m/{n:020}"))?;
         }
         self.remove(&format!("/c/{id}/g"))?;
+        self.remove(&format!("/c/{id}/room"))?;
         self.remove(&format!("/c/{id}"))
+    }
+
+    fn room(&self, id: &ConvId) -> Result<Option<Room>, StoreError> {
+        Ok(self
+            .entry(&format!("/c/{id}/room"))?
+            .and_then(|(_, e)| Room::from_json(&Self::text(&e, "record"))))
+    }
+
+    fn put_room(&self, id: &ConvId, room: &Room) -> Result<(), StoreError> {
+        self.upsert(
+            ROOM_KIND,
+            &format!("/c/{id}/room"),
+            None,
+            &[("record", room.to_json())],
+        )
+    }
+
+    fn rooms(&self) -> Result<Vec<(ConvId, Room)>, StoreError> {
+        let content = self.content();
+        let mut page = content
+            .list(
+                &nex_db::Listing::latest(ROOM_KIND)
+                    .site(self.site.as_ref())
+                    .limit(1000),
+            )
+            .map_err(nex)?;
+        let mut out = Vec::new();
+        loop {
+            for item in page.items() {
+                let id = item
+                    .route()
+                    .and_then(|(_, p)| p.strip_prefix("/c/"))
+                    .and_then(|p| p.strip_suffix("/room"))
+                    .and_then(|h| h.parse::<ConvId>().ok());
+                let record = item
+                    .field("record")
+                    .and_then(nex_db::Value::as_text)
+                    .and_then(Room::from_json);
+                if let (Some(id), Some(r)) = (id, record) {
+                    out.push((id, r));
+                }
+            }
+            if out.len() >= 1_000_000 {
+                break;
+            }
+            match page.next() {
+                Some(c) => page = content.next_page(c).map_err(nex)?,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError> {
+        self.remove(&format!("/c/{id}/m/{number:020}"))
     }
 }

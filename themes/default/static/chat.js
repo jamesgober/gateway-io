@@ -13,6 +13,10 @@
   const sendForm = $('chat-send');
   const inviteForm = $('chat-invite');
   const invites = $('chat-invites');
+  const roomList = $('chat-rooms');
+  const people = $('chat-people');
+  const peopleTitle = $('chat-people-title');
+  let room = null; // the room this page is in, or null
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = scheme + '//' + location.host + root.dataset.socket;
 
@@ -77,7 +81,8 @@
       const li = document.createElement('li');
       const b = document.createElement('button');
       b.type = 'button';
-      const label = c.kind === 'group' ? c.name + ' (group)' : other(c);
+      const label = c.kind === 'group' ? c.name + ' (group)'
+        : c.kind === 'room' ? c.name + ' (room)' : other(c);
       b.textContent = label + (c.unread > 0 ? ' (' + c.unread + ')' : '');
       if (c.unread > 0) b.className = 'unread';
       b.addEventListener('click', () => select(c.id));
@@ -86,7 +91,40 @@
     }
   }
 
+  function leaveRoom() {
+    if (room) send({ op: 'exit', room });
+    room = null;
+    people.hidden = true;
+    peopleTitle.hidden = true;
+  }
+
+  function drawRooms(items) {
+    roomList.textContent = '';
+    for (const r of items) {
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = r.name + ' (' + r.people + ')';
+      b.title = r.topic || '';
+      b.addEventListener('click', () => { leaveRoom(); send({ op: 'enter', room: r.id }); });
+      li.appendChild(b);
+      roomList.appendChild(li);
+    }
+  }
+
+  function drawPeople(items) {
+    people.textContent = '';
+    for (const p of items) {
+      const li = document.createElement('li');
+      li.textContent = p === me ? p + ' (you)' : p;
+      people.appendChild(li);
+    }
+    people.hidden = false;
+    peopleTitle.hidden = false;
+  }
+
   function select(id) {
+    if (room && room !== id) leaveRoom();
     current = id;
     more = null;
     shown.clear();
@@ -167,12 +205,29 @@
     },
     left(f) { handlers.removed(f); say('You left the group.'); },
     invite() { say('Invited.'); },
+    rooms(f) { drawRooms(f.items || []); },
+    room(f) {
+      if (room === f.id || current === f.id) return;
+      room = f.id;
+      conversations.set(f.id, { id: f.id, kind: 'room', name: f.name, unread: 0, read: 0, last: 0 });
+      select(f.id);
+      inviteForm.hidden = true;
+      say('In ' + f.name + '.');
+      send({ op: 'who', room: f.id });
+    },
+    entered(f) { if (f.room === room) send({ op: 'who', room }); },
+    exited(f) { if (f.room === room && f.account !== me) send({ op: 'who', room }); },
+    who(f) { if (f.room === room) drawPeople(f.items || []); },
+    kicked(f) { outOfRoom(f.room, 'You were put out of the room.'); },
+    banned(f) { outOfRoom(f.room, 'You may not come back to that room for now.'); },
+    room_closed(f) { outOfRoom(f.room, 'The room was closed.'); },
+    muted() { say('You may not write in this room for now.'); },
     error(f) { say(f.message || 'Something went wrong.'); },
   };
 
   function connect() {
     ws = new WebSocket(url);
-    ws.addEventListener('open', () => { say('Connected.'); send({ op: 'invites' }); });
+    ws.addEventListener('open', () => { say('Connected.'); room = null; send({ op: 'invites' }); send({ op: 'rooms' }); });
     ws.addEventListener('message', (e) => {
       let f;
       try { f = JSON.parse(e.data); } catch (_) { return; }
@@ -183,6 +238,18 @@
       say('Disconnected. Trying again…');
       setTimeout(connect, 3000);
     });
+  }
+
+  function outOfRoom(id, why) {
+    if (room !== id) return;
+    room = null;
+    conversations.delete(id);
+    if (current === id) { current = null; log.textContent = ''; sendForm.hidden = true; }
+    people.hidden = true;
+    peopleTitle.hidden = true;
+    drawList();
+    say(why);
+    send({ op: 'rooms' });
   }
 
   function drawInvites(items) {
