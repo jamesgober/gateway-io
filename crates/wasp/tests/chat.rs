@@ -42,10 +42,18 @@ fn slash(p: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
+/// The messenger on, with a member's page of history at two.
+const CHAT_ON: &str =
+    "[api]\nenabled = true\n[chat]\nenabled = true\n[chat.role.member]\npage = 2\n";
+
 fn open(data: &Path) -> (Door, SocketAddr) {
+    open_with(data, CHAT_ON)
+}
+
+fn open_with(data: &Path, more: &str) -> (Door, SocketAddr) {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     let conf = Config::from_text(&format!(
-        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n[api]\nenabled = true\n[chat]\nenabled = true\n[chat.role.member]\npage = 2\n",
+        "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{more}",
         slash(&theme),
         slash(&data.join("nex")),
     ))
@@ -543,4 +551,60 @@ fn the_chat_page_is_for_members() {
     let guest = call(addr, "GET", "/chat", "", "");
     assert_eq!(guest.status, 303, "a guest is sent to sign in");
     let _ = door.close(Duration::from_secs(2));
+}
+
+/// The status a guest's upgrade to `path` on `host` gets: 401 where the
+/// route is, 404 where it is not.
+fn upgrade_status(addr: SocketAddr, host: &str, path: &str) -> u16 {
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    s.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .expect("write");
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).expect("status line");
+    String::from_utf8_lossy(&head[9..12]).parse().unwrap_or(0)
+}
+
+#[test]
+fn the_messenger_is_off_until_a_site_turns_it_on() {
+    let data = temp_dir("off");
+    let (door, addr) = open_with(&data.0, "");
+    assert_eq!(upgrade_status(addr, "localhost", "/ws/chat"), 404);
+    assert_eq!(call(addr, "GET", "/chat", "", "").status, 404);
+    let _ = door.close(Duration::from_secs(2));
+
+    // With host profiles each profile says, and `[chat]` is what they
+    // inherit.
+    let profiles = "[host.a]\nhosts = [\"localhost\"]\n[host.b]\nhosts = [\"b.test\"]\n";
+    let (door, addr) = open_with(
+        &data.0,
+        &format!("{profiles}[host.a.chat]\nenabled = true\npath = \"/ws/talk\"\n"),
+    );
+    assert_eq!(upgrade_status(addr, "localhost", "/ws/talk"), 401);
+    assert_eq!(upgrade_status(addr, "localhost", "/ws/chat"), 404);
+    assert_eq!(upgrade_status(addr, "b.test", "/ws/talk"), 404);
+    assert_eq!(upgrade_status(addr, "b.test", "/ws/chat"), 404);
+    let _ = door.close(Duration::from_secs(2));
+    let (door, addr) = open_with(
+        &data.0,
+        &format!("[chat]\nenabled = true\n{profiles}[host.b.chat]\nenabled = false\n"),
+    );
+    assert_eq!(upgrade_status(addr, "localhost", "/ws/chat"), 401);
+    assert_eq!(upgrade_status(addr, "b.test", "/ws/chat"), 404);
+    let _ = door.close(Duration::from_secs(2));
+
+    // A key a profile's chat table does not know refuses the boot.
+    let conf = Config::from_text(&format!(
+        "[auth]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{profiles}[host.a.chat]\nmax_length = 10\n",
+        slash(&data.0.join("nex"))
+    ))
+    .expect("config");
+    let err = wasp::wire(&conf).err().expect("refused");
+    assert!(err.contains("host.a.chat.max_length"), "{err}");
 }

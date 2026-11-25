@@ -153,6 +153,7 @@ fields = ["path", "referrer"]
 | `content` | the profile's name | its content: a site of its own in nex-db, its own file with bison-db; `default` is the content from before profiles |
 | `realm` | `shared` | the accounts and sessions: `shared` (the site's realm, with `auth.admin`), or a name for a realm of its own; profiles naming the same realm share it |
 | `api` | `[api]` | the profile's own API, `[host.<name>.api]` with `enabled` and `prefix`; the budget is the process's |
+| `chat` | `[chat]` | the profile's own messenger switch, `[host.<name>.chat]` with `enabled` and `path`; the limits are the process's |
 | `admin` | none | the boot account of a realm of its own. Its password comes from the realm's own variable, `WASP_ADMIN_PASSWORD_<REALM>` (`WASP_ADMIN_PASSWORD_BLOG` for `blog`), needed until it exists. It never takes `WASP_ADMIN_PASSWORD`, so one leaked password never opens another realm |
 
 An exact name wins over a wildcard, and the longest wildcard wins. A host belongs to one profile only. A host no profile names gets `[host] default`, or 421 when there is none, and never another profile's pages. A profile's `[host.<name>.errors.*]` and `[host.<name>.log_rule.*]` replace the top-level tables for its hosts; without them it uses `[errors]` and `[log_rule]`. The guest cache keeps every host's pages apart. A realm of its own has its own accounts, sessions, keys and account directory: a session of one realm is no one on a profile of another, and an account of one cannot sign in on the other. Without any `[host.*]` the site is the one `[site]` describes, as before.
@@ -414,6 +415,8 @@ max_length = 4000      # characters in one message
 page = 50              # messages in one page of history
 history = 1000         # how far back a member can page; 0 for all
 ```
+
+With host profiles, each profile takes `[chat]`'s switch and path unless its own `[host.<name>.chat]` sets `enabled` or `path`, so one profile can have the messenger and another not. Profiles in the same realm share its conversations.
 
 `[chat.role.editor]` and `[chat.role.admin]` take the same keys. By default a member pages 50 at a time and 1,000 messages back, and editors and admins 100 at a time with no limit. An account gets the most its roles allow.
 

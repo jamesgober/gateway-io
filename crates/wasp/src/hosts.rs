@@ -70,12 +70,16 @@ pub struct HostProfiles {
 }
 
 const PROFILE_KEYS: &[&str] = &[
-    "admin", "api", "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
+    "admin", "api", "chat", "content", "errors", "hosts", "log_rule", "name", "realm", "theme",
 ];
 
 /// The keys of a profile's `[host.<name>.api]` (the budget is the
 /// process's, in `[api]`).
 const PROFILE_API_KEYS: &[&str] = &["enabled", "prefix"];
+
+/// The keys of a profile's `[host.<name>.chat]` (the limits are the
+/// process's, in `[chat]`).
+const PROFILE_CHAT_KEYS: &[&str] = &["enabled", "path"];
 
 /// `host` as profiles compare it: lower case, without a port or a trailing
 /// dot.
@@ -153,6 +157,16 @@ impl HostProfiles {
                 return Err(format!(
                     "unknown key `{at}.api.{k}`: a host profile's API keys are {}",
                     PROFILE_API_KEYS.join(", ")
+                ));
+            }
+            if let Some(k) = config
+                .keys(&format!("{at}.chat"))
+                .into_iter()
+                .find(|k| !PROFILE_CHAT_KEYS.contains(k))
+            {
+                return Err(format!(
+                    "unknown key `{at}.chat.{k}`: a host profile's chat keys are {}",
+                    PROFILE_CHAT_KEYS.join(", ")
                 ));
             }
             let hosts: Vec<String> = config
