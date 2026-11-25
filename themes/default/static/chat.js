@@ -11,6 +11,8 @@
   const log = $('chat-log');
   const older = $('chat-older');
   const sendForm = $('chat-send');
+  const inviteForm = $('chat-invite');
+  const invites = $('chat-invites');
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = scheme + '//' + location.host + root.dataset.socket;
 
@@ -75,7 +77,8 @@
       const li = document.createElement('li');
       const b = document.createElement('button');
       b.type = 'button';
-      b.textContent = other(c) + (c.unread > 0 ? ' (' + c.unread + ')' : '');
+      const label = c.kind === 'group' ? c.name + ' (group)' : other(c);
+      b.textContent = label + (c.unread > 0 ? ' (' + c.unread + ')' : '');
       if (c.unread > 0) b.className = 'unread';
       b.addEventListener('click', () => select(c.id));
       li.appendChild(b);
@@ -89,6 +92,8 @@
     shown.clear();
     log.textContent = '';
     sendForm.hidden = false;
+    const c = conversations.get(id);
+    inviteForm.hidden = !(c && c.kind === 'group');
     send({ op: 'history', conversation: id });
   }
 
@@ -142,12 +147,32 @@
         drawList();
       }
     },
+    group(f) {
+      const c = conversations.get(f.id) || { id: f.id, unread: 0, read: 0, last: 0 };
+      c.kind = 'group';
+      c.name = f.name;
+      c.count = f.count;
+      const fresh = !conversations.has(f.id);
+      conversations.set(f.id, c);
+      drawList();
+      if (fresh) { select(f.id); send({ op: 'invites' }); }
+    },
+    invites(f) { drawInvites(f.items || []); },
+    invited() { send({ op: 'invites' }); },
+    removed(f) {
+      conversations.delete(f.conversation);
+      if (current === f.conversation) { current = null; log.textContent = ''; sendForm.hidden = true; inviteForm.hidden = true; }
+      drawList();
+      say('You were taken out of a group.');
+    },
+    left(f) { handlers.removed(f); say('You left the group.'); },
+    invite() { say('Invited.'); },
     error(f) { say(f.message || 'Something went wrong.'); },
   };
 
   function connect() {
     ws = new WebSocket(url);
-    ws.addEventListener('open', () => say('Connected.'));
+    ws.addEventListener('open', () => { say('Connected.'); send({ op: 'invites' }); });
     ws.addEventListener('message', (e) => {
       let f;
       try { f = JSON.parse(e.data); } catch (_) { return; }
@@ -160,6 +185,34 @@
     });
   }
 
+  function drawInvites(items) {
+    invites.textContent = '';
+    for (const i of items) {
+      const li = document.createElement('li');
+      li.appendChild(document.createTextNode('Invited to ' + i.name + ' '));
+      const join = document.createElement('button');
+      join.type = 'button';
+      join.textContent = 'Join';
+      join.addEventListener('click', () => send({ op: 'join', conversation: i.conversation }));
+      const no = document.createElement('button');
+      no.type = 'button';
+      no.textContent = 'Decline';
+      no.addEventListener('click', () => { send({ op: 'decline', conversation: i.conversation }); li.remove(); });
+      li.append(join, ' ', no);
+      invites.appendChild(li);
+    }
+  }
+
+  $('chat-create').addEventListener('submit', (e) => {
+    e.preventDefault();
+    send({ op: 'create', name: e.target.elements.name.value });
+    e.target.reset();
+  });
+  inviteForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (current) send({ op: 'invite', conversation: current, account: e.target.elements.account.value.trim().toLowerCase() });
+    e.target.reset();
+  });
   $('chat-open').addEventListener('submit', (e) => {
     e.preventDefault();
     send({ op: 'open', with: e.target.elements.with.value.trim().toLowerCase() });

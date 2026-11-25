@@ -9,7 +9,7 @@ use nex_db::Patch;
 
 use super::{NexDb, StoreError, nex};
 use crate::chat::store::{ChatStore, Conversation, Usage};
-use crate::chat::{ConvId, Message};
+use crate::chat::{ConvId, Group, Message};
 
 const CONV_KIND: &str = "chat_conv";
 const MEMBER_KIND: &str = "chat_member";
@@ -18,6 +18,8 @@ const READ_KIND: &str = "chat_read";
 const MUTE_KIND: &str = "chat_mute";
 const BLOCK_KIND: &str = "chat_block";
 const USAGE_KIND: &str = "chat_usage";
+const GROUP_KIND: &str = "chat_group";
+const INVITE_KIND: &str = "chat_invite";
 
 /// The messenger's store for one realm.
 #[derive(Clone, Debug)]
@@ -149,6 +151,7 @@ impl ChatStore for NexChat {
             .collect();
         Ok(Some(Conversation {
             id: *id,
+            group: Self::text(&e, "kind") == "group",
             members,
             last: Self::number(&e, "last"),
             at_ms: Self::number(&e, "at"),
@@ -167,6 +170,7 @@ impl ChatStore for NexChat {
             &format!("/c/{}", c.id),
             None,
             &[
+                ("kind", if c.group { "group" } else { "direct" }.to_owned()),
                 ("members", members),
                 ("last", "0".to_owned()),
                 ("at", "0".to_owned()),
@@ -330,5 +334,68 @@ impl ChatStore for NexChat {
                 ("messages", usage.messages.to_string()),
             ],
         )
+    }
+
+    fn group(&self, id: &ConvId) -> Result<Option<Group>, StoreError> {
+        Ok(self
+            .entry(&format!("/c/{id}/g"))?
+            .and_then(|(_, e)| Group::from_json(&Self::text(&e, "record"))))
+    }
+
+    fn put_group(&self, id: &ConvId, group: &Group) -> Result<(), StoreError> {
+        self.upsert(
+            GROUP_KIND,
+            &format!("/c/{id}/g"),
+            None,
+            &[("record", group.to_json())],
+        )
+    }
+
+    fn unindex(&self, account: u128, id: &ConvId) -> Result<(), StoreError> {
+        self.remove(&format!("/a/{}/{id}", hex(account)))
+    }
+
+    fn set_invited(&self, account: u128, id: &ConvId, on: bool) -> Result<(), StoreError> {
+        let path = format!("/i/{}/{id}", hex(account));
+        if on {
+            self.upsert(
+                INVITE_KIND,
+                &path,
+                Some(account),
+                &[("conversation", id.to_string())],
+            )
+        } else {
+            self.remove(&path)
+        }
+    }
+
+    fn invites_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError> {
+        let page = self
+            .content()
+            .list(
+                &nex_db::Listing::latest(INVITE_KIND)
+                    .site(self.site.as_ref())
+                    .by_author(account_id(account))
+                    .limit(1000),
+            )
+            .map_err(nex)?;
+        let prefix = format!("/i/{}/", hex(account));
+        Ok(page
+            .items()
+            .iter()
+            .filter_map(|item| {
+                item.route()
+                    .and_then(|(_, p)| p.strip_prefix(&prefix))
+                    .and_then(|h| h.parse::<ConvId>().ok())
+            })
+            .collect())
+    }
+
+    fn delete_conversation(&self, id: &ConvId, last: u64) -> Result<(), StoreError> {
+        for n in 1..=last {
+            self.remove(&format!("/c/{id}/m/{n:020}"))?;
+        }
+        self.remove(&format!("/c/{id}/g"))?;
+        self.remove(&format!("/c/{id}"))
     }
 }
