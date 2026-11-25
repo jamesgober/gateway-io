@@ -276,6 +276,13 @@ fn a_browser_and_a_program_open_the_echo_route_by_the_page_rules() {
         connect(addr, &format!("Authorization: Bearer {bare}\r\n")).err(),
         Some(403)
     );
+    // Nor is a key made for the messenger alone, though it holds the member
+    // bit.
+    let chatter = make_key(addr, &session, "&scope=chat");
+    assert_eq!(
+        connect(addr, &format!("Authorization: Bearer {chatter}\r\n")).err(),
+        Some(403)
+    );
     // No one, and a bad key.
     assert_eq!(connect(addr, "").err(), Some(401));
     assert_eq!(

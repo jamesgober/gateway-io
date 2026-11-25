@@ -73,8 +73,12 @@ pub const MAX_DEPTH: usize = 16;
 /// The longest text read, in bytes.
 pub const MAX_LEN: usize = 1 << 20;
 
-/// The most members in one array or object.
-pub const MAX_ITEMS: usize = 10_000;
+/// The most items in one array.
+pub const MAX_ITEMS: usize = 1_000;
+
+/// The most members in one object: frames and stored bodies have a few
+/// keys each.
+pub const MAX_MEMBERS: usize = 32;
 
 /// Reads `text` as one JSON value (whitespace around it allowed).
 ///
@@ -143,6 +147,7 @@ impl Reader<'_> {
         }
         self.at += 1;
         let mut members: Vec<(String, Value)> = Vec::new();
+        let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         self.ws();
         if self.peek() == Some(b'}') {
             self.at += 1;
@@ -154,7 +159,10 @@ impl Reader<'_> {
                 return Err("an object key must be a string");
             }
             let key = self.string()?;
-            if members.iter().any(|(k, _)| *k == key) {
+            if members.len() == MAX_MEMBERS {
+                return Err("too many members");
+            }
+            if !keys.insert(key.clone()) {
                 return Err("a key appears twice");
             }
             self.ws();
@@ -165,9 +173,6 @@ impl Reader<'_> {
             self.ws();
             let v = self.value(depth)?;
             members.push((key, v));
-            if members.len() > MAX_ITEMS {
-                return Err("too many members");
-            }
             self.ws();
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -346,5 +351,23 @@ mod tests {
         assert!(parse(&deep).is_err());
         let ok = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
         assert!(parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn big_objects_are_refused_early() {
+        let object = |n: usize| {
+            let members: Vec<String> = (0..n).map(|i| format!("\"k{i}\":1")).collect();
+            format!("{{{}}}", members.join(","))
+        };
+        assert!(parse(&object(MAX_MEMBERS)).is_ok());
+        assert_eq!(parse(&object(MAX_MEMBERS + 1)), Err("too many members"));
+        // A frame as big as a WebSocket message allows, all keys: refused
+        // after a few dozen, not checked pair by pair.
+        let t = std::time::Instant::now();
+        assert!(parse(&object(20_000)).is_err());
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+        let items = |n: usize| format!("[{}]", vec!["1"; n].join(","));
+        assert!(parse(&items(MAX_ITEMS)).is_ok());
+        assert_eq!(parse(&items(MAX_ITEMS + 1)), Err("too many items"));
     }
 }

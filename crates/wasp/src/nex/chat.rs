@@ -1,14 +1,14 @@
 //! The messenger's store on nex-db (G-83): one content site per realm
 //! (`wasp-chat`, or `wasp-chat-<realm>`), an entity per conversation, per
-//! message, per read marker, per mute and per block, and an index entry per
-//! member authored by its account.
+//! message, per read marker, per mute, per block and per account's usage, and
+//! an index entry per member authored by its account.
 
 use std::sync::Arc;
 
 use nex_db::Patch;
 
 use super::{NexDb, StoreError, nex};
-use crate::chat::store::{ChatStore, Conversation};
+use crate::chat::store::{ChatStore, Conversation, Usage};
 use crate::chat::{ConvId, Message};
 
 const CONV_KIND: &str = "chat_conv";
@@ -17,9 +17,7 @@ const MESSAGE_KIND: &str = "chat_msg";
 const READ_KIND: &str = "chat_read";
 const MUTE_KIND: &str = "chat_mute";
 const BLOCK_KIND: &str = "chat_block";
-
-/// The most conversations an account's list reads.
-const MAX_CONVERSATIONS: usize = 10_000;
+const USAGE_KIND: &str = "chat_usage";
 
 /// The messenger's store for one realm.
 #[derive(Clone, Debug)]
@@ -74,23 +72,18 @@ impl NexChat {
             .to_owned()
     }
 
-    /// Writes `fields` to the entity at `path`, making it when there is none.
-    fn upsert(
+    fn number(entry: &nex_db::Entry, name: &str) -> u64 {
+        Self::text(entry, name).parse().unwrap_or(0)
+    }
+
+    /// A new entity at `path`: `false` when the path is taken.
+    fn put(
         &self,
         kind: &str,
         path: &str,
         author: Option<u128>,
         fields: &[(&str, String)],
-    ) -> Result<(), StoreError> {
-        let content = self.content();
-        if let Some((rid, _)) = self.entry(path)? {
-            let patch = fields
-                .iter()
-                .fold(Patch::new(), |p, (k, v)| p.set(*k, v.as_str()));
-            content.save_draft(rid, patch).map_err(nex)?;
-            content.publish(rid).map_err(nex)?;
-            return Ok(());
-        }
+    ) -> Result<bool, StoreError> {
         let mut entity = nex_db::Entity::new(kind)
             .site(self.site.as_ref())
             .path(path);
@@ -100,10 +93,41 @@ impl NexChat {
         for (k, v) in fields {
             entity = entity.field(*k, v.as_str());
         }
-        match content.put(entity) {
-            Ok(_) | Err(nex_db::Error::AlreadyExists { .. }) => Ok(()),
+        match self.content().put(entity) {
+            Ok(_) => Ok(true),
+            Err(nex_db::Error::AlreadyExists { .. }) => Ok(false),
             Err(e) => Err(nex(e)),
         }
+    }
+
+    /// Writes `fields` to the entity at `path`, making it when there is none.
+    fn upsert(
+        &self,
+        kind: &str,
+        path: &str,
+        author: Option<u128>,
+        fields: &[(&str, String)],
+    ) -> Result<(), StoreError> {
+        if let Some((rid, _)) = self.entry(path)? {
+            return self.change(rid, fields);
+        }
+        if !self.put(kind, path, author, fields)? {
+            // Made meanwhile: write to it.
+            if let Some((rid, _)) = self.entry(path)? {
+                return self.change(rid, fields);
+            }
+        }
+        Ok(())
+    }
+
+    fn change(&self, rid: nex_db::EntityId, fields: &[(&str, String)]) -> Result<(), StoreError> {
+        let content = self.content();
+        let patch = fields
+            .iter()
+            .fold(Patch::new(), |p, (k, v)| p.set(*k, v.as_str()));
+        content.save_draft(rid, patch).map_err(nex)?;
+        content.publish(rid).map_err(nex)?;
+        Ok(())
     }
 
     fn remove(&self, path: &str) -> Result<(), StoreError> {
@@ -123,93 +147,107 @@ impl ChatStore for NexChat {
             .split_whitespace()
             .filter_map(|h| u128::from_str_radix(h, 16).ok())
             .collect();
-        Ok(Some(Conversation { id: *id, members }))
+        Ok(Some(Conversation {
+            id: *id,
+            members,
+            last: Self::number(&e, "last"),
+            at_ms: Self::number(&e, "at"),
+        }))
     }
 
-    fn create(&self, c: &Conversation) -> Result<(), StoreError> {
-        if self.entry(&format!("/c/{}", c.id))?.is_some() {
-            return Ok(());
-        }
+    fn create(&self, c: &Conversation) -> Result<bool, StoreError> {
         let members = c
             .members
             .iter()
             .map(|m| hex(*m))
             .collect::<Vec<_>>()
             .join(" ");
-        self.upsert(
+        self.put(
             CONV_KIND,
             &format!("/c/{}", c.id),
             None,
-            &[("members", members), ("last", "0".to_owned())],
-        )?;
-        for m in &c.members {
-            self.upsert(
-                MEMBER_KIND,
-                &format!("/a/{}/{}", hex(*m), c.id),
-                Some(*m),
-                &[("conversation", c.id.to_string())],
-            )?;
-        }
-        Ok(())
+            &[
+                ("members", members),
+                ("last", "0".to_owned()),
+                ("at", "0".to_owned()),
+            ],
+        )
     }
 
-    fn conversations_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError> {
+    fn index(&self, account: u128, id: &ConvId) -> Result<(), StoreError> {
+        // Published again, the entry moves to the front of the listing.
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        self.upsert(
+            MEMBER_KIND,
+            &format!("/a/{}/{id}", hex(account)),
+            Some(account),
+            &[("conversation", id.to_string()), ("at", at.to_string())],
+        )
+    }
+
+    fn conversations_of(
+        &self,
+        account: u128,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<ConvId>, Option<String>), StoreError> {
         let content = self.content();
-        let mut page = content
-            .list(
-                &nex_db::Listing::latest(MEMBER_KIND)
-                    .site(self.site.as_ref())
-                    .by_author(account_id(account))
-                    .limit(1000),
-            )
-            .map_err(nex)?;
+        let page = match after {
+            None => content
+                .list(
+                    &nex_db::Listing::latest(MEMBER_KIND)
+                        .updated()
+                        .site(self.site.as_ref())
+                        .by_author(account_id(account))
+                        .limit(limit),
+                )
+                .map_err(nex)?,
+            Some(text) => {
+                let cursor = nex_db::Cursor::parse(text)
+                    .map_err(|_| StoreError::invalid("not a place in the list"))?;
+                content.next_page(&cursor).map_err(nex)?
+            }
+        };
+        // Only this account's entries, whatever a cursor says.
         let prefix = format!("/a/{}/", hex(account));
-        let mut out = Vec::new();
-        loop {
-            for item in page.items() {
-                if let Some(id) = item
-                    .route()
+        let ids = page
+            .items()
+            .iter()
+            .filter_map(|item| {
+                item.route()
+                    .filter(|(site, _)| *site == &*self.site)
                     .and_then(|(_, p)| p.strip_prefix(&prefix))
                     .and_then(|h| h.parse::<ConvId>().ok())
-                {
-                    out.push(id);
-                }
-            }
-            if out.len() >= MAX_CONVERSATIONS {
-                break;
-            }
-            match page.next() {
-                Some(c) => page = content.next_page(c).map_err(nex)?,
-                None => break,
-            }
-        }
-        Ok(out)
+            })
+            .collect();
+        Ok((ids, page.next().map(ToString::to_string)))
     }
 
-    fn last_number(&self, id: &ConvId) -> Result<u64, StoreError> {
-        Ok(self
-            .entry(&format!("/c/{id}"))?
-            .and_then(|(_, e)| Self::text(&e, "last").parse().ok())
-            .unwrap_or(0))
-    }
-
-    fn append(&self, m: &Message) -> Result<(), StoreError> {
-        let id = m.conversation;
-        self.upsert(
+    fn append(&self, m: &Message) -> Result<bool, StoreError> {
+        self.put(
             MESSAGE_KIND,
-            &format!("/c/{id}/m/{:020}", m.number),
+            &format!("/c/{}/m/{:020}", m.conversation, m.number),
             Some(m.author),
             &[
                 ("author", hex(m.author)),
                 ("at", m.at_ms.to_string()),
                 ("body", crate::chat::spans_json(&m.body)),
             ],
-        )?;
-        self.upsert(
-            CONV_KIND,
-            &format!("/c/{id}"),
-            None,
-            &[("last", m.number.to_string())],
+        )
+    }
+
+    fn set_last(&self, id: &ConvId, number: u64, at_ms: u64) -> Result<(), StoreError> {
+        let Some((rid, e)) = self.entry(&format!("/c/{id}"))? else {
+            return Ok(());
+        };
+        if number <= Self::number(&e, "last") {
+            return Ok(());
+        }
+        self.change(
+            rid,
+            &[("last", number.to_string()), ("at", at_ms.to_string())],
         )
     }
 
@@ -222,7 +260,7 @@ impl ChatStore for NexChat {
             conversation: *id,
             number,
             author: u128::from_str_radix(&Self::text(&e, "author"), 16).unwrap_or(0),
-            at_ms: Self::text(&e, "at").parse().unwrap_or(0),
+            at_ms: Self::number(&e, "at"),
             body,
         }))
     }
@@ -230,8 +268,7 @@ impl ChatStore for NexChat {
     fn read_marker(&self, id: &ConvId, account: u128) -> Result<u64, StoreError> {
         Ok(self
             .entry(&format!("/c/{id}/r/{}", hex(account)))?
-            .and_then(|(_, e)| Self::text(&e, "n").parse().ok())
-            .unwrap_or(0))
+            .map_or(0, |(_, e)| Self::number(&e, "n")))
     }
 
     fn set_read(&self, id: &ConvId, account: u128, number: u64) -> Result<(), StoreError> {
@@ -271,5 +308,27 @@ impl ChatStore for NexChat {
         } else {
             self.remove(&path)
         }
+    }
+
+    fn usage(&self, account: u128) -> Result<Usage, StoreError> {
+        Ok(self
+            .entry(&format!("/q/{}", hex(account)))?
+            .map(|(_, e)| Usage {
+                started: Self::number(&e, "started"),
+                messages: Self::number(&e, "messages"),
+            })
+            .unwrap_or_default())
+    }
+
+    fn set_usage(&self, account: u128, usage: Usage) -> Result<(), StoreError> {
+        self.upsert(
+            USAGE_KIND,
+            &format!("/q/{}", hex(account)),
+            Some(account),
+            &[
+                ("started", usage.started.to_string()),
+                ("messages", usage.messages.to_string()),
+            ],
+        )
     }
 }

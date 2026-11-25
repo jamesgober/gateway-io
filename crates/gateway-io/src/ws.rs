@@ -463,7 +463,8 @@ impl WsHub {
     }
 
     /// Authenticates every open connection's head again, and closes the ones
-    /// whose caller changed, is suspended, or fails the route's rule now.
+    /// whose caller changed, holds other permissions, is suspended, or fails
+    /// the route's rule now.
     fn recheck_all(&self) {
         let open: Vec<(u64, Envelope, Arc<OwnedHead>, Identity, Rule)> = lock(&self.live)
             .iter()
@@ -475,7 +476,10 @@ impl WsHub {
             });
             let keep = match found {
                 Identified::Caller(now, _) => {
+                    // Changed permissions end it too: the service read what
+                    // they allowed when it opened.
                     now.subject() == was.subject()
+                        && now.perms() == was.perms()
                         && now.standing() == Standing::Good
                         && matches!(self.core.access().check(&now, &rule), Decision::Allow)
                 }

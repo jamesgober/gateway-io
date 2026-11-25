@@ -5,24 +5,25 @@
 //!
 //! | The client sends | The server answers |
 //! |---|---|
-//! | `{"op":"conversations"}` | `{"op":"conversations","items":[..]}` (also sent on connect) |
+//! | `{"op":"conversations","after":".."}` | `{"op":"conversations","items":[..],"more":".." or null}`, a page, the most recent first (the first page is also sent on connect) |
 //! | `{"op":"open","with":"<account>"}` | `{"op":"conversation","id":..,"members":[..]}` |
 //! | `{"op":"history","conversation":..,"before":n,"limit":n}` | `{"op":"history","conversation":..,"messages":[..],"more":n or null}` |
 //! | `{"op":"send","conversation":..,"body":[spans],"nonce":".."}` | `{"op":"sent","nonce":..,"conversation":..,"number":n}` |
-//! | `{"op":"read","conversation":..,"number":n}` | `{"op":"read",..}`, pushed to the members |
+//! | `{"op":"read","conversation":..,"number":n}` | `{"op":"read",..}`, pushed to the other member when the marker moves |
 //! | `{"op":"mute","conversation":..,"on":true}` | `{"op":"muted","conversation":..,"on":true}` |
 //! | `{"op":"block","account":..,"on":true}` | `{"op":"blocked","account":..,"on":true}` |
 //!
 //! Every open connection of each member gets `{"op":"message","message":..}`
 //! for a new message (not a member who muted the conversation), and
-//! `{"op":"read",..}` when a member reads. An error is
+//! `{"op":"read",..}` when the other member reads (never across a block).
+//! An error is
 //! `{"op":"error","code":..,"message":..}`, with the `nonce` when there was
 //! one.
 
 pub mod store;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gateway_io::ws::{WebSocketConn, WebSocketService, WsMessage, WsSender};
@@ -30,7 +31,7 @@ use serve_net::Envelope;
 use wasp_core::PermSet;
 use wasp_core::suite::config::Config;
 
-pub use store::{ChatStore, Conversation, MemoryChat};
+pub use store::{ChatStore, Conversation, MemoryChat, Usage};
 
 use crate::api::{Obj, list};
 use crate::json::{self, Value};
@@ -272,6 +273,12 @@ pub struct ChatSettings {
     pub editor: Limits,
     /// Admins' limits (`[chat.role.admin]`).
     pub admin: Limits,
+    /// The most conversations one account may start
+    /// (`chat.max_conversations`, 500).
+    pub max_conversations: u64,
+    /// The most messages one account may keep sent
+    /// (`chat.max_messages`, 100,000; 0 for no cap).
+    pub max_messages: u64,
 }
 
 impl Default for ChatSettings {
@@ -280,6 +287,8 @@ impl Default for ChatSettings {
             enabled: false,
             path: "/ws/chat".to_owned(),
             max_length: 4000,
+            max_conversations: 500,
+            max_messages: 100_000,
             member: Limits {
                 page: 50,
                 history: 1000,
@@ -297,7 +306,14 @@ impl Default for ChatSettings {
 }
 
 /// The keys of `[chat]`.
-pub const KEYS: &[&str] = &["enabled", "max_length", "path", "role"];
+pub const KEYS: &[&str] = &[
+    "enabled",
+    "max_conversations",
+    "max_length",
+    "max_messages",
+    "path",
+    "role",
+];
 
 impl ChatSettings {
     /// Reads `[chat]`; with `nex` false (no nex-db accounts) turning it on is
@@ -321,6 +337,17 @@ impl ChatSettings {
             .ok()
             .filter(|n| (1..=100_000).contains(n))
             .ok_or_else(|| format!("chat.max_length must be 1 to 100000 characters, not {max}"))?;
+        let max_conversations: u64 = config
+            .get_or("chat.max_conversations", d.max_conversations)
+            .map_err(e)?;
+        if !(1..=1_000_000).contains(&max_conversations) {
+            return Err(format!(
+                "chat.max_conversations must be 1 to 1000000, not {max_conversations}"
+            ));
+        }
+        let max_messages: u64 = config
+            .get_or("chat.max_messages", d.max_messages)
+            .map_err(e)?;
         for role in config.keys("chat.role") {
             if !matches!(role, "member" | "editor" | "admin") {
                 return Err(format!(
@@ -359,6 +386,8 @@ impl ChatSettings {
             enabled,
             path,
             max_length,
+            max_conversations,
+            max_messages,
             member: limits("member", d.member)?,
             editor: limits("editor", d.editor)?,
             admin: limits("admin", d.admin)?,
@@ -382,15 +411,36 @@ impl ChatSettings {
 
 /// Whether an account exists in the realm and may take part.
 pub trait Directory: Send + Sync + 'static {
-    /// Whether `account` may be written to (it exists, and may sign in).
+    /// Whether `account` may be written to: it exists, may sign in, and is
+    /// a member.
     fn reachable(&self, account: u128) -> bool;
 }
 
 impl Directory for crate::nex::NexAuth {
     fn reachable(&self, account: u128) -> bool {
-        self.may_sign_in(wasp_core::UserId(account))
-            .unwrap_or(false)
+        let user = wasp_core::UserId(account);
+        self.may_sign_in(user).unwrap_or(false)
+            && self
+                .role_names(user)
+                .is_ok_and(|r| r.iter().any(|n| n == crate::nex::MEMBER_ROLE))
     }
+}
+
+/// Conversations in one page of the list.
+pub const LIST_PAGE: usize = 50;
+
+/// How many taken numbers a send steps over before it gives up (another
+/// writer, or a send cut short before it moved the conversation's last
+/// number).
+const NUMBER_TRIES: u64 = 64;
+
+/// One open connection, as pushes reach it.
+struct Live {
+    id: u64,
+    sender: WsSender,
+    /// Set when the client stopped reading and pushes to it were dropped:
+    /// its next frame closes it, and it catches up when it comes back.
+    behind: Arc<AtomicBool>,
 }
 
 /// The messenger for one realm: its store, and every open connection by
@@ -400,9 +450,12 @@ pub struct Chat {
     directory: Arc<dyn Directory>,
     realm: String,
     settings: ChatSettings,
-    live: Mutex<HashMap<u128, Vec<(u64, WsSender)>>>,
+    live: Mutex<HashMap<u128, Vec<Live>>>,
     next: AtomicU64,
-    locks: Box<[Mutex<()>]>,
+    /// Numbering, by conversation.
+    conversation_locks: Box<[Mutex<()>]>,
+    /// Quotas, by account. Taken before a conversation's lock, never after.
+    account_locks: Box<[Mutex<()>]>,
 }
 
 impl std::fmt::Debug for Chat {
@@ -450,6 +503,10 @@ fn message_json(m: &Message) -> String {
         .end()
 }
 
+fn stripe(locks: &[Mutex<()>], key: u64) -> &Mutex<()> {
+    &locks[usize::try_from(key % locks.len() as u64).unwrap_or(0)]
+}
+
 impl Chat {
     /// The messenger for `realm` over `store`.
     #[must_use]
@@ -466,7 +523,8 @@ impl Chat {
             settings,
             live: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
-            locks: (0..64).map(|_| Mutex::new(())).collect(),
+            conversation_locks: (0..64).map(|_| Mutex::new(())).collect(),
+            account_locks: (0..64).map(|_| Mutex::new(())).collect(),
         })
     }
 
@@ -476,7 +534,9 @@ impl Chat {
         &self.settings
     }
 
-    /// One connection of `account`, which holds `perms`.
+    /// One connection of `account`, which holds `perms`. The gateway ends
+    /// the connection when the account's permissions change, so what they
+    /// allow is read once, here.
     #[must_use]
     pub fn connection(self: &Arc<Chat>, account: u128, perms: PermSet) -> ChatConn {
         ChatConn {
@@ -486,15 +546,25 @@ impl Chat {
                 || perms.contains(crate::site_nex::ADMIN),
             limits: self.settings.limits_for(perms),
             id: self.next.fetch_add(1, Ordering::Relaxed),
+            behind: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Sends `text` to every open connection of `account`.
+    /// Sends `text` to every open connection of `account`. A connection
+    /// whose client stopped reading is dropped from the pushes, and marked
+    /// to close: it catches up when it comes back.
     fn push(&self, account: u128, text: &str) {
-        let live = lock(&self.live);
-        if let Some(conns) = live.get(&account) {
-            for (_, s) in conns {
-                let _ = s.send_text(text);
+        let mut live = lock(&self.live);
+        if let Some(conns) = live.get_mut(&account) {
+            conns.retain(|c| match c.sender.send_text(text) {
+                Ok(()) => true,
+                Err(_) => {
+                    c.behind.store(true, Ordering::Release);
+                    false
+                }
+            });
+            if conns.is_empty() {
+                live.remove(&account);
             }
         }
     }
@@ -518,12 +588,27 @@ impl Chat {
         let two = self.store.blocked(b, a).map_err(|_| unavailable())?;
         Ok(one || two)
     }
+
+    /// Whether `me` may write to `other` now: `other` is reachable and no
+    /// block stands between them. Which of the two failed is never told.
+    fn may_write(&self, me: u128, other: u128) -> Result<bool, String> {
+        Ok(self.directory.reachable(other) && !self.blocked_between(me, other)?)
+    }
 }
 
 fn unavailable() -> String {
     error(
         "chat.unavailable",
         "Messages cannot be read or kept now. Try again shortly.",
+        None,
+    )
+}
+
+/// The one answer when an account cannot be written to, for any reason.
+fn cannot_write() -> String {
+    error(
+        "chat.cannot_write",
+        "You cannot write to that account.",
         None,
     )
 }
@@ -535,6 +620,7 @@ pub struct ChatConn {
     advanced: bool,
     limits: Limits,
     id: u64,
+    behind: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ChatConn {
@@ -572,7 +658,7 @@ impl ChatConn {
         };
         let nonce = v.get("nonce").and_then(Value::as_str).map(str::to_owned);
         let answer = match v.get("op").and_then(Value::as_str) {
-            Some("conversations") => self.conversations(),
+            Some("conversations") => self.conversations(&v),
             Some("open") => self.open(&v),
             Some("history") => self.history(&v),
             Some("send") => self.send(&v, nonce.as_deref()),
@@ -601,18 +687,29 @@ impl ChatConn {
         }
     }
 
-    fn conversations(&self) -> Result<String, String> {
+    /// One page of the caller's conversations, the most recent first.
+    fn conversations(&self, v: &Value) -> Result<String, String> {
         let chat = &self.chat;
-        let ids = chat
+        let after = v.get("after").and_then(Value::as_str);
+        let (ids, more) = chat
             .store
-            .conversations_of(self.account)
-            .map_err(|_| unavailable())?;
-        let mut items: Vec<(u64, String)> = Vec::with_capacity(ids.len());
+            .conversations_of(self.account, after, LIST_PAGE)
+            .map_err(|e| match e.kind() {
+                crate::content::StoreErrorKind::Invalid => error(
+                    "chat.bad_after",
+                    "`after` is the `more` of the page before.",
+                    None,
+                ),
+                _ => unavailable(),
+            })?;
+        let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             let Ok(Some(c)) = chat.store.conversation(&id) else {
                 continue;
             };
-            let last = chat.store.last_number(&id).map_err(|_| unavailable())?;
+            if !c.members.contains(&self.account) {
+                continue;
+            }
             let read = chat
                 .store
                 .read_marker(&id, self.account)
@@ -621,32 +718,31 @@ impl ChatConn {
                 .store
                 .muted(&id, self.account)
                 .map_err(|_| unavailable())?;
-            let message = if last > 0 {
-                chat.store.message(&id, last).map_err(|_| unavailable())?
-            } else {
-                None
-            };
-            let at = message.as_ref().map_or(0, |m| m.at_ms);
             let members: Vec<String> = c.members.iter().map(|m| hex(*m)).collect();
-            let o = Obj::new()
-                .str("id", &id.to_string())
-                .strs("members", members.iter().map(String::as_str))
-                .num("last", last)
-                .num("read", read.min(last))
-                .num("unread", last.saturating_sub(read))
-                .raw("muted", if muted { "true" } else { "false" });
-            let o = match &message {
-                Some(m) => o.raw("message", &message_json(m)),
-                None => o.null("message"),
-            };
-            items.push((at, o.end()));
+            items.push(
+                Obj::new()
+                    .str("id", &id.to_string())
+                    .strs("members", members.iter().map(String::as_str))
+                    .num("last", c.last)
+                    .num("at", c.at_ms)
+                    .num("read", read.min(c.last))
+                    .num("unread", c.last.saturating_sub(read))
+                    .raw("muted", if muted { "true" } else { "false" })
+                    .end(),
+            );
         }
-        items.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-        Ok(Obj::new()
+        let o = Obj::new()
             .str("op", "conversations")
-            .str("me", &hex(self.account))
-            .raw("items", &list(items.into_iter().map(|(_, s)| s)))
-            .end())
+            .str("me", &hex(self.account));
+        let o = match after {
+            Some(a) => o.str("after", a),
+            None => o.null("after"),
+        };
+        let o = o.raw("items", &list(items));
+        Ok(match more {
+            Some(m) => o.str("more", &m).end(),
+            None => o.null("more").end(),
+        })
     }
 
     fn open(&self, v: &Value) -> Result<String, String> {
@@ -665,15 +761,8 @@ impl ChatConn {
             ));
         }
         let chat = &self.chat;
-        if !chat.directory.reachable(other) {
-            return Err(error(
-                "chat.unknown_account",
-                "There is no such account to write to.",
-                None,
-            ));
-        }
-        if chat.blocked_between(self.account, other)? {
-            return Err(error("chat.blocked", "A block stands between you.", None));
+        if !chat.may_write(self.account, other)? {
+            return Err(cannot_write());
         }
         let id = ConvId::direct(&chat.realm, self.account, other);
         let (lo, hi) = if self.account < other {
@@ -681,11 +770,40 @@ impl ChatConn {
         } else {
             (other, self.account)
         };
-        let c = Conversation {
-            id,
-            members: vec![lo, hi],
-        };
-        chat.store.create(&c).map_err(|_| unavailable())?;
+        {
+            let _quota = lock(stripe(&chat.account_locks, self.account as u64));
+            if chat
+                .store
+                .conversation(&id)
+                .map_err(|_| unavailable())?
+                .is_none()
+            {
+                let mut usage = chat.store.usage(self.account).map_err(|_| unavailable())?;
+                if usage.started >= chat.settings.max_conversations {
+                    return Err(error(
+                        "chat.quota",
+                        "You have started as many conversations as you may.",
+                        None,
+                    ));
+                }
+                let c = Conversation {
+                    id,
+                    members: vec![lo, hi],
+                    last: 0,
+                    at_ms: 0,
+                };
+                if chat.store.create(&c).map_err(|_| unavailable())? {
+                    usage.started += 1;
+                    chat.store
+                        .set_usage(self.account, usage)
+                        .map_err(|_| unavailable())?;
+                }
+            }
+        }
+        // In the opener's list now; in the other's with the first message.
+        chat.store
+            .index(self.account, &id)
+            .map_err(|_| unavailable())?;
         Ok(Obj::new()
             .str("op", "conversation")
             .str("id", &id.to_string())
@@ -702,8 +820,7 @@ impl ChatConn {
             ));
         };
         let chat = &self.chat;
-        chat.member_of(&id, self.account)?;
-        let last = chat.store.last_number(&id).map_err(|_| unavailable())?;
+        let last = chat.member_of(&id, self.account)?.last;
         // How far back this caller may scroll.
         let floor = match self.limits.history {
             0 => 1,
@@ -744,8 +861,8 @@ impl ChatConn {
         let chat = &self.chat;
         let c = chat.member_of(&id, self.account)?;
         for other in c.members.iter().filter(|m| **m != self.account) {
-            if chat.blocked_between(self.account, *other)? {
-                return Err(error("chat.blocked", "A block stands between you.", None));
+            if !chat.may_write(self.account, *other)? {
+                return Err(cannot_write());
             }
         }
         let body = v
@@ -753,20 +870,58 @@ impl ChatConn {
             .ok_or_else(|| error("chat.bad_body", "`body` is a list of spans.", None))?;
         let body = read_spans(body, self.advanced, chat.settings.max_length)
             .map_err(|why| error("chat.bad_body", why, None))?;
-        let stripe = usize::from(id.0[0]) % chat.locks.len();
         let message = {
-            let _numbering = lock(&chat.locks[stripe]);
-            let number = chat.store.last_number(&id).map_err(|_| unavailable())? + 1;
-            let m = Message {
-                conversation: id,
-                number,
-                author: self.account,
-                at_ms: now_ms(),
-                body,
+            let _quota = lock(stripe(&chat.account_locks, self.account as u64));
+            let mut usage = chat.store.usage(self.account).map_err(|_| unavailable())?;
+            if chat.settings.max_messages > 0 && usage.messages >= chat.settings.max_messages {
+                return Err(error(
+                    "chat.quota",
+                    "You have sent as many messages as you may keep.",
+                    None,
+                ));
+            }
+            let message = {
+                let key = u64::from_le_bytes(id.0[..8].try_into().unwrap_or([0; 8]));
+                let _numbering = lock(stripe(&chat.conversation_locks, key));
+                let last = chat
+                    .store
+                    .conversation(&id)
+                    .map_err(|_| unavailable())?
+                    .map_or(c.last, |c| c.last);
+                let mut m = Message {
+                    conversation: id,
+                    number: last + 1,
+                    author: self.account,
+                    at_ms: now_ms(),
+                    body,
+                };
+                // Write once: a number already taken (another process, or a
+                // send cut short before it moved `last`) is stepped over.
+                let mut kept = false;
+                for _ in 0..NUMBER_TRIES {
+                    if chat.store.append(&m).map_err(|_| unavailable())? {
+                        kept = true;
+                        break;
+                    }
+                    m.number += 1;
+                }
+                if !kept {
+                    return Err(unavailable());
+                }
+                chat.store
+                    .set_last(&id, m.number, m.at_ms)
+                    .map_err(|_| unavailable())?;
+                m
             };
-            chat.store.append(&m).map_err(|_| unavailable())?;
-            m
+            usage.messages += 1;
+            let _ = chat.store.set_usage(self.account, usage);
+            message
         };
+        // Both members' lists put it first; the other's gets it now when this
+        // is the first message.
+        for member in &c.members {
+            let _ = chat.store.index(*member, &id);
+        }
         let _ = chat.store.set_read(&id, self.account, message.number);
         let push = Obj::new()
             .str("op", "message")
@@ -798,25 +953,35 @@ impl ChatConn {
         };
         let chat = &self.chat;
         let c = chat.member_of(&id, self.account)?;
-        let last = chat.store.last_number(&id).map_err(|_| unavailable())?;
         let was = chat
             .store
             .read_marker(&id, self.account)
             .map_err(|_| unavailable())?;
-        let now = number.min(last).max(was);
-        chat.store
-            .set_read(&id, self.account, now)
-            .map_err(|_| unavailable())?;
-        let push = Obj::new()
+        let now = number.min(c.last).max(was);
+        let answer = Obj::new()
             .str("op", "read")
             .str("conversation", &id.to_string())
             .str("member", &hex(self.account))
             .num("number", now)
             .end();
-        for member in &c.members {
-            chat.push(*member, &push);
+        // Nothing moved: nothing is written, and no one is told.
+        if now == was {
+            return Ok(answer);
         }
-        Ok(push)
+        chat.store
+            .set_read(&id, self.account, now)
+            .map_err(|_| unavailable())?;
+        // The other members hear it; never across a block, nor one who muted
+        // the conversation.
+        for other in c.members.iter().filter(|m| **m != self.account) {
+            if chat.blocked_between(self.account, *other)?
+                || chat.store.muted(&id, *other).unwrap_or(false)
+            {
+                continue;
+            }
+            chat.push(*other, &answer);
+        }
+        Ok(answer)
     }
 
     fn mute(&self, v: &Value) -> Result<String, String> {
@@ -870,13 +1035,24 @@ impl WebSocketService for ChatConn {
         lock(&self.chat.live)
             .entry(self.account)
             .or_default()
-            .push((self.id, conn.sender()));
-        // Catching up: every conversation, its last message, what is unread.
-        let summary = self.conversations().unwrap_or_else(|e| e);
+            .push(Live {
+                id: self.id,
+                sender: conn.sender(),
+                behind: Arc::clone(&self.behind),
+            });
+        // Catching up: the first page of conversations, with what is unread.
+        let summary = self
+            .conversations(&Value::Obj(Vec::new()))
+            .unwrap_or_else(|e| e);
         let _ = conn.send_text(&summary);
     }
 
     fn message(&self, _env: &Envelope, message: WsMessage<'_>, conn: &mut WebSocketConn<'_>) {
+        if self.behind.load(Ordering::Acquire) {
+            // Pushes were lost while the client was not reading.
+            let _ = conn.close(1013, "missed messages: connect again to catch up");
+            return;
+        }
         let answer = match message {
             WsMessage::Text(t) => self.handle(t),
             _ => error("chat.bad_frame", "Frames are JSON text.", None),
@@ -887,7 +1063,7 @@ impl WebSocketService for ChatConn {
     fn closed(&self, _env: &Envelope, _code: Option<u16>) {
         let mut live = lock(&self.chat.live);
         if let Some(conns) = live.get_mut(&self.account) {
-            conns.retain(|(id, _)| *id != self.id);
+            conns.retain(|c| c.id != self.id);
             if conns.is_empty() {
                 live.remove(&self.account);
             }
@@ -945,6 +1121,10 @@ mod tests {
             ),
             (r#"[{"text":"<b>x</b>\u0007"}]"#, "control"),
             (r#"[{"text":"0123456789x"}]"#, "too long"),
+            (
+                r#"[{"text":"x","marks":["link"],"href":"/\\evil.example"}]"#,
+                "address",
+            ),
         ] {
             let e = read_spans(&v(bad), false, 10).expect_err(bad);
             assert!(e.contains(why), "{bad}: {e}");
@@ -1033,7 +1213,7 @@ mod tests {
         );
         assert!(
             ann.handle(&format!(r#"{{"op":"open","with":"{:032x}"}}"#, 404))
-                .contains("chat.unknown_account")
+                .contains("chat.cannot_write")
         );
         assert!(ann.handle("not json").contains("chat.bad_frame"));
         assert!(ann.handle(r#"{"op":"dance"}"#).contains("chat.bad_op"));
@@ -1054,11 +1234,13 @@ mod tests {
                 r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hi"}}]}}"#
             ))
         };
-        assert!(send(&ann).contains("chat.blocked"));
-        assert!(send(&bob).contains("chat.blocked"));
+        // The same answer as for an account that is not there: a block is
+        // never told.
+        assert!(send(&ann).contains("chat.cannot_write"));
+        assert!(send(&bob).contains("chat.cannot_write"));
         assert!(
             ann.handle(r#"{"op":"open","with":"00000000000000000000000000000002"}"#)
-                .contains("chat.blocked")
+                .contains("chat.cannot_write")
         );
         bob.handle(r#"{"op":"block","account":"00000000000000000000000000000001","on":false}"#);
         assert!(send(&ann).contains("\"op\":\"sent\""));
@@ -1089,5 +1271,149 @@ mod tests {
         assert!(ChatSettings::from_config(&c("[chat.role.guest]\npage = 1\n"), true).is_err());
         assert!(ChatSettings::from_config(&c("[chat.role.member]\npage = 0\n"), true).is_err());
         assert!(ChatSettings::from_config(&c("[chat]\npath = \"/admin/chat\"\n"), true).is_err());
+    }
+
+    fn id_of(answer: &str) -> String {
+        field(answer, "id")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("no id: {answer}"))
+    }
+
+    fn items(answer: &str) -> usize {
+        field(answer, "items")
+            .and_then(|v| v.as_arr().map(<[Value]>::len))
+            .unwrap_or_else(|| panic!("no items: {answer}"))
+    }
+
+    #[test]
+    fn the_list_is_paged_and_shows_a_conversation_once_it_has_a_message() {
+        let chat = chat(ChatSettings::default());
+        let ann = chat.connection(1, crate::site_nex::MEMBER);
+        let mut first = String::new();
+        for other in 100..160u128 {
+            let id = id_of(&ann.handle(&format!(r#"{{"op":"open","with":"{other:032x}"}}"#)));
+            if other == 100 {
+                first = id;
+            }
+        }
+        let page = ann.handle(r#"{"op":"conversations"}"#);
+        assert_eq!(items(&page), LIST_PAGE);
+        let more = field(&page, "more")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .expect("more");
+        let rest = ann.handle(&format!(r#"{{"op":"conversations","after":"{more}"}}"#));
+        assert_eq!(items(&rest), 10);
+        assert_eq!(field(&rest, "more"), Some(Value::Null));
+        assert!(
+            ann.handle(r#"{"op":"conversations","after":"nonsense"}"#)
+                .contains("chat.bad_after")
+        );
+        // Opening one plants nothing in the other's list; the first message
+        // puts it there.
+        let other = chat.connection(100, crate::site_nex::MEMBER);
+        assert_eq!(items(&other.handle(r#"{"op":"conversations"}"#)), 0);
+        ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{first}","body":[{{"text":"hi"}}]}}"#
+        ));
+        let list = other.handle(r#"{"op":"conversations"}"#);
+        assert_eq!(items(&list), 1);
+        assert!(list.contains(&first), "{list}");
+        // And it moves to the front of the sender's.
+        assert!(
+            ann.handle(r#"{"op":"conversations"}"#)
+                .find(&first)
+                .is_some_and(|at| at < 200),
+            "the newest first"
+        );
+    }
+
+    #[test]
+    fn an_account_has_quotas() {
+        let chat = chat(ChatSettings {
+            max_conversations: 2,
+            max_messages: 2,
+            ..ChatSettings::default()
+        });
+        let ann = chat.connection(1, crate::site_nex::MEMBER);
+        let open = |n: u128| ann.handle(&format!(r#"{{"op":"open","with":"{n:032x}"}}"#));
+        let id = id_of(&open(2));
+        id_of(&open(3));
+        assert!(open(4).contains("chat.quota"));
+        // Opening one it has is not starting one.
+        assert_eq!(id_of(&open(2)), id);
+        // Nor is one someone else started.
+        let five = chat.connection(5, crate::site_nex::MEMBER);
+        id_of(&five.handle(r#"{"op":"open","with":"00000000000000000000000000000001"}"#));
+        id_of(&open(5));
+        let send = || {
+            ann.handle(&format!(
+                r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hi"}}]}}"#
+            ))
+        };
+        assert!(send().contains("\"sent\""));
+        assert!(send().contains("\"sent\""));
+        assert!(send().contains("chat.quota"));
+    }
+
+    #[test]
+    fn a_number_is_never_written_twice() {
+        let store = Arc::new(MemoryChat::new());
+        let chat = Chat::new(
+            store.clone(),
+            Arc::new(Everyone),
+            "users",
+            ChatSettings::default(),
+        );
+        let ann = chat.connection(1, crate::site_nex::MEMBER);
+        let id = id_of(&ann.handle(r#"{"op":"open","with":"00000000000000000000000000000002"}"#));
+        let conv: ConvId = id.parse().expect("id");
+        // Message 1 kept, but the send stopped before it moved `last` (a
+        // crash, or another process).
+        let kept = Message {
+            conversation: conv,
+            number: 1,
+            author: 2,
+            at_ms: 1,
+            body: vec![Span {
+                text: "first".to_owned(),
+                marks: 0,
+                href: None,
+            }],
+        };
+        assert!(store.append(&kept).expect("append"));
+        assert!(!store.append(&kept).expect("append"), "taken");
+        let sent = ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{id}","body":[{{"text":"second"}}]}}"#
+        ));
+        assert_eq!(
+            field(&sent, "number").and_then(|v| v.as_int()),
+            Some(2),
+            "{sent}"
+        );
+        assert_eq!(store.message(&conv, 1).expect("read"), Some(kept));
+        assert_eq!(
+            store.conversation(&conv).expect("read").map(|c| c.last),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_read_that_moves_nothing_writes_nothing() {
+        let chat = chat(ChatSettings::default());
+        let ann = chat.connection(1, crate::site_nex::MEMBER);
+        let bob = chat.connection(2, crate::site_nex::MEMBER);
+        let id = id_of(&ann.handle(r#"{"op":"open","with":"00000000000000000000000000000002"}"#));
+        ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hi"}}]}}"#
+        ));
+        let read = |n: u64| {
+            bob.handle(&format!(
+                r#"{{"op":"read","conversation":"{id}","number":{n}}}"#
+            ))
+        };
+        assert_eq!(field(&read(1), "number").and_then(|v| v.as_int()), Some(1));
+        // Past the last message, or back: the marker stays.
+        assert_eq!(field(&read(9), "number").and_then(|v| v.as_int()), Some(1));
+        assert_eq!(field(&read(0), "number").and_then(|v| v.as_int()), Some(1));
     }
 }

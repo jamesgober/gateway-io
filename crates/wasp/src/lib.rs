@@ -472,7 +472,17 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
     ("api", &["burst", "enabled", "prefix", "rate"]),
-    ("chat", &["enabled", "max_length", "path", "role"]),
+    (
+        "chat",
+        &[
+            "enabled",
+            "max_conversations",
+            "max_length",
+            "max_messages",
+            "path",
+            "role",
+        ],
+    ),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];
@@ -626,24 +636,51 @@ fn wire_with(
         );
     }
     let api_budget = api::ApiBudget::from_config(config)?;
-    // The messenger: off unless `[chat] enabled`, and only with nex-db
-    // accounts.
+    // The messenger: off unless `[chat] enabled`, or a host profile's
+    // `[host.<name>.chat] enabled`, and only with nex-db accounts. Each
+    // site's socket path, or none where it is off.
     #[cfg(feature = "store-nex")]
     let chat_settings = chat::ChatSettings::from_config(config, nex_accounts)?;
     #[cfg(feature = "store-nex")]
-    let settings = site::SiteSettings {
-        chat: chat_settings.enabled.then(|| chat_settings.path.clone()),
-        ..settings
-    };
+    let (chat_on, chat_path) = (chat_settings.enabled, chat_settings.path.clone());
     #[cfg(not(feature = "store-nex"))]
-    if config
-        .get_or("chat.enabled", false)
-        .map_err(|e| e.to_string())?
-    {
-        return Err(
-            "chat.enabled needs nex-db accounts: build wasp with the `store-nex` feature"
-                .to_owned(),
-        );
+    let (chat_on, chat_path) = (
+        config
+            .get_or("chat.enabled", false)
+            .map_err(|e| e.to_string())?,
+        "/ws/chat".to_owned(),
+    );
+    let chat_paths: Vec<Option<String>> = match &profiles {
+        None => vec![chat_on.then(|| chat_path.clone())],
+        Some(p) => p
+            .profiles
+            .iter()
+            .map(|x| -> Result<Option<String>, String> {
+                let at = format!("host.{}.chat", x.name);
+                let on: bool = config
+                    .get_or(&format!("{at}.enabled"), chat_on)
+                    .map_err(|e| e.to_string())?;
+                let path: String = config
+                    .get_or(&format!("{at}.path"), chat_path.clone())
+                    .map_err(|e| e.to_string())?;
+                let path = api::checked_path(&path, &format!("{at}.path"))?;
+                Ok(on.then_some(path))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    if chat_paths.iter().any(Option::is_some) {
+        if cfg!(not(feature = "store-nex")) {
+            return Err(
+                "chat.enabled needs nex-db accounts: build wasp with the `store-nex` feature"
+                    .to_owned(),
+            );
+        }
+        if !nex_accounts {
+            return Err(
+                "chat.enabled needs nex-db accounts (auth.store = \"nex\"): conversations are kept with them"
+                    .to_owned(),
+            );
+        }
     }
     // Account events end open WebSockets through it, once the gateway is open.
     let revoker = gateway_io::Revoker::new();
@@ -838,7 +875,15 @@ fn wire_with(
     // settings, its content site, and its own `[host.<name>.errors]` table
     // when it has one.
     let plans: Vec<(site::SiteSettings, String, Option<String>, Option<String>)> = match &profiles {
-        None => vec![(settings.clone(), DEFAULT_CONTENT.to_owned(), None, None)],
+        None => vec![(
+            site::SiteSettings {
+                chat: chat_paths[0].clone(),
+                ..settings.clone()
+            },
+            DEFAULT_CONTENT.to_owned(),
+            None,
+            None,
+        )],
         Some(p) => p
             .profiles
             .iter()
@@ -856,6 +901,7 @@ fn wire_with(
                     s.theme.clone_from(t);
                 }
                 s.api = apis.get(i).cloned().unwrap_or_default();
+                s.chat = chat_paths.get(i).cloned().flatten();
                 (
                     s,
                     x.content.clone(),
@@ -924,7 +970,7 @@ fn wire_with(
                 // One messenger per realm, shared by the profiles in it.
                 let realm_auth = realm.clone().unwrap_or_else(|| a.clone());
                 let realm_name = realm_auth.realm().to_owned();
-                if chat_settings.enabled && !chats.contains_key(&realm_name) {
+                if s.chat.is_some() && !chats.contains_key(&realm_name) {
                     chats.insert(
                         realm_name.clone(),
                         chat::Chat::new(
