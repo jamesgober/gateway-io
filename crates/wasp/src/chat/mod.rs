@@ -550,11 +550,19 @@ impl ChatSettings {
     }
 }
 
-/// Whether an account exists in the realm and may take part.
+/// The realm's accounts, as the messenger needs them.
 pub trait Directory: Send + Sync + 'static {
     /// Whether `account` may be written to: it exists, may sign in, and is
     /// a member.
     fn reachable(&self, account: u128) -> bool;
+    /// Whether `account` holds the site's admin role.
+    fn is_admin(&self, _account: u128) -> bool {
+        false
+    }
+    /// Bans `account` from the whole site: `false` when it could not.
+    fn ban(&self, _account: u128) -> bool {
+        false
+    }
 }
 
 impl Directory for crate::nex::NexAuth {
@@ -564,6 +572,15 @@ impl Directory for crate::nex::NexAuth {
             && self
                 .role_names(user)
                 .is_ok_and(|r| r.iter().any(|n| n == crate::nex::MEMBER_ROLE))
+    }
+
+    fn is_admin(&self, account: u128) -> bool {
+        self.role_names(wasp_core::UserId(account))
+            .is_ok_and(|r| r.iter().any(|n| n == crate::nex::ADMIN_ROLE))
+    }
+
+    fn ban(&self, account: u128) -> bool {
+        crate::nex::NexAuth::ban(self, wasp_core::UserId(account)).is_ok()
     }
 }
 
@@ -2596,9 +2613,18 @@ mod tests {
             ))),
             "chat.no_room"
         );
+        // It cannot read a private room, but it can close one.
         assert_eq!(
-            code(&site.handle(&format!(r#"{{"op":"delete_room","room":"{private}"}}"#))),
+            code(&site.handle(&format!(r#"{{"op":"history","conversation":"{private}"}}"#))),
             "chat.no_room"
+        );
+        assert_eq!(
+            code(&mo.handle(&format!(r#"{{"op":"delete_room","room":"{private}"}}"#))),
+            "chat.no_room"
+        );
+        assert_eq!(
+            op(&site.handle(&format!(r#"{{"op":"delete_room","room":"{private}"}}"#))),
+            "room_closed"
         );
         assert_eq!(
             op(&site.handle(&format!(r#"{{"op":"delete_room","room":"{id}"}}"#))),
@@ -2648,5 +2674,44 @@ mod tests {
             codes.push(code(&send()));
         }
         assert!(codes.contains(&"chat.slow_down".to_owned()), "{codes:?}");
+    }
+
+    /// A directory that knows one admin (9) and keeps who it banned.
+    #[derive(Default)]
+    struct Staffed {
+        banned: Mutex<Vec<u128>>,
+    }
+    impl Directory for Staffed {
+        fn reachable(&self, account: u128) -> bool {
+            !lock(&self.banned).contains(&account)
+        }
+        fn is_admin(&self, account: u128) -> bool {
+            account == 9
+        }
+        fn ban(&self, account: u128) -> bool {
+            lock(&self.banned).push(account);
+            true
+        }
+    }
+
+    #[test]
+    fn a_site_admin_may_ban_an_account_site_wide() {
+        let directory = Arc::new(Staffed::default());
+        let chat = Chat::new(
+            Arc::new(MemoryChat::new()),
+            directory.clone(),
+            "users",
+            ChatSettings::default(),
+        );
+        let ann = member(&chat, 1);
+        let site = admin(&chat, 8);
+        let ban = |c: &ChatConn, who: u128| {
+            c.handle(&format!(r#"{{"op":"ban_account","account":"{who:032x}"}}"#))
+        };
+        assert_eq!(code(&ban(&ann, 2)), "chat.not_allowed");
+        assert_eq!(code(&ban(&site, 9)), "chat.not_allowed", "never an admin");
+        assert_eq!(code(&ban(&site, 8)), "chat.not_allowed", "never oneself");
+        assert_eq!(op(&ban(&site, 2)), "account_banned");
+        assert_eq!(*lock(&directory.banned), vec![2]);
     }
 }

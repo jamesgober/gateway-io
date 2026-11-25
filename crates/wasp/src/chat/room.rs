@@ -560,6 +560,7 @@ impl ChatConn {
             "room_invite" => self.room_list(v, true),
             "room_uninvite" => self.room_list(v, false),
             "delete_room" => self.delete_room(v),
+            "ban_account" => self.ban_account(v),
             _ => Err(error("chat.bad_op", "There is no such op.", None)),
         }
     }
@@ -1430,8 +1431,10 @@ impl ChatConn {
             let Some(r) = chat.room(&id)? else {
                 return Err(not_here());
             };
+            // A site admin may close any room, a private one too (without
+            // reading it), so abuse there is never out of reach.
             staff = r.owner != self.account;
-            if staff && !(self.rank >= 2 && r.access != RoomAccess::Private) {
+            if staff && self.rank < 2 {
                 return Err(if r.may_enter(self.account, self.rank, now_ms()) {
                     not_allowed()
                 } else {
@@ -1468,6 +1471,38 @@ impl ChatConn {
         lock(&chat.presence).remove(&id);
         lock(&chat.room_numbers).remove(&id);
         Ok(closed)
+    }
+}
+
+impl ChatConn {
+    /// A site admin bans an account from the whole site: its sessions,
+    /// keys and connections end. Never another admin, never oneself.
+    fn ban_account(&self, v: &Value) -> Result<String, String> {
+        let target = super::account_of(v, "account").ok_or_else(|| {
+            error(
+                "chat.bad_account",
+                "`account` is an account id (32 hex digits).",
+                None,
+            )
+        })?;
+        let chat = &self.chat;
+        if self.rank < 2 || target == self.account || chat.directory.is_admin(target) {
+            return Err(error(
+                "chat.not_allowed",
+                "Only a site admin may ban an account, and never an admin.",
+                None,
+            ));
+        }
+        if !chat.directory.ban(target) {
+            return Err(unavailable());
+        }
+        // The room it came from, when one is named, goes in the line.
+        let at = room_of(v).unwrap_or(ConvId([0; 16]));
+        chat.audit(self.account, "chat.staff_ban_account", target, &at);
+        Ok(Obj::new()
+            .str("op", "account_banned")
+            .str("account", &hex(target))
+            .end())
     }
 }
 
