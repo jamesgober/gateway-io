@@ -485,6 +485,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "path",
             "rate",
             "role",
+            "rooms",
         ],
     ),
     ("jobs", &["queue", "threads"]),

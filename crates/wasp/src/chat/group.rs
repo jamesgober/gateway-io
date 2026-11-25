@@ -340,7 +340,7 @@ impl super::Chat {
     }
 
     /// Writes an audit line for a moderation step.
-    fn audit(&self, by: u128, action: &'static str, account: u128, id: &ConvId) {
+    pub(super) fn audit(&self, by: u128, action: &'static str, account: u128, id: &ConvId) {
         crate::events::audit_with(
             &hex(by),
             action,
@@ -370,16 +370,16 @@ impl ChatConn {
                 let (id, g, _) = self.in_group(v)?;
                 Ok(group_json(&id, &g))
             }
-            _ => Err(error("chat.bad_op", "There is no such op.", None)),
+            _ => self.room_op(op, v),
         }
     }
 
     /// The group the frame names, when the caller is a member of it.
     fn in_group(&self, v: &Value) -> Result<(ConvId, Arc<Group>, super::GroupMember), String> {
         let id = conv_of(v).ok_or_else(bad_conversation)?;
-        match self.chat.access(&id, self.account)? {
+        match self.chat.access(&id, self.account, self.rank)? {
             Access::Group(_, g, m) => Ok((id, g, m)),
-            Access::Direct(_) => Err(error(
+            Access::Direct(_) | Access::Room(..) => Err(error(
                 "chat.not_a_group",
                 "That conversation is not a group.",
                 None,
@@ -399,7 +399,7 @@ impl ChatConn {
         let chat = &self.chat;
         let _order = chat.conversation_lock(id);
         let c = match chat.store.conversation(id) {
-            Ok(Some(c)) if c.group => c,
+            Ok(Some(c)) if c.kind == super::ConvKind::Group => c,
             Ok(_) => return Err(not_a_member()),
             Err(_) => return Err(unavailable()),
         };
@@ -429,7 +429,7 @@ impl ChatConn {
         let id = ConvId::random().ok_or_else(unavailable)?;
         let c = Conversation {
             id,
-            group: true,
+            kind: super::ConvKind::Group,
             members: Vec::new(),
             last: 0,
             at_ms: 0,

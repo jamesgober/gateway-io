@@ -404,7 +404,7 @@ Each account may hold `ws.per_account` connections (then 429), each connection m
 
 ## Messenger
 
-With nex-db accounts, members can send each other direct messages and talk in groups. It is off until `[chat] enabled = true`. Then the site has a WebSocket route at `/ws/chat` and a page at `/chat` that uses it (the default theme has one; a theme without `pages/chat.html` gets the route only).
+With nex-db accounts, members can send each other direct messages, talk in groups, and meet in rooms. It is off until `[chat] enabled = true`. Then the site has a WebSocket route at `/ws/chat` and a page at `/chat` that uses it (the default theme has one; a theme without `pages/chat.html` gets the route only).
 
 ```toml
 [chat]
@@ -418,6 +418,11 @@ fanout = 2000          # deliveries a second, per account
 [chat.group]
 max_members = 200
 invite_days = 14
+
+[chat.rooms]
+categories = ["general", "help"]
+filter = []            # words no room allows
+max_present = 1000     # people in one room at once
 
 [chat.role.member]
 page = 50              # messages in one page of history
@@ -472,6 +477,34 @@ A group is a conversation with a name, one owner, moderators and members. People
 An invite is refused with the same `chat.cannot_write` as everywhere else when the account isn't an active member of the realm, is banned from the group, or has a block either way with whoever invites it. A block never takes anyone out of a group, but the blocker gets none of the blocked account's messages, live or in history. Kicks, bans, role changes, transfers and settings go to the log as audit lines, with account ids and never message text. Group ops on a direct conversation answer `chat.not_a_group`, and an op the caller's place doesn't allow answers `chat.not_allowed`.
 
 Every send is charged to two budgets of the account, across all its connections: `chat.rate` sends a second (bursts of `chat.burst`), and `chat.fanout` deliveries a second (bursts of twice that), where a message costs one delivery for each other member. Over either, the answer is `chat.slow_down` with `retry_ms`, and nothing is kept.
+
+### Rooms
+
+A room is a place people walk into, and it's about who is in it right now. A connection enters a room and exits it, and closing the socket exits every room. Everyone inside hears `{"op":"entered","room","account"}` and `{"op":"exited",..}` when someone comes or goes, and a message reaches the connections in the room at that moment. Who is in a room is never shown outside it, and it's never stored. Rooms aren't in the conversation list.
+
+A room is `public` (listed in the directory, open to anyone signed in whose site role reaches the room's `role`, members by default), `unlisted` (the same, but entered by id and never listed) or `private` (entered only by the owner, its moderators and the accounts on its list). It's `persistent` (it keeps its messages, and people page back up to its `scroll`, while it keeps its last `keep`) or ephemeral (it keeps nothing, and `history` is empty). Who may make rooms is per role: `[chat.role.<role>] rooms` is `none`, `private` (private and unlisted rooms) or `public` (any). Members get `private` and editors and admins get `public` by default.
+
+| Send | Who | Answer |
+|---|---|---|
+| `{"op":"rooms","category":..,"q":..,"after":n}` | anyone | `{"op":"rooms","items":[{"id","name","topic","category","persistent","people"}],"more":n}`: the public rooms open to you, the busiest first, 50 a page; `q` searches the name and topic |
+| `{"op":"categories"}` | anyone | `{"op":"categories","items":[{"name","rooms"}]}` |
+| `{"op":"create_room","name":..,"topic":..,"category":..,"access":"public","role":"member","persistent":true}` | by `rooms` | the room's record; it counts as a conversation started |
+| `{"op":"room","room":..}` | who may enter | `{"op":"room","id","name","topic","category","access","role","owner","moderators","persistent","scroll","keep","marks","slow","people"}`, with `words` for its moderators |
+| `{"op":"enter","room":..}` / `exit` | who may enter | the room's record / `{"op":"exited"}` |
+| `{"op":"who","room":..,"after":n}` | someone in the room | `{"op":"who","items":[accounts],"more":n}`, 200 a page |
+| `{"op":"send","conversation":<room>,..}` | someone in the room | as for any conversation |
+| `{"op":"room_mute","room":..,"account":..,"minutes":n}` / `room_unmute` | moderators | `{"op":"muted","until":ms}`; muted, they stay in the room but can't write |
+| `{"op":"room_kick","room":..,"account":..,"minutes":5}` | moderators | out now, and back after `minutes` |
+| `{"op":"room_ban","room":..,"account":..,"minutes":n}` / `room_unban` | moderators | out, and kept out until it ends; `minutes` 0 (the default for mutes and bans) is until lifted |
+| `{"op":"room_role","room":..,"account":..,"role":"moderator"}` | the owner | the room's record; `member` takes it back |
+| `{"op":"room_invite","room":..,"account":..}` / `room_uninvite` | moderators of a private room | onto or off its list; the account gets `{"op":"room_invited"}` |
+| `{"op":"room_settings","room":..,..}` | the owner: any of `name`, `category`, `access`, `role`, `persistent`, `scroll`, `keep`, `marks`; moderators too: `topic`, `slow`, `words` | the room's record |
+| `{"op":"delete_room","room":..}` | the owner, or a site admin (any room) | `{"op":"room_closed"}`, also pushed to everyone in it |
+| `{"op":"ban_account","account":..,"room":..}` | a site admin | `{"op":"account_banned"}`: the account is banned from the whole site, and its sessions, keys and connections end. Never another admin. `room`, when given, goes in the audit line |
+
+The target of a mute, kick or ban hears `muted`, `kicked` or `banned` with its end. None of it ever reaches the owner, and a moderator never acts on another moderator. A site admin acts as a moderator in every public and unlisted room. In a private room they can't enter or read anything, but they can close the room and ban an account from the whole site, so abuse there is never out of reach. Every step they take goes to the log as a `staff` audit line. Every moderation step goes to the log, with account ids and never message text. `slow` is slow mode: one message per person per that many seconds, counted from their last one (moderators don't wait). A message that holds a word from the site's `chat.rooms.filter` or the room's `words` (up to 100) as a whole word, ignoring case, is refused with `chat.filtered`. The log counts refusals but never keeps the text. A room you can't enter answers `chat.no_room`, whether it exists or not.
+
+A room holds up to `chat.rooms.max_present` people at once, and a private room's list holds up to the same. A message costs the sender one delivery from `chat.fanout` for each other person in the room, and the whole realm shares `chat.rooms.fanout` deliveries a second, so no number of senders can flood the process. Over either, the answer is `chat.slow_down`. Entered and exited notices are dropped, never queued, when the realm's budget is spent. Rooms live on the process their people connect to for now; one room across several nodes is still to come.
 
 Messages are kept in nex-db, in a content site of their own for each realm, so they survive a restart. A message is written once: its number is taken only if it is free, so nothing is ever written over, even after a crash in the middle of a send. One process sends at a time per conversation for now; several nodes sharing one store is still to come.
 
@@ -542,6 +575,13 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `chat.group.max_members` | 200 | the most members and open invites a group may have (2 to 1,000) |
 | `chat.group.invite_days` | 14 | how long an invite lasts, in days |
 | `chat.role.<role>.groups` | true | whether the role may start groups |
+| `chat.role.<role>.rooms` | `private` (`public` for `editor` and `admin`) | which rooms the role may make: `none`, `private` (private and unlisted) or `public` (any) |
+| `chat.rooms.categories` | `["general"]` | the categories a room may be in (lower case letters, digits and `-`) |
+| `chat.rooms.filter` | none | words no message in any room may hold, one word each |
+| `chat.rooms.max` | 10000 | the most rooms the site may hold |
+| `chat.rooms.max_present` | 1000 | the most people in one room at once, and on a private room's list (2 to 10,000) |
+| `chat.rooms.max_keep` | 100000 | the most messages a persistent room may keep |
+| `chat.rooms.fanout` | 200000 | room deliveries a second across the realm; `0` for no budget |
 | `chat.role.<role>.page` | 50 (100 for `editor` and `admin`) | messages in one page of history, 1 to 500 |
 | `chat.role.<role>.history` | 1000 (all for `editor` and `admin`) | how many messages back a role can page; `0` for all |
 | `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |

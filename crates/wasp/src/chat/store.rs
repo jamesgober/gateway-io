@@ -6,15 +6,49 @@ use std::sync::Mutex;
 
 use crate::content::StoreError;
 
-use super::{ConvId, Group, Message, Span};
+use super::{ConvId, Group, Message, Room, Span};
+
+/// What a conversation is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvKind {
+    /// Two accounts (G-83).
+    Direct,
+    /// A group with a record of its members (G-84).
+    Group,
+    /// A room people walk into (G-85).
+    Room,
+}
+
+impl ConvKind {
+    /// Its name in records and frames.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConvKind::Direct => "direct",
+            ConvKind::Group => "group",
+            ConvKind::Room => "room",
+        }
+    }
+
+    /// The kind `name` names; a record without one is direct.
+    #[must_use]
+    pub fn from_name(name: &str) -> ConvKind {
+        match name {
+            "group" => ConvKind::Group,
+            "room" => ConvKind::Room,
+            _ => ConvKind::Direct,
+        }
+    }
+}
 
 /// One conversation: its id, its members, and its last message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     /// Its id.
     pub id: ConvId,
-    /// Whether it is a group (its members are in its group record).
-    pub group: bool,
+    /// What it is (a group's members are in its group record, a room's
+    /// rules in its room record).
+    pub kind: ConvKind,
     /// A direct conversation's two members, in order; empty for a group.
     pub members: Vec<u128>,
     /// The number of its last message; 0 for none.
@@ -92,9 +126,17 @@ pub trait ChatStore: Send + Sync + 'static {
     fn set_invited(&self, account: u128, id: &ConvId, on: bool) -> Result<(), StoreError>;
     /// The groups `account` holds invites to (at most 1,000).
     fn invites_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError>;
-    /// Deletes conversation `id`: its record, its group record, and its
-    /// messages up to `last`.
+    /// Deletes conversation `id`: its record, its group or room record,
+    /// and its messages up to `last`.
     fn delete_conversation(&self, id: &ConvId, last: u64) -> Result<(), StoreError>;
+    /// The record of room `id`, when there is one.
+    fn room(&self, id: &ConvId) -> Result<Option<Room>, StoreError>;
+    /// Keeps room `id`'s record.
+    fn put_room(&self, id: &ConvId, room: &Room) -> Result<(), StoreError>;
+    /// Every room (at most 1,000,000).
+    fn rooms(&self) -> Result<Vec<(ConvId, Room)>, StoreError>;
+    /// Deletes message `number` of conversation `id`, when it is there.
+    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError>;
 }
 
 /// Everything in memory: gone at a restart. For tests and trials.
@@ -116,6 +158,7 @@ struct Inner {
     usage: HashMap<u128, Usage>,
     groups: HashMap<ConvId, Group>,
     invites: BTreeSet<(u128, ConvId)>,
+    rooms: HashMap<ConvId, Room>,
 }
 
 impl MemoryChat {
@@ -314,8 +357,33 @@ impl ChatStore for MemoryChat {
             i.conversations.remove(id);
             i.messages.remove(id);
             i.groups.remove(id);
+            i.rooms.remove(id);
             for l in i.lists.values_mut() {
                 l.remove(id);
+            }
+        });
+        Ok(())
+    }
+
+    fn room(&self, id: &ConvId) -> Result<Option<Room>, StoreError> {
+        Ok(self.with(|i| i.rooms.get(id).cloned()))
+    }
+
+    fn put_room(&self, id: &ConvId, room: &Room) -> Result<(), StoreError> {
+        self.with(|i| {
+            i.rooms.insert(*id, room.clone());
+        });
+        Ok(())
+    }
+
+    fn rooms(&self) -> Result<Vec<(ConvId, Room)>, StoreError> {
+        Ok(self.with(|i| i.rooms.iter().map(|(k, v)| (*k, v.clone())).collect()))
+    }
+
+    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError> {
+        self.with(|i| {
+            if let Some(m) = i.messages.get_mut(id) {
+                m.remove(&number);
             }
         });
         Ok(())

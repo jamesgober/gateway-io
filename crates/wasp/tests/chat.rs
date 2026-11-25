@@ -330,8 +330,10 @@ impl Client {
         loop {
             let f = self.next();
             match f.get("op").and_then(Value::as_str) {
-                Some("message" | "read" | "member" | "invited" | "removed")
-                    if !frame.contains("\"op\":\"read\"") => {}
+                Some(
+                    "message" | "read" | "member" | "invited" | "removed" | "entered" | "exited"
+                    | "room_invited",
+                ) if !frame.contains("\"op\":\"read\"") => {}
                 _ => return f,
             }
         }
@@ -869,5 +871,93 @@ fn a_group_reaches_its_members_live_and_outlives_a_restart() {
     ann.ask(&format!(r#"{{"op":"leave","conversation":"{id}"}}"#));
     let e = ann.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
     assert_eq!(s(&e, "code"), "chat.not_a_member");
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_room_is_about_who_is_in_it_now() {
+    let data = temp_dir("rooms");
+    let more = format!("{CHAT_ON}[chat.rooms]\ncategories = [\"general\", \"help\"]\n");
+    let (door, addr) = open_with(&data.0, &more);
+    let (ed_s, ann_s, bob_s) = (sign_in(addr, ED), sign_in(addr, ANN), sign_in(addr, BOB));
+    let (mut ed, _) = member(addr, &ed_s);
+    let (mut ann, ann_id) = member(addr, &ann_s);
+    let (mut bob, bob_id) = member(addr, &bob_s);
+    // A second connection of Bob's, not in the room.
+    let (mut bob_away, _) = member(addr, &bob_s);
+    let made = ed.ask(r#"{"op":"create_room","name":"Lobby","topic":"Say hi"}"#);
+    assert_eq!(s(&made, "op"), "room", "{made:?}");
+    let id = s(&made, "id");
+    let quiet = s(
+        &ed.ask(r#"{"op":"create_room","name":"Quiet","persistent":false}"#),
+        "id",
+    );
+    // In the directory, for anyone signed in.
+    let found = ann.ask(r#"{"op":"rooms","q":"lobby"}"#);
+    assert!(format!("{found:?}").contains(&id), "{found:?}");
+
+    ann.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    let entered = bob.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    assert_eq!(n(&entered, "people"), 2, "{entered:?}");
+    // Ann hears Bob come in.
+    let heard = ann.next_op("entered");
+    assert_eq!(s(&heard, "account"), bob_id);
+    let who = ann.ask(&format!(r#"{{"op":"who","room":"{id}"}}"#));
+    assert!(format!("{who:?}").contains(&bob_id), "{who:?}");
+
+    let sent = ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hello room"}}]}}"#
+    ));
+    assert_eq!(s(&sent, "op"), "sent", "{sent:?}");
+    let pushed = bob.next_op("message");
+    assert_eq!(
+        s(pushed.get("message").expect("message"), "conversation"),
+        id
+    );
+    // Bob's other connection is not in the room: nothing reaches it.
+    let frames = bob_away.frames_until_answer(r#"{"op":"invites"}"#, "invites");
+    assert!(
+        !frames.iter().any(|f| s(f, "op") == "message"),
+        "only the room's connections: {frames:?}"
+    );
+
+    // Kicked: Bob hears it and is out; Ann hears him go.
+    let kicked = ed.ask(&format!(
+        r#"{{"op":"room_kick","room":"{id}","account":"{bob_id}"}}"#
+    ));
+    assert_eq!(s(&kicked, "op"), "kicked", "{kicked:?}");
+    assert_eq!(s(&bob.next_op("kicked"), "room"), id);
+    assert_eq!(s(&ann.next_op("exited"), "account"), bob_id);
+
+    // An ephemeral room keeps nothing.
+    ann.ask(&format!(r#"{{"op":"enter","room":"{quiet}"}}"#));
+    ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{quiet}","body":[{{"text":"not kept"}}]}}"#
+    ));
+    let page = ann.ask(&format!(r#"{{"op":"history","conversation":"{quiet}"}}"#));
+    assert!(texts(&page).is_empty(), "{page:?}");
+
+    // Closing the socket is leaving every room.
+    let (mut ed2, _) = member(addr, &ed_s);
+    ed2.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    assert_eq!(s(&ann.next_op("entered"), "account"), s(&made, "owner"));
+    drop(ed2);
+    let _ = ed;
+    // Ed has another connection open but not in the room: he left it.
+    assert_eq!(s(&ann.next_op("exited"), "account"), s(&made, "owner"));
+    let _ = ann_id;
+    let _ = door.close(Duration::from_secs(2));
+    drop((ann, bob, bob_away));
+
+    // The room and its messages are kept; nobody is in it after a restart.
+    let (door, addr) = open_with(&data.0, &more);
+    let (mut ann, _) = member(addr, &sign_in(addr, ANN));
+    let entered = ann.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    assert_eq!(
+        (s(&entered, "name"), n(&entered, "people")),
+        ("Lobby".into(), 1)
+    );
+    let page = ann.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(texts(&page), ["hello room"]);
     let _ = door.close(Duration::from_secs(2));
 }
