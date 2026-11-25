@@ -386,6 +386,21 @@ API requests run in the bulk lane, so under load they are refused before page vi
 
 `[api] enabled = true` turns the API on and `[api] prefix` moves it. A host profile sets its own in `[host.<name>.api]`. With the gatekeeper there is no API.
 
+## WebSockets
+
+A site can hold WebSocket connections through the gateway. Only a route the site declares upgrades; any other request that asks to upgrade is an ordinary request. No route is declared by default: the only one so far is an echo route for tests and trials, in a build with the `ws-echo` feature:
+
+```toml
+[site]
+ws_echo = "/ws/echo"
+```
+
+The caller is signed in as for a page: the session cookie, or `Authorization: Bearer <key>` for a program, in the realm the host picks, with the same standing checks. The route's rule is checked before the switch (the echo route takes a signed-in member; a key needs `account:read`), and a refusal is the HTTP status (401, 403), with nothing switched. A page may open one only from the site's own hosts (`Origin`); a request without `Origin` is not a browser and is judged by its credential alone.
+
+While a connection is open it stays held to those rules. Disabling, banning or removing the account, a password change and signing out everywhere end its connections at once, even idle ones; so do revoking one session or one API key. Every `ws.recheck` the caller is checked again, so an expired session or key, or a role taken away, ends it too.
+
+Each account may hold `ws.per_account` connections (then 429), each connection may send `ws.rate` messages a second in bursts of `ws.burst` (then the connection closes with 1008), and a frame or message over its size is refused by the protocol (1009). The connection is pinged after `ws.ping` of quiet and closed if a second interval passes without a byte. It works through the Unix socket behind the start shim too.
+
 ## Configuration
 
 A key wasp does not know, in any section, refuses the boot with its name, so a typo never leaves a setting at its default.
@@ -435,6 +450,14 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `api.prefix` | `/api/v1` | where the API lives, under `site.base`; never a path the site uses (`/admin`, `/account`, `/posts`, ...) |
 | `api.rate` | 10 | API requests a second for each caller (an account, all its keys and sessions together, or a guest's address); `0` for no budget. Read at boot |
 | `api.burst` | twice `api.rate` | the most at once after a quiet spell, at least `api.rate` |
+| `ws.max_frame` | 65536 | the largest WebSocket frame, in bytes |
+| `ws.max_message` | 262144 | the largest WebSocket message, in bytes (at least `ws.max_frame`) |
+| `ws.ping` | `30s` | a ping after this much quiet; a second interval with no byte back closes the connection |
+| `ws.per_account` | 8 | WebSocket connections one account may hold; `0` for no cap |
+| `ws.rate` | 20 | messages a second per connection; `0` for no budget |
+| `ws.burst` | twice `ws.rate` | the most messages at once after a quiet spell |
+| `ws.recheck` | `15s` | how often an open connection's caller is checked again |
+| `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`; refused unless `gateway.listen` is a loopback address) |

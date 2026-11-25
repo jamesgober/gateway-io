@@ -518,6 +518,7 @@ dependencies = [
  "serve-net",
  "wasp-core",
  "web-net",
+ "ws-net",
 ]
 
 [[package]]
@@ -942,6 +943,7 @@ checksum = "6dd5115d6c04057ef65d3a649752311c5ac297d18f738dbe13c2e3ce2f8a7b1a"
 dependencies = [
  "http-net",
  "net-io",
+ "ws-net",
 ]
 
 [[package]]
@@ -1198,6 +1200,7 @@ dependencies = [
  "serve-net",
  "wasp-core",
  "web-net",
+ "ws-net",
 ]
 
 [[package]]
@@ -1318,6 +1321,16 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "ws-net"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "192c40b13ec71be71c1c07d6d1b88eeebba154dc85d69b1609e2a979792e7bb2"
+dependencies = [
+ "mod-rand",
+ "parse-net 0.9.3",
+]
 
 [[package]]
 name = "zeroize"

@@ -97,6 +97,8 @@ pub struct Pipeline {
     budgeted: [bool; 6],
     /// The pool that answers `WorkClass::Cpu` routes off the worker.
     cpu: Option<Arc<crate::offload::CpuPool>>,
+    /// The open WebSockets; `None` turns upgrades off.
+    ws: Option<Arc<crate::ws::WsHub>>,
 }
 
 /// A passport out of its shelf for one call. If the call unwinds (a panic in
@@ -172,7 +174,75 @@ impl Pipeline {
             access: None,
             budgeted: [false; 6],
             cpu: None,
+            ws: None,
         }
+    }
+
+    /// Lets the web services' WebSocket routes upgrade, held by `hub`.
+    #[must_use]
+    pub(crate) fn with_ws(mut self, hub: Option<Arc<crate::ws::WsHub>>) -> Pipeline {
+        self.ws = hub;
+        self
+    }
+
+    /// A request that offers an upgrade: the caller is authenticated here
+    /// (serve-net never calls `call` for an upgrade), and the web service
+    /// says whether it is one of its WebSocket routes and the caller may
+    /// open it. Its ticket, already held, is bound to the account and the
+    /// session or key, and stays alive with the connection.
+    fn upgrade(&self, head: &HttpHead<'_>, env: &Envelope, tag: TicketTag) -> HeadAction {
+        let Some(hub) = self.ws.as_ref() else {
+            return HeadAction::Proceed;
+        };
+        let Some(web) = self.web.get(ServiceTag(env.tag())) else {
+            return HeadAction::Proceed;
+        };
+        let found = crate::ws::identify(&self.core, &self.pool, env, head, &mut |caller| {
+            web.upgrade(head, env, caller)
+        });
+        let (identity, accept) = match found {
+            crate::ws::Identified::Refused(status) => return HeadAction::refuse(status),
+            crate::ws::Identified::Caller(_, crate::ws::Upgrade::NotHere) => {
+                return HeadAction::Proceed;
+            }
+            crate::ws::Identified::Caller(_, crate::ws::Upgrade::Refuse(status)) => {
+                return HeadAction::refuse(status);
+            }
+            crate::ws::Identified::Caller(identity, crate::ws::Upgrade::Accept(a)) => (identity, a),
+        };
+        if !hub.has_room(&identity) {
+            return HeadAction::refuse(429);
+        }
+        let account = match identity.subject() {
+            wasp_core::Subject::User(u) => Some(u.0),
+            wasp_core::Subject::Guest => None,
+        };
+        let session = identity.session();
+        let bound = self.tickets.with_ticket(env.worker().get(), tag, |ticket| {
+            if let Some(a) = account {
+                let v = ticket.bind_account(bouncer_io::AccountKey(a));
+                if v.is_deny() {
+                    return v;
+                }
+            }
+            match session {
+                Some(s) => {
+                    ticket.bind_session(bouncer_io::SessionKey::from_digest(s.0.to_le_bytes()))
+                }
+                None => bouncer_io::Verdict::Pass,
+            }
+        });
+        if let Some(bouncer_io::Verdict::Deny(d)) = bound {
+            return HeadAction::refuse(d.code.http_status());
+        }
+        hub.pend(
+            tag.get(),
+            crate::ws::OwnedHead::of(head),
+            identity,
+            accept.rule,
+        );
+        let service = crate::ws::GatewayWs::new(Arc::clone(hub), accept.service, tag.get());
+        HeadAction::Upgrade(service.target(accept.origins).into())
     }
 
     /// Answers the routes marked `WorkClass::Cpu` on `pool` instead of the
@@ -656,6 +726,9 @@ impl HttpService for Pipeline {
         match self.tickets.hold_at(env.worker().get(), ticket, hook, line) {
             Some(tag) => {
                 env.set_user_word(tag.get());
+                if head.is_upgrade() {
+                    return self.upgrade(head, env, tag);
+                }
                 HeadAction::Proceed
             }
             None => HeadAction::refuse(503),
@@ -682,9 +755,16 @@ impl HttpService for Pipeline {
             }
             return;
         }
-        let (stamps, parked, line) = self
+        let (stamps, parked, line, ticket) = self
             .tickets
-            .release_all(env.worker().get(), TicketTag::from_raw(env.user_word()));
+            .release_keeping(env.worker().get(), TicketTag::from_raw(env.user_word()));
+        // An upgrade: the ticket stays alive with its connection.
+        match (ticket, &self.ws) {
+            (Some(t), Some(hub)) if hub.is_pending(env.user_word()) => {
+                hub.keep_ticket(env.user_word(), t);
+            }
+            (t, _) => drop(t),
+        }
         if let Some(access) = &self.access {
             access.finished(line, env, finished);
         }

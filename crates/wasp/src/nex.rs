@@ -539,6 +539,9 @@ pub struct NexAuth {
     /// Sessions are issued under their account's stripe, so the new one is
     /// told apart from the others exactly (see `open_session`).
     issuing: Arc<[std::sync::Mutex<()>; 64]>,
+    /// Ends open WebSockets (and running requests) when an account, a
+    /// session or a key is revoked.
+    revoker: gateway_io::Revoker,
 }
 
 /// What a session's last recheck read (its account's permissions and
@@ -619,6 +622,7 @@ impl NexAuth {
             realm: Arc::from(DEFAULT_REALM),
             directory: Arc::from(DIRECTORY),
             issuing: Arc::new(std::array::from_fn(|_| std::sync::Mutex::new(()))),
+            revoker: gateway_io::Revoker::new(),
         }
     }
 
@@ -655,6 +659,14 @@ impl NexAuth {
         } else {
             self.db.db().auth_realm(&self.realm).map_err(nex)
         }
+    }
+
+    /// The same authenticator, ending open WebSockets through `revoker` on
+    /// account, session and key events.
+    #[must_use]
+    pub fn with_revoker(mut self, revoker: gateway_io::Revoker) -> NexAuth {
+        self.revoker = revoker;
+        self
     }
 
     /// The same authenticator, reading its settings from `policy`.
@@ -887,7 +899,9 @@ impl NexAuth {
                 nex_db::Standing::Banned { reason: 1 },
                 None,
             )
-            .map_err(nex)
+            .map_err(nex)?;
+        self.revoker.account(user.0);
+        Ok(())
     }
 
     /// The first step of a sign-in: `identifier` and `password`. Every

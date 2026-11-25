@@ -365,8 +365,10 @@ impl NexAuth {
         auth.set_password(account, &hashed).map_err(nex)?;
         let _ = auth.revoke_all(account).map_err(nex)?;
         self.forget_devices(user)?;
-        // A key made by whoever had the old password goes with it.
+        // A key made by whoever had the old password goes with it, and so
+        // does everything open with the old sessions.
         self.revoke_api_keys(user)?;
+        self.revoker.account(user.0);
         self.open_session(user, from).map(Ok)
     }
 
@@ -471,6 +473,16 @@ impl NexAuth {
         let content = self.db.db().content();
         let path = format!("/{}/s/{sid}", hex_of(account));
         if let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? {
+            // What the session opened (a WebSocket) ends with it, by the id
+            // the authenticator gave it: its token's digest, kept here.
+            let digest = content.get(route.entity()).ok().flatten().and_then(|r| {
+                r.field("token")
+                    .and_then(nex_db::Value::as_text)
+                    .and_then(|t| u128::from_str_radix(t, 16).ok())
+            });
+            if let Some(d) = digest {
+                self.revoker.session(d);
+            }
             let _ = content.delete(route.entity());
         }
         Ok(ended)
@@ -495,6 +507,7 @@ impl NexAuth {
         let ended = self.auth()?.revoke_all(account_of(user)).map_err(nex)?;
         self.forget_devices(user)?;
         self.revoke_api_keys(user)?;
+        self.revoker.account(user.0);
         Ok(ended)
     }
 
@@ -593,6 +606,7 @@ impl NexAuth {
         )
         .map_err(nex)?;
         let _ = auth.revoke_all(account).map_err(nex)?;
+        self.revoker.account(user.0);
         self.forget_devices(user)
     }
 
@@ -618,6 +632,7 @@ impl NexAuth {
     /// directory entry.
     pub fn remove(&self, user: UserId) -> Result<(), StoreError> {
         self.auth()?.erase_account(account_of(user)).map_err(nex)?;
+        self.revoker.account(user.0);
         if let Some((rid, _)) = self.entry(user)? {
             self.db.db().content().delete(rid).map_err(nex)?;
         }

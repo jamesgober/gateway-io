@@ -27,6 +27,7 @@ pub mod site_account;
 #[cfg(feature = "store-nex")]
 pub mod site_nex;
 pub mod theme;
+pub mod ws;
 
 use std::sync::Arc;
 
@@ -73,6 +74,9 @@ pub struct Wiring {
     /// The API's budget per caller, for the gateway (`None` when no site has
     /// the API or `api.rate = 0`).
     pub api_budget: Option<gateway_io::LaneRate>,
+    /// Ends open WebSockets on account events; attach it to the gateway
+    /// once it is open.
+    pub revoker: gateway_io::Revoker,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -426,6 +430,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "service",
             "theme",
             "theme_poll",
+            "ws_echo",
         ],
     ),
     ("content", &["fields", "path", "recovery", "store"]),
@@ -591,6 +596,8 @@ fn wire_with(
         );
     }
     let api_budget = api::ApiBudget::from_config(config)?;
+    // Account events end open WebSockets through it, once the gateway is open.
+    let revoker = gateway_io::Revoker::new();
     #[cfg(not(feature = "gatekeeper"))]
     let _ = secret_dir;
     #[cfg(not(any(feature = "gatekeeper", feature = "store-nex")))]
@@ -646,7 +653,9 @@ fn wire_with(
                 config,
                 cfg!(feature = "mfa"),
             )?);
-            let a = nex::NexAuth::new(db.clone()).with_policy(cell.clone());
+            let a = nex::NexAuth::new(db.clone())
+                .with_policy(cell.clone())
+                .with_revoker(revoker.clone());
             // A host profile with a realm of its own signs in there: one
             // authenticator per profile, picked by host in the core.
             nex_realms = match &profiles {
@@ -860,7 +869,7 @@ fn wire_with(
                     .as_ref()
                     .is_some_and(|r| r.realm() != nex::DEFAULT_REALM);
                 let boot = if own { own_admin } else { boot.clone() };
-                Box::new(site_nex::build(
+                let app: Box<dyn gateway_io::WebService> = Box::new(site_nex::build(
                     realm.unwrap_or(a),
                     core.access().clone(),
                     manifest,
@@ -868,7 +877,14 @@ fn wire_with(
                     &s,
                     site_keys(config, secret_dir, boot)?,
                     ready,
-                )?)
+                )?);
+                // Its WebSocket routes, when it declares any.
+                let routes = ws::routes(&s);
+                if routes.is_empty() {
+                    app
+                } else {
+                    Box::new(ws::WsSite::new(app, routes, core.access().clone(), &s))
+                }
             }
         };
         sites.push(site);
@@ -895,6 +911,7 @@ fn wire_with(
         renders: renders.unwrap_or_default(),
         stages,
         notices,
+        revoker,
         api_budget: (api_budget.per_second > 0 && apis.iter().any(|a| a.enabled)).then_some(
             gateway_io::LaneRate {
                 lane: wasp_core::Lane::BULK,

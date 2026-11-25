@@ -76,6 +76,8 @@ pub struct Settings {
     /// Budgets per caller on some lanes (none by default): the application
     /// sets them (wasp's `[api] rate`), never the configuration reader.
     pub lane_rates: Vec<LaneRate>,
+    /// WebSockets (`[ws]`): sizes, keepalive, budgets, the recheck.
+    pub ws: crate::ws::WsSettings,
 }
 
 /// A lane's budget for each caller: a signed-in caller (a session or an API
@@ -176,6 +178,18 @@ pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("door", &["ban", "exempt"]),
+    (
+        "ws",
+        &[
+            "burst",
+            "max_frame",
+            "max_message",
+            "per_account",
+            "ping",
+            "rate",
+            "recheck",
+        ],
+    ),
 ];
 
 /// Refuses a key not in `known` in each of its sections.
@@ -222,6 +236,7 @@ impl Default for Settings {
             exempt: Vec::new(),
             ingress: IngressMode::Direct,
             lane_rates: Vec::new(),
+            ws: crate::ws::WsSettings::default(),
         }
     }
 }
@@ -381,6 +396,7 @@ impl Settings {
             exempt: addresses(config, "door.exempt")?,
             ingress: ingress(config)?,
             lane_rates: Vec::new(),
+            ws: ws_settings(config)?,
         };
         let explicit_ingress = config
             .get::<String>("gateway.ingress")
@@ -455,6 +471,70 @@ impl Settings {
             };
         }
     }
+}
+
+/// `[ws]`, every key optional.
+fn ws_settings(config: &Config) -> Result<crate::ws::WsSettings, SettingsError> {
+    let d = crate::ws::WsSettings::default();
+    let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());
+    let bytes = |key: &str, default: u64, max: u64| -> Result<u64, SettingsError> {
+        let n: u64 = config.get_or(key, default).map_err(err)?;
+        if n < 125 || n > max {
+            return Err(SettingsError(format!(
+                "{key} must be 125 to {max} bytes, not {n}"
+            )));
+        }
+        Ok(n)
+    };
+    let max_frame = bytes("ws.max_frame", d.max_frame, 16 << 20)?;
+    let max_message = bytes("ws.max_message", d.max_message, 64 << 20)?;
+    if max_message < max_frame {
+        return Err(SettingsError(
+            "ws.max_message must be at least ws.max_frame".into(),
+        ));
+    }
+    let count = |key: &str, default: u32, max: u32| -> Result<u32, SettingsError> {
+        let n: u64 = config.get_or(key, u64::from(default)).map_err(err)?;
+        u32::try_from(n)
+            .ok()
+            .filter(|n| *n <= max)
+            .ok_or_else(|| SettingsError(format!("{key} must be 0 to {max}, not {n}")))
+    };
+    let rate = count("ws.rate", d.rate, 100_000)?;
+    let burst = count("ws.burst", rate.saturating_mul(2), 1_000_000)?;
+    if burst < rate {
+        return Err(SettingsError("ws.burst must be at least ws.rate".into()));
+    }
+    let span = |key: &str, default: Duration, min: Duration, max: Duration| {
+        let d: Duration = config.get_or(key, default).map_err(err)?;
+        if d < min || d > max {
+            return Err(SettingsError(format!(
+                "{key} must be {}s to {}s",
+                min.as_secs(),
+                max.as_secs()
+            )));
+        }
+        Ok(d)
+    };
+    Ok(crate::ws::WsSettings {
+        max_frame,
+        max_message,
+        ping: span(
+            "ws.ping",
+            d.ping,
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        )?,
+        per_account: count("ws.per_account", d.per_account, 10_000)?,
+        rate,
+        burst,
+        recheck: span(
+            "ws.recheck",
+            d.recheck,
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        )?,
+    })
 }
 
 fn ingress(config: &Config) -> Result<IngressMode, SettingsError> {

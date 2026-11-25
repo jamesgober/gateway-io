@@ -22,6 +22,8 @@ nex-db = { workspace = true, optional = true }
 # The web site: site, url, router, handlers.
 web-net = { workspace = true }
 serve-net = { workspace = true }
+# WebSocket origin policies (serve-net's `ws` drives the protocol).
+ws-net = { workspace = true }
 # The render engine: themes compiled at boot, values through the View trait.
 luminess = { workspace = true }
 # The first durable content store (embedded, first-party).
@@ -39,9 +41,14 @@ store-nex = ["dep:nex-db", "dep:crypt-io"]
 # Two-step sign-in (TOTP) for nex-db accounts. It brings crypt-io's C backend
 # (AWS-LC), so the static musl build leaves it out.
 mfa = ["store-nex", "nex-db/mfa"]
+# An echo WebSocket route (`site.ws_echo`), for tests and trials: off by
+# default, so no build ships a WebSocket route it was not asked for.
+ws-echo = ["store-nex"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
+# A WebSocket client for the tests.
+ws-net = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true
