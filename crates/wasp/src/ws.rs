@@ -23,8 +23,25 @@ pub struct WsRoute {
     pub path: String,
     /// Who may open it, checked again while it is open.
     pub rule: Rule,
-    /// The conversation.
-    pub service: Arc<dyn WebSocketService>,
+    /// The conversation for this caller (its own, or one shared by all), or
+    /// the status it is refused with.
+    pub make: ServiceFor,
+}
+
+/// Makes a route's service for one caller.
+pub type ServiceFor =
+    Arc<dyn Fn(&Caller<'_>) -> Result<Arc<dyn WebSocketService>, u16> + Send + Sync>;
+
+impl WsRoute {
+    /// A route every caller talks to the same `service` on.
+    #[must_use]
+    pub fn shared(path: String, rule: Rule, service: Arc<dyn WebSocketService>) -> WsRoute {
+        WsRoute {
+            path,
+            rule,
+            make: Arc::new(move |_| Ok(Arc::clone(&service))),
+        }
+    }
 }
 
 impl std::fmt::Debug for WsRoute {
@@ -113,11 +130,14 @@ impl WebService for WsSite {
             return self.site.upgrade(head, env, caller);
         };
         match self.access.check(caller.identity(), &route.rule) {
-            Decision::Allow => Upgrade::Accept(WsAccept {
-                service: Arc::clone(&route.service),
-                origins: self.origin_policy(),
-                rule: route.rule,
-            }),
+            Decision::Allow => match (route.make)(caller) {
+                Ok(service) => Upgrade::Accept(WsAccept {
+                    service,
+                    origins: self.origin_policy(),
+                    rule: route.rule,
+                }),
+                Err(status) => Upgrade::Refuse(status),
+            },
             Decision::Deny(refusal) => Upgrade::Refuse(refusal.status),
         }
     }
@@ -160,11 +180,11 @@ pub fn routes(settings: &SiteSettings) -> Vec<WsRoute> {
     let mut routes = Vec::new();
     #[cfg(feature = "ws-echo")]
     if let Some(path) = &settings.ws_echo {
-        routes.push(WsRoute {
-            path: format!("{}{path}", settings.base.trim_end_matches('/')),
-            rule: ECHO_RULE,
-            service: Arc::new(Echo),
-        });
+        routes.push(WsRoute::shared(
+            format!("{}{path}", settings.base.trim_end_matches('/')),
+            ECHO_RULE,
+            Arc::new(Echo),
+        ));
     }
     #[cfg(not(feature = "ws-echo"))]
     let _ = settings;

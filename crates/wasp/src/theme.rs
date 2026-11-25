@@ -524,6 +524,8 @@ pub struct Page {
     pub editor: Option<Arc<Editor>>,
     /// The account and sign-in security pages.
     pub security: Option<Arc<Security>>,
+    /// The messenger's socket address, on the chat page; empty elsewhere.
+    pub chat: String,
 }
 
 luminess::view!(Page as "page" {
@@ -536,6 +538,7 @@ luminess::view!(Page as "page" {
     form: object(Form),
     editor: object(Editor),
     security: object(Security),
+    chat: text,
 });
 
 /// What an error page template reads, as `error`.

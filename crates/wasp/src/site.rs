@@ -79,6 +79,8 @@ pub struct SiteSettings {
     pub api: crate::api::ApiSettings,
     /// The echo WebSocket route's path (`site.ws_echo`, feature `ws-echo`).
     pub ws_echo: Option<String>,
+    /// The messenger's socket path (`chat.path`), when the messenger is on.
+    pub chat: Option<String>,
 }
 
 impl Default for SiteSettings {
@@ -95,6 +97,7 @@ impl Default for SiteSettings {
             admin_theme: AdminSource::Builtin,
             api: crate::api::ApiSettings::default(),
             ws_echo: None,
+            chat: None,
         }
     }
 }
@@ -182,6 +185,7 @@ impl SiteSettings {
             admin_theme: admin_source(config)?,
             api: crate::api::ApiSettings::from_config(config, !nex_accounts(config))?,
             ws_echo: ws_echo(config)?,
+            chat: None,
         })
     }
 }
@@ -318,6 +322,7 @@ impl Pages {
             form: form.map(Arc::new),
             editor: None,
             security: None,
+            chat: String::new(),
         }
     }
 

@@ -5,10 +5,14 @@
 pub mod api;
 #[cfg(feature = "gatekeeper")]
 pub mod auth;
+#[cfg(feature = "store-nex")]
+pub mod chat;
 pub mod content;
 pub mod events;
 pub mod hosts;
 pub mod import;
+#[cfg(feature = "store-nex")]
+pub mod json;
 #[cfg(feature = "store-nex")]
 pub mod nex;
 // Read by the nex-db site; other builds only refuse its tables.
@@ -293,6 +297,31 @@ pub(crate) const DEFAULT_AUTH_STORE: &str = if cfg!(feature = "gatekeeper") {
 /// then signing in and out; everything else is browsing. Under load the
 /// browsing lanes are refused first (`Shed`), and they cannot take the
 /// passports held back for these (`gateway.reserve`).
+/// The messenger's WebSocket route at `path`: a member signed in by
+/// cookie, or an API key with the `chat` scope, gets a connection of its own.
+#[cfg(feature = "store-nex")]
+fn chat_route(path: String, chat: Arc<chat::Chat>) -> ws::WsRoute {
+    /// The route's rule: a signed-in member.
+    const CHATTING: wasp_core::Rule = wasp_core::Rule::needs(11, site_nex::MEMBER);
+    ws::WsRoute {
+        path,
+        rule: CHATTING,
+        make: Arc::new(move |caller| {
+            if let Some(token) = caller.token::<nex::NexToken>()
+                && let nex::Via::Key(scopes) = token.via()
+                && !scopes.has("chat")
+            {
+                return Err(403);
+            }
+            let wasp_core::Subject::User(user) = caller.identity().subject() else {
+                return Err(401);
+            };
+            Ok(Arc::new(chat.connection(user.0, caller.identity().perms()))
+                as Arc<dyn gateway_io::ws::WebSocketService>)
+        }),
+    }
+}
+
 fn site_lanes(base: &str, apis: &[api::ApiSettings]) -> Vec<wasp_core::LaneRule> {
     use wasp_core::{Lane, LaneRule};
     let at = |path: &str| format!("{base}{path}");
@@ -443,6 +472,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
     ("api", &["burst", "enabled", "prefix", "rate"]),
+    ("chat", &["enabled", "max_length", "path", "role"]),
     ("jobs", &["queue", "threads"]),
     ("hello", &["slow_route"]),
 ];
@@ -596,6 +626,25 @@ fn wire_with(
         );
     }
     let api_budget = api::ApiBudget::from_config(config)?;
+    // The messenger: off unless `[chat] enabled`, and only with nex-db
+    // accounts.
+    #[cfg(feature = "store-nex")]
+    let chat_settings = chat::ChatSettings::from_config(config, nex_accounts)?;
+    #[cfg(feature = "store-nex")]
+    let settings = site::SiteSettings {
+        chat: chat_settings.enabled.then(|| chat_settings.path.clone()),
+        ..settings
+    };
+    #[cfg(not(feature = "store-nex"))]
+    if config
+        .get_or("chat.enabled", false)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            "chat.enabled needs nex-db accounts: build wasp with the `store-nex` feature"
+                .to_owned(),
+        );
+    }
     // Account events end open WebSockets through it, once the gateway is open.
     let revoker = gateway_io::Revoker::new();
     #[cfg(not(feature = "gatekeeper"))]
@@ -817,6 +866,10 @@ fn wire_with(
             .collect(),
     };
     let mut sites: Vec<Box<dyn gateway_io::WebService>> = Vec::new();
+    // The messenger of each realm, made with the first site in it.
+    #[cfg(feature = "store-nex")]
+    let mut chats: std::collections::HashMap<String, Arc<chat::Chat>> =
+        std::collections::HashMap::new();
     let mut watchers = Vec::new();
     let mut renders = None;
     for (i, (s, label, own_errors, own_admin)) in plans.into_iter().enumerate() {
@@ -868,6 +921,20 @@ fn wire_with(
                 let own = realm
                     .as_ref()
                     .is_some_and(|r| r.realm() != nex::DEFAULT_REALM);
+                // One messenger per realm, shared by the profiles in it.
+                let realm_auth = realm.clone().unwrap_or_else(|| a.clone());
+                let realm_name = realm_auth.realm().to_owned();
+                if chat_settings.enabled && !chats.contains_key(&realm_name) {
+                    chats.insert(
+                        realm_name.clone(),
+                        chat::Chat::new(
+                            Arc::new(realm_auth.chat_store()),
+                            Arc::new(realm_auth.clone()),
+                            &realm_name,
+                            chat_settings.clone(),
+                        ),
+                    );
+                }
                 let boot = if own { own_admin } else { boot.clone() };
                 let app: Box<dyn gateway_io::WebService> = Box::new(site_nex::build(
                     realm.unwrap_or(a),
@@ -878,8 +945,16 @@ fn wire_with(
                     site_keys(config, secret_dir, boot)?,
                     ready,
                 )?);
-                // Its WebSocket routes, when it declares any.
-                let routes = ws::routes(&s);
+                // Its WebSocket routes, when it declares any: the echo route,
+                // and the messenger of its realm.
+                #[allow(unused_mut)]
+                let mut routes = ws::routes(&s);
+                if let (Some(path), Some(chat)) = (&s.chat, chats.get(&realm_name)) {
+                    routes.push(chat_route(
+                        format!("{}{path}", s.base.trim_end_matches('/')),
+                        chat.clone(),
+                    ));
+                }
                 if routes.is_empty() {
                     app
                 } else {

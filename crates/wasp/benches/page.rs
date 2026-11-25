@@ -60,6 +60,7 @@ fn main() {
             form: None,
             editor: None,
             security: None,
+            chat: String::new(),
         });
     });
     let page = Page {
@@ -72,6 +73,7 @@ fn main() {
         form: None,
         editor: None,
         security: None,
+        chat: String::new(),
     };
     let post_cost = measure(|| {
         buf.clear();
