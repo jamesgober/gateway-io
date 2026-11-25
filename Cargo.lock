@@ -288,9 +288,9 @@ checksum = "f30f5a86e977a267d245e350424f5d015fb0f7463b231c3547c7eeb167485c36"
 
 [[package]]
 name = "config-lib"
-version = "1.4.1"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8aef6205077e77fdbd551dd764d2f2331395971b32a5655826f9e69d9ac0370"
+checksum = "1589c7ead007aae61aec8f63426aae085b397ddaedd4660883880023eb05c969"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -338,9 +338,9 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crypt-io"
-version = "1.6.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5331b5c56d73aa1d4c5b9238b0f0aa5da157a64b5c2e1ccf81977c1908a6452c"
+checksum = "ce4b97f48532384234b373e8979d306a5122ece9f7e3914561d0d4b2f0ae16e6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -350,6 +350,7 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.4.3",
  "mod-rand",
+ "sha1",
  "sha2",
  "subtle",
  "zeroize",
@@ -735,8 +736,8 @@ checksum = "8bfe4a65fd91025b84c79bdcf60ef724789e32f7713f3f6fba54294d6f063f6c"
 
 [[package]]
 name = "nex-db"
-version = "0.8.1"
-source = "git+https://github.com/jamesgober/nex-db?tag=v0.8.1#d0bf5c86751ed5fb768715413e4edefac3d4c298"
+version = "0.9.0"
+source = "git+https://github.com/jamesgober/nex-db?tag=v0.9.0#e63c7aeafd651e0fd6639b45dfd76ea5e8ef1f01"
 dependencies = [
  "audit-trail",
  "crypt-io",
@@ -947,6 +948,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1039,9 +1051,9 @@ dependencies = [
 
 [[package]]
 name = "system-suite"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c2139e1f56b8ee6224b8216cee627d5ef2e588f5a6f45892c1e3f9fe99ed88b"
+checksum = "8ba749058de70a3d2f0e12a3a6ea3879c264d042b5fc3ed35ca2592426e5578a"
 dependencies = [
  "arc-swap",
  "config-lib",

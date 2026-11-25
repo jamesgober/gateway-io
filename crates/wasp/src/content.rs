@@ -1585,6 +1585,8 @@ mod tests {
     #[test]
     fn field_declarations_are_checked() {
         for (text, says) in [
+            // An empty table is seen (config-lib 1.5) and names no type.
+            ("[content.fields.post.author]\n", "type"),
             (
                 "[content.fields.post.Author]\ntype = \"text\"\n",
                 "lower case",

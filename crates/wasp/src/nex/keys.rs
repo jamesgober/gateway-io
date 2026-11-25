@@ -2,16 +2,15 @@
 //! security page.
 //!
 //! nex-db keeps each key as a keyed digest with its account, id, scopes and
-//! dates, and answers whether a key's text counts. wasp's account directory
-//! keeps what the account's list shows, at `/<account>/k/<key id>`: the
-//! label, the scopes and the dates, never the key. The account is the
-//! record's author, so a list reads only that account's keys.
+//! dates, answers whether a key's text counts, and lists an account's keys
+//! (`api_keys`). wasp's account directory keeps only what nex-db does not:
+//! each key's label, at `/<account>/k/<key id>`, never the key.
 
 use std::time::{Duration, SystemTime};
 
 use wasp_core::{PermSet, SessionId, UserId};
 
-use super::{NexAuth, StoreError, StoreErrorKind, account_of, hex_of, nex};
+use super::{NexAuth, StoreError, account_of, hex_of, nex};
 
 /// The permission only a session cookie carries: the account pages, the
 /// admin pages and signing out need it, so no API key ever reaches them.
@@ -149,15 +148,6 @@ impl Drop for NewKey {
     }
 }
 
-fn ms_of(t: SystemTime) -> u64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-fn at_ms(ms: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
-}
-
 /// The id a request signed in with key `id` carries: the bouncer charges
 /// it, and the recheck cache keeps the account's roles under it. Apart from
 /// every session's id (a digest of another input).
@@ -187,49 +177,44 @@ impl NexAuth {
     /// The keys of `user`, newest first.
     pub fn api_keys(&self, user: UserId) -> Result<Vec<KeyRow>, StoreError> {
         let account = account_of(user);
-        let content = self.db.db().content();
-        let page = content
-            .list(
-                &nex_db::Listing::latest(KEY_KIND)
-                    .site(self.directory.as_ref())
-                    .by_author(account)
-                    .limit(4 * MAX_KEYS),
-            )
-            .map_err(nex)?;
-        let prefix = format!("/{}/k/", hex_of(account));
-        let mut rows = Vec::new();
-        for e in page.items() {
-            let Some(id) = e
-                .route()
-                .and_then(|(_, p)| p.strip_prefix(&prefix))
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            let Some(record) = content.get(e.id()).map_err(nex)? else {
-                continue;
-            };
-            let field = |name: &str| {
-                record
-                    .field(name)
-                    .and_then(nex_db::Value::as_text)
-                    .unwrap_or("")
-                    .to_owned()
-            };
-            let ms = |name: &str| field(name).parse::<u64>().unwrap_or(0);
-            rows.push(KeyRow {
-                id,
-                label: field("label"),
-                scopes: field("scopes")
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect(),
-                created: at_ms(ms("created")),
-                expires: at_ms(ms("expires")),
-            });
-        }
+        let mut rows: Vec<KeyRow> = self
+            .auth()?
+            .api_keys(account)
+            .map_err(nex)?
+            .into_iter()
+            .filter(|k| k.revoked_at().is_none())
+            .map(|k| {
+                let id = k.id().to_string();
+                Ok(KeyRow {
+                    label: self.key_label(account, &id)?,
+                    scopes: k.scopes().to_vec(),
+                    created: k.created_at(),
+                    // Every key wasp makes has an expiry.
+                    expires: k.expires_at().unwrap_or(SystemTime::UNIX_EPOCH),
+                    id,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?;
         rows.sort_by_key(|r| std::cmp::Reverse(r.created));
         Ok(rows)
+    }
+
+    /// The label wasp keeps for key `id` of `account`, or empty.
+    fn key_label(&self, account: nex_db::AccountId, id: &str) -> Result<String, StoreError> {
+        let content = self.db.db().content();
+        let path = format!("/{}/k/{id}", hex_of(account));
+        let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? else {
+            return Ok(String::new());
+        };
+        Ok(content
+            .get(route.entity())
+            .map_err(nex)?
+            .and_then(|r| {
+                r.field("label")
+                    .and_then(nex_db::Value::as_text)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default())
     }
 
     /// Makes a key for `user`: `label`, `scopes`, lasting `days` (one of
@@ -267,10 +252,7 @@ impl NexAuth {
             .site(self.directory.as_ref())
             .path(format!("/{}/k/{id}", hex_of(account)))
             .author(account)
-            .field("label", label.as_str())
-            .field("scopes", names.join(" "))
-            .field("created", ms_of(created).to_string())
-            .field("expires", ms_of(expires).to_string());
+            .field("label", label.as_str());
         if let Err(e) = content.put(record) {
             // A key the list cannot show must not work.
             let _ = self.auth()?.revoke_api_key(id);
@@ -307,30 +289,26 @@ impl NexAuth {
             return Ok(None);
         };
         let account = account_of(user);
-        let content = self.db.db().content();
-        let path = format!("/{}/k/{kid}", hex_of(account));
-        let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? else {
+        // nex-db says whose key it is: another account's key, or one revoked
+        // already, is no key of this account's.
+        let auth = self.auth()?;
+        let own = auth
+            .api_keys(account)
+            .map_err(nex)?
+            .iter()
+            .any(|k| k.id() == kid && k.revoked_at().is_none());
+        if !own {
             return Ok(None);
-        };
-        // A record deleted before (a key revoked already) is no key.
-        let Some(record) = content.get(route.entity()).map_err(nex)? else {
-            return Ok(None);
-        };
-        if !record.authors().contains(&account) {
-            return Err(StoreError::new(
-                StoreErrorKind::Invalid,
-                "a key record that is not the account's own",
-            ));
         }
-        let label = record
-            .field("label")
-            .and_then(nex_db::Value::as_text)
-            .unwrap_or("")
-            .to_owned();
-        self.auth()?.revoke_api_key(kid).map_err(nex)?;
+        let label = self.key_label(account, &kid.to_string())?;
+        auth.revoke_api_key(kid).map_err(nex)?;
         // What the key opened (a WebSocket) ends with it.
         self.revoker.session(key_session(kid).0);
-        content.delete(route.entity()).map_err(nex)?;
+        let content = self.db.db().content();
+        let path = format!("/{}/k/{kid}", hex_of(account));
+        if let Some(route) = content.resolve(&self.directory, &path).map_err(nex)? {
+            let _ = content.delete(route.entity());
+        }
         Ok(Some(label))
     }
 }

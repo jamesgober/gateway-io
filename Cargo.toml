@@ -19,15 +19,15 @@ serve-net = { version = "0.8.2", default-features = false, features = ["http1", 
 ws-net = { version = "0.9", default-features = false }
 net-io = "0.7.2"
 bouncer-io = { version = "0.11", features = ["net-io"] }
-system-suite = { version = "0.9.4", default-features = false, features = ["kernel", "sys", "signals", "config", "log"] }
+system-suite = { version = "0.9.5", default-features = false, features = ["kernel", "sys", "signals", "config", "log"] }
 web-net = { version = "0.10.1", default-features = false }
 luminess = { version = "0.10", features = ["web-net"] }
 bison-db = { version = "1.1", default-features = false, features = ["std"] }
 gatekeeper-io = "0.6"
 # nex-db is not on crates.io: its git tag, never a path.
-nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.8.1" }
+nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.9.0" }
 key-vault = { version = "1.1", features = ["fetcher-file"] }
-crypt-io = "1.6"
+crypt-io = "1.7"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
 
 [workspace.lints.rust]
