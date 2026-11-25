@@ -26,7 +26,7 @@ pub mod room;
 pub mod store;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gateway_io::ws::{WebSocketConn, WebSocketService, WsMessage, WsSender};
@@ -603,9 +603,22 @@ const BUDGETS: usize = 100_000;
 struct Live {
     id: u64,
     sender: WsSender,
-    /// Set when the client stopped reading and pushes to it were dropped:
-    /// its next frame closes it, and it catches up when it comes back.
-    behind: Arc<AtomicBool>,
+}
+
+/// What a connection whose client stopped reading is closed with: it
+/// missed pushes, and catches up when it connects again.
+const BEHIND: (u16, &str) = (1013, "missed messages: connect again to catch up");
+
+/// Sends `text` to `c`: `false` when the connection is gone, or its client
+/// stopped reading (then it is closed, with the close handshake).
+fn deliver(c: &Live, text: &str) -> bool {
+    match c.sender.send_text(text) {
+        Ok(()) => true,
+        Err(_) => {
+            let _ = c.sender.close(BEHIND.0, BEHIND.1);
+            false
+        }
+    }
 }
 
 /// A token bucket: `rate` a second, at most `burst`.
@@ -788,7 +801,6 @@ impl Chat {
                 || perms.contains(crate::site_nex::ADMIN),
             limits: self.settings.limits_for(perms),
             id: self.next.fetch_add(1, Ordering::Relaxed),
-            behind: Arc::new(AtomicBool::new(false)),
             rank: if perms.contains(crate::site_nex::ADMIN) {
                 2
             } else {
@@ -801,18 +813,7 @@ impl Chat {
     fn push_to(&self, account: u128, conns: &[u64], text: &str) {
         let mut live = lock(&self.live);
         if let Some(open) = live.get_mut(&account) {
-            open.retain(|c| {
-                if !conns.contains(&c.id) {
-                    return true;
-                }
-                match c.sender.send_text(text) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        c.behind.store(true, Ordering::Release);
-                        false
-                    }
-                }
-            });
+            open.retain(|c| !conns.contains(&c.id) || deliver(c, text));
             if open.is_empty() {
                 live.remove(&account);
             }
@@ -820,18 +821,12 @@ impl Chat {
     }
 
     /// Sends `text` to every open connection of `account`. A connection
-    /// whose client stopped reading is dropped from the pushes, and marked
-    /// to close: it catches up when it comes back.
+    /// whose client stopped reading is dropped from the pushes and closed:
+    /// it catches up when it comes back.
     fn push(&self, account: u128, text: &str) {
         let mut live = lock(&self.live);
         if let Some(conns) = live.get_mut(&account) {
-            conns.retain(|c| match c.sender.send_text(text) {
-                Ok(()) => true,
-                Err(_) => {
-                    c.behind.store(true, Ordering::Release);
-                    false
-                }
-            });
+            conns.retain(|c| deliver(c, text));
             if conns.is_empty() {
                 live.remove(&account);
             }
@@ -1018,7 +1013,6 @@ pub struct ChatConn {
     advanced: bool,
     limits: Limits,
     id: u64,
-    behind: Arc<AtomicBool>,
     /// The caller's site role as a rank: 0 member, 1 editor, 2 admin.
     rank: u8,
 }
@@ -1539,7 +1533,6 @@ impl WebSocketService for ChatConn {
             .push(Live {
                 id: self.id,
                 sender: conn.sender(),
-                behind: Arc::clone(&self.behind),
             });
         // Catching up: the first page of conversations, with what is unread.
         let summary = self
@@ -1549,11 +1542,6 @@ impl WebSocketService for ChatConn {
     }
 
     fn message(&self, _env: &Envelope, message: WsMessage<'_>, conn: &mut WebSocketConn<'_>) {
-        if self.behind.load(Ordering::Acquire) {
-            // Pushes were lost while the client was not reading.
-            let _ = conn.close(1013, "missed messages: connect again to catch up");
-            return;
-        }
         let answer = match message {
             WsMessage::Text(t) => self.handle(t),
             _ => error("chat.bad_frame", "Frames are JSON text.", None),

@@ -96,9 +96,9 @@ dependencies = [
 
 [[package]]
 name = "auth-gate"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9738070ff2ce5f88d1ebd8dfa4971fd3054ba058ccf0c672a52e775cafc5bc7e"
+checksum = "fc48f23d1f8d53582c76b8676a3cc36a4024a69c95af5251304c066aaf9c2fc7"
 dependencies = [
  "crypt-io",
  "id-forge",
@@ -201,9 +201,9 @@ dependencies = [
 
 [[package]]
 name = "bouncer-io"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90c3eb4c7cec261dce53e6ffd5a11d126caed4360a511fea760534c43af7b508"
+checksum = "4f2ce717275859c3ebcd25aad54806428c3514afb23f50e97af15e43671ff148"
 dependencies = [
  "better-bucket",
  "clock-lib",
@@ -495,9 +495,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "gatekeeper-io"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f134fa04e2afad5131a874fd885fbdf8f0508dd5ca04447caefedafb4f66082"
+checksum = "2a3ead229fd01db2d1db18072e802e2142232a50c8026be3e680761b72f6b310"
 dependencies = [
  "access-gate",
  "audit-trail",
@@ -587,9 +587,9 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "http-net"
-version = "0.9.2"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0142371c2bb7cab4e9846e3f34126d8646123e6a6929bf93d96e51f434dd970e"
+checksum = "c0b66f88dee103f71ba36c04703285a4ca0f105ac16c704cb6b562a57fbee0b6"
 dependencies = [
  "parse-net 0.7.0",
 ]
@@ -700,9 +700,9 @@ dependencies = [
 
 [[package]]
 name = "luminess"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f91355f9d24d9e13da4fc17868a9201614f72063598218c67b53e9a7d089771"
+checksum = "92bad63136d25a4189d61c3d5f5ae37ade4408a528da63d41bc041b2e35e14d2"
 dependencies = [
  "web-net",
 ]
@@ -938,9 +938,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "serve-net"
-version = "0.8.4"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dd5115d6c04057ef65d3a649752311c5ac297d18f738dbe13c2e3ce2f8a7b1a"
+checksum = "d9663b124d06d4973a2fc215deb8cbc7a59dd755fbf16ef9c6e622d204aad0ae"
 dependencies = [
  "http-net",
  "net-io",
@@ -1225,9 +1225,9 @@ dependencies = [
 
 [[package]]
 name = "web-net"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63512e52832359239e90f4f81af33e231700db66a69706df3fbdde2a055cfb4"
+checksum = "b21d84a23617181abeca236771b9c1904d169414d16e82fb93bc5282dff0b32c"
 dependencies = [
  "compress-lib",
  "cookie-net",

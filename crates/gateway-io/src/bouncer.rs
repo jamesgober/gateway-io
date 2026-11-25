@@ -33,15 +33,26 @@ pub fn lane_class(lane: wasp_core::Lane) -> LaneClass {
 }
 
 /// The door's budgets (bouncer-io's defaults) with the settings' lane
-/// budgets.
+/// budgets and the WebSocket message budget.
 fn budgets(settings: &Settings) -> Budgets {
-    settings.lane_rates.iter().fold(Budgets::default(), |b, r| {
+    let budgets = settings.lane_rates.iter().fold(Budgets::default(), |b, r| {
         let per_second = r.per_second.max(1);
         b.lane_rate(
             lane_class(r.lane),
             Rate::per_second(per_second).burst(r.burst.max(per_second)),
         )
-    })
+    });
+    // WebSocket messages, per account across its connections (`ws.rate`;
+    // 0 is no budget).
+    let ws = &settings.ws;
+    if ws.rate == 0 {
+        budgets
+    } else {
+        budgets.class_rate(
+            crate::ws::WS_MESSAGES,
+            Rate::per_second(ws.rate).burst(ws.burst.max(ws.rate)),
+        )
+    }
 }
 
 /// The allow list for `door.exempt`: addresses exempt from the door's

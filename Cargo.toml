@@ -11,19 +11,19 @@ authors = ["James Gober <me@jamesgober.com>"]
 publish = false
 
 # Published first-party crates only; nothing here is a path into another repository.
-# net-io 0.7: serve-net 0.8, bouncer-io 0.11 and web-net 0.10.1 are built on it, and the
+# net-io 0.7: serve-net 0.9, bouncer-io and web-net 0.11 are built on it, and the
 # gate and control-line types cross between them, so one net-io version must be in the tree.
 [workspace.dependencies]
-serve-net = { version = "0.8.2", default-features = false, features = ["http1", "ws"] }
+serve-net = { version = "0.9", default-features = false, features = ["http1", "ws"] }
 # The WebSocket protocol under serve-net's `ws` feature: its limits and origin policy.
 ws-net = { version = "0.9", default-features = false }
-net-io = "0.7.2"
-bouncer-io = { version = "0.11", features = ["net-io"] }
+net-io = "0.7.3"
+bouncer-io = { version = "0.12", features = ["net-io"] }
 system-suite = { version = "0.9.5", default-features = false, features = ["kernel", "sys", "signals", "config", "log"] }
-web-net = { version = "0.10.1", default-features = false }
-luminess = { version = "0.10", features = ["web-net"] }
+web-net = { version = "0.11", default-features = false }
+luminess = { version = "0.10.1", features = ["web-net"] }
 bison-db = { version = "1.1", default-features = false, features = ["std"] }
-gatekeeper-io = "0.6"
+gatekeeper-io = "0.7"
 # nex-db is not on crates.io: its git tag, never a path.
 nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.9.0" }
 key-vault = { version = "1.1", features = ["fetcher-file"] }

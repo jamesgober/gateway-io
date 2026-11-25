@@ -400,7 +400,7 @@ The caller is signed in as for a page: the session cookie, or `Authorization: Be
 
 While a connection is open it stays held to those rules. Disabling, banning or removing the account, a password change and signing out everywhere end its connections at once, even idle ones; so do revoking one session or one API key. Every `ws.recheck` the caller is checked again, so an expired session or key, or a role given or taken away, ends it too.
 
-Each account may hold `ws.per_account` connections (then 429), each connection may send `ws.rate` messages a second in bursts of `ws.burst` (then the connection closes with 1008), and a frame or message over its size is refused by the protocol (1009). The connection is pinged after `ws.ping` of quiet and closed if a second interval passes without a byte. It works through the Unix socket behind the start shim too.
+Each account may hold `ws.per_account` connections (then 429) and send `ws.rate` messages a second across all of them, in bursts of `ws.burst` (then the connection that went over closes with 1008), and a frame or message over its size is refused by the protocol (1009). The connection is pinged after `ws.ping` of quiet and closed if a second interval passes without a byte. It works through the Unix socket behind the start shim too.
 
 ## Messenger
 
@@ -448,7 +448,7 @@ Every frame is one JSON object with an `op`. Account and conversation ids are 32
 | `{"op":"mute","conversation":..,"on":true}` | `{"op":"muted","conversation":..,"on":true}` |
 | `{"op":"block","account":..,"on":true}` | `{"op":"blocked","account":..,"on":true}` |
 
-A message is `{"conversation","number","author","at","body"}`: messages are numbered from 1 in each conversation and `at` is milliseconds since 1970. Every open connection of each member gets `{"op":"message","message":..}` when one is sent. The other member gets `{"op":"read",..}` when your read marker moves, but not across a block. A member who muted a conversation gets no pushes from it, but its history is the same. A connection that stops reading its pushes misses them: it is closed with 1013 at its next frame, and catches up when it connects again.
+A message is `{"conversation","number","author","at","body"}`: messages are numbered from 1 in each conversation and `at` is milliseconds since 1970. Every open connection of each member gets `{"op":"message","message":..}` when one is sent. The other member gets `{"op":"read",..}` when your read marker moves, but not across a block. A member who muted a conversation gets no pushes from it, but its history is the same. A connection that stops reading its pushes misses them: it is closed with 1013 at once, with the close handshake, and catches up when it connects again.
 
 A body is a list of spans, never HTML: `{"text":"hello","marks":["bold"]}`, with `href` for a link. Members may use `bold`, `italic` and `link` (an `http(s)://` address or one on the site, never with a backslash). Editors and admins may also use `code`, `pre`, `quote` and `strike`. A body holds at most 64 spans and `chat.max_length` characters, and no control characters but newlines. The page puts every span on the screen as text.
 
@@ -561,7 +561,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `ws.max_message` | 262144 | the largest WebSocket message, in bytes (at least `ws.max_frame`) |
 | `ws.ping` | `30s` | a ping after this much quiet; a second interval with no byte back closes the connection |
 | `ws.per_account` | 8 | WebSocket connections one account may hold; `0` for no cap |
-| `ws.rate` | 20 | messages a second per connection; `0` for no budget |
+| `ws.rate` | 20 | messages a second per account, across its connections; `0` for no budget |
 | `ws.burst` | twice `ws.rate` | the most messages at once after a quiet spell |
 | `ws.recheck` | `15s` | how often an open connection's caller is checked again |
 | `chat.enabled` | false | the messenger, with nex-db accounts |
