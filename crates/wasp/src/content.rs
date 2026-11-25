@@ -551,7 +551,7 @@ impl Meta {
 
 /// A site path (`/about`, never `//host`) or an `http(s)://` address, with
 /// nothing that could leave an attribute.
-fn address_ok(value: &str) -> bool {
+pub(crate) fn address_ok(value: &str) -> bool {
     if value.len() > META_URL_MAX
         || value.chars().any(|c| {
             c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`')

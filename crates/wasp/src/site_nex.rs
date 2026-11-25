@@ -560,6 +560,8 @@ pub fn build(
 ) -> Result<NexApp, String> {
     let csrf_key = keys.csrf;
     let boot = keys.boot;
+    // A theme without the messenger's page still serves the socket.
+    let chat_page = web_net::Render::template(&engine, "chat").is_some();
     let pages = Pages::new(settings, content);
     // The key outlives a restart (`crate::secret`): a form opened before it
     // still posts after it.
@@ -706,6 +708,21 @@ pub fn build(
         for route in crate::api::routes(&settings.api, &pages, &accounts.auth) {
             builder = builder.route(route);
         }
+    }
+    // The messenger's page, when the messenger is on and the theme has one.
+    if let Some(socket) = settings.chat.as_ref().filter(|_| chat_page) {
+        let socket = format!("{}{socket}", settings.base.trim_end_matches('/'));
+        let p = pages.clone();
+        let chat_page: NexRoute = get("/chat", move |cx: &mut NexCx<'_>| {
+            let mut view = p.page("Messages", None, "", None);
+            view.chat.clone_from(&socket);
+            cx.set_header("cache-control", "no-store");
+            cx.render(&view)
+        })
+        .allow(MEMBER_PAGE)
+        .template("chat")
+        .name("chat");
+        builder = builder.route(chat_page);
     }
     builder.build().map_err(|e| format!("site: {e}"))
 }

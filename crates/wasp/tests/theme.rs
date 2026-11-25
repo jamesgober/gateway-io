@@ -249,6 +249,7 @@ fn error_pages_for_404_405_and_500() {
             form: None,
             editor: None,
             security: None,
+            chat: String::new(),
         })
     })
     .public()

@@ -388,7 +388,7 @@ API requests run in the bulk lane, so under load they are refused before page vi
 
 ## WebSockets
 
-A site can hold WebSocket connections through the gateway. Only a route the site declares upgrades; any other request that asks to upgrade is an ordinary request. No route is declared by default: the only one so far is an echo route for tests and trials, in a build with the `ws-echo` feature:
+A site can hold WebSocket connections through the gateway. Only a route the site declares upgrades; any other request that asks to upgrade is an ordinary request. No route is declared by default. The messenger (below) declares one, and there is an echo route for tests and trials, in a build with the `ws-echo` feature:
 
 ```toml
 [site]
@@ -400,6 +400,44 @@ The caller is signed in as for a page: the session cookie, or `Authorization: Be
 While a connection is open it stays held to those rules. Disabling, banning or removing the account, a password change and signing out everywhere end its connections at once, even idle ones; so do revoking one session or one API key. Every `ws.recheck` the caller is checked again, so an expired session or key, or a role taken away, ends it too.
 
 Each account may hold `ws.per_account` connections (then 429), each connection may send `ws.rate` messages a second in bursts of `ws.burst` (then the connection closes with 1008), and a frame or message over its size is refused by the protocol (1009). The connection is pinged after `ws.ping` of quiet and closed if a second interval passes without a byte. It works through the Unix socket behind the start shim too.
+
+## Messenger
+
+With nex-db accounts, members can send each other direct messages. It is off until `[chat] enabled = true`. Then the site has a WebSocket route at `/ws/chat` and a page at `/chat` that uses it (the default theme has one; a theme without `pages/chat.html` gets the route only).
+
+```toml
+[chat]
+enabled = true
+max_length = 4000      # characters in one message
+
+[chat.role.member]
+page = 50              # messages in one page of history
+history = 1000         # how far back a member can page; 0 for all
+```
+
+`[chat.role.editor]` and `[chat.role.admin]` take the same keys. By default a member pages 50 at a time and 1,000 messages back, and editors and admins 100 at a time with no limit. An account gets the most its roles allow.
+
+A browser connects with its session cookie. A program connects with `Authorization: Bearer <key>`, and the key needs the `chat` scope (made on `/account/security` like any other key). A guest gets 401 and a key without the scope 403, before anything is switched.
+
+Every frame is one JSON object with an `op`. Account and conversation ids are 32 hex characters.
+
+| Send | Answer |
+|---|---|
+| `{"op":"conversations"}` | `{"op":"conversations","me":..,"items":[..]}`, newest first; each item has `id`, `members`, `last`, `read`, `unread`, `muted` and the last `message`. Sent on connect too, so a member who was away sees what is new |
+| `{"op":"open","with":"<account>"}` | `{"op":"conversation","id":..,"members":[..]}`; two accounts have one conversation, so opening it again gives the same id |
+| `{"op":"history","conversation":..,"before":n,"limit":n}` | `{"op":"history","conversation":..,"messages":[..],"more":n}`, oldest first; `before` and `limit` are optional, and `more` is the `before` for the next page back, or `null` |
+| `{"op":"send","conversation":..,"body":[..],"nonce":".."}` | `{"op":"sent","nonce":..,"conversation":..,"number":n}` |
+| `{"op":"read","conversation":..,"number":n}` | `{"op":"read","conversation":..,"member":..,"number":n}` |
+| `{"op":"mute","conversation":..,"on":true}` | `{"op":"muted","conversation":..,"on":true}` |
+| `{"op":"block","account":..,"on":true}` | `{"op":"blocked","account":..,"on":true}` |
+
+A message is `{"conversation","number","author","at","body"}`: messages are numbered from 1 in each conversation and `at` is milliseconds since 1970. Every open connection of each member gets `{"op":"message","message":..}` when one is sent, and `{"op":"read",..}` when a member reads. A member who muted a conversation gets no pushes from it, but its history is the same.
+
+A body is a list of spans, never HTML: `{"text":"hello","marks":["bold"]}`, with `href` for a link. Members may use `bold`, `italic` and `link` (an `http(s)://` address or one on the site). Editors and admins may also use `code`, `pre`, `quote` and `strike`. A body holds at most 64 spans and `chat.max_length` characters, and no control characters but newlines. The page puts every span on the screen as text.
+
+Each frame is checked on its own: the caller must be a member of the conversation (`chat.not_a_member`), nobody can open a conversation with an account that doesn't exist in the realm, and a block in either direction stops opening and sending both ways (`chat.blocked`). An error is `{"op":"error","code":..,"message":..}`, with the `nonce` when the frame had one. The `[ws]` budgets apply to the connection, and so do the standing checks: a disabled or banned account, a password change or a revoked key ends the connection at once.
+
+Messages are kept in nex-db, in a content site of their own for each realm, so they survive a restart. One process numbers the messages for now; several nodes sharing one store is still to come.
 
 ## Configuration
 
@@ -457,6 +495,11 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `ws.rate` | 20 | messages a second per connection; `0` for no budget |
 | `ws.burst` | twice `ws.rate` | the most messages at once after a quiet spell |
 | `ws.recheck` | `15s` | how often an open connection's caller is checked again |
+| `chat.enabled` | false | the messenger, with nex-db accounts |
+| `chat.path` | `/ws/chat` | the messenger's WebSocket route, under `site.base` |
+| `chat.max_length` | 4000 | characters in one message |
+| `chat.role.<role>.page` | 50 (100 for `editor` and `admin`) | messages in one page of history, 1 to 500 |
+| `chat.role.<role>.history` | 1000 (all for `editor` and `admin`) | how many messages back a role can page; `0` for all |
 | `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |

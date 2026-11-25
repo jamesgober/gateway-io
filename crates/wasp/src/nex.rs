@@ -32,6 +32,7 @@ use crate::content::{ContentStore, FIELD_PREFIX, Meta, StoreError, StoreErrorKin
 use crate::policy::{MfaMode, Policy, PolicyCell, Rules};
 
 mod accounts;
+pub mod chat;
 mod keys;
 pub use accounts::{AccountRow, CodeCheck, SessionRow, SignInFrom};
 pub use keys::{
@@ -707,6 +708,12 @@ impl NexAuth {
             }
         }
         Ok((PermSet(bits), names))
+    }
+
+    /// The messenger's store for this realm.
+    #[must_use]
+    pub fn chat_store(&self) -> chat::NexChat {
+        chat::NexChat::new(self.db.clone(), &self.realm)
     }
 
     /// The names of `user`'s roles.

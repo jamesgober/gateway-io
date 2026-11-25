@@ -28,12 +28,20 @@ pub struct Scope {
 }
 
 /// Every scope a key may have.
-pub const SCOPES: &[Scope] = &[Scope {
-    name: "account:read",
-    label: "Read the account: who it is and its roles",
-    bit: 1,
-    perms: crate::site_nex::MEMBER,
-}];
+pub const SCOPES: &[Scope] = &[
+    Scope {
+        name: "account:read",
+        label: "Read the account: who it is and its roles",
+        bit: 1,
+        perms: crate::site_nex::MEMBER,
+    },
+    Scope {
+        name: "chat",
+        label: "Read and send the account's messages",
+        bit: 2,
+        perms: crate::site_nex::MEMBER,
+    },
+];
 
 /// A set of scopes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -1,0 +1,24 @@
+{% extends "base" %}
+{% block content %}
+<article class="chat" id="chat" data-socket="{{ page.chat }}">
+<h1>{{ page.title }}</h1>
+<p class="muted">Your account id: <code id="chat-me">…</code>. Give it to someone so they can write to you.</p>
+<form id="chat-open" class="chat-open">
+<label>Write to (an account id) <input name="with" pattern="[0-9a-f]{32}" maxlength="32" required autocomplete="off"></label>
+<button type="submit">Open</button>
+</form>
+<p id="chat-status" class="muted" role="status">Connecting…</p>
+<div class="chat-panes">
+<ul id="chat-list" class="chat-list"></ul>
+<section class="chat-talk">
+<button type="button" id="chat-older" hidden>Older messages</button>
+<ol id="chat-log" class="chat-log"></ol>
+<form id="chat-send" class="chat-send" hidden>
+<textarea name="text" rows="3" maxlength="4000" required></textarea>
+<button type="submit">Send</button>
+</form>
+</section>
+</div>
+</article>
+<script src="{{ page.site.home }}theme/chat.js" defer></script>
+{% endblock %}
