@@ -133,7 +133,7 @@ impl TlsReplies {
             .filter(|h| !h.is_empty());
         let local = |h: &str| matches!(h, "localhost" | "127.0.0.1" | "[::1]");
         let name = match asked {
-            Some(h) if self.hosts.iter().any(|s| *s == h) => h,
+            Some(h) if self.hosts.contains(&h) => h,
             // No site hosts (a local run): only a development host.
             Some(h) if self.hosts.is_empty() && local(&h) => h,
             _ => self.hosts.first()?.clone(),
