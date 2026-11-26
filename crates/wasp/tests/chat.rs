@@ -58,6 +58,12 @@ fn open_with(data: &Path, more: &str) -> (Door, SocketAddr) {
 
 /// The site, and its accounts (with `NOBODY`, an account with no roles).
 fn open_auth(data: &Path, more: &str) -> (Door, SocketAddr, NexAuth) {
+    let (door, addr, auth, _) = open_nex(data, more);
+    (door, addr, auth)
+}
+
+/// The site, its accounts, and its database.
+fn open_nex(data: &Path, more: &str) -> (Door, SocketAddr, NexAuth, wasp::nex::NexDb) {
     let theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/default");
     let conf = Config::from_text(&format!(
         "[site]\ntheme = \"{}\"\ntheme_poll = \"0s\"\n[auth]\nstore = \"nex\"\n[content]\nstore = \"nex\"\n[nex]\npath = \"{}\"\n{more}",
@@ -78,7 +84,8 @@ fn open_auth(data: &Path, more: &str) -> (Door, SocketAddr, NexAuth) {
             Err(e) => panic!("wiring: {e}"),
         }
     };
-    let auth = NexAuth::new(wiring.nex.clone().expect("nex-db"));
+    let db = wiring.nex.clone().expect("nex-db");
+    let auth = NexAuth::new(db.clone());
     for who in [ANN, BOB, EVE] {
         auth.ensure_account(who, PASSWORD, &[MEMBER_ROLE])
             .expect("member");
@@ -102,7 +109,7 @@ fn open_auth(data: &Path, more: &str) -> (Door, SocketAddr, NexAuth) {
     let door = Door::open(wiring.core, &settings, UrgentLine::detached(), web).expect("opens");
     revoker.attach_to(&door);
     let addr = door.local_addr().expect("addr");
-    (door, addr, auth)
+    (door, addr, auth, db)
 }
 
 struct Got {
@@ -1006,5 +1013,72 @@ fn in_a_room_a_block_keeps_the_blocked_out_of_sight() {
                 || (s(f, "op") == "entered" && s(f, "account") == ann_id)),
         "{frames:?}"
     );
+    let _ = door.close(Duration::from_secs(2));
+}
+
+#[test]
+fn a_backup_made_while_the_site_runs_restores_the_whole_site() {
+    let data = temp_dir("backup");
+    let (door, addr, _, db) = open_nex(&data.0, CHAT_ON);
+    let session = sign_in(addr, ANN);
+    let (mut ann, _) = member(addr, &session);
+    let (bob, bob_id) = member(addr, &sign_in(addr, BOB));
+    let id = s(
+        &ann.ask(&format!(r#"{{"op":"open","with":"{bob_id}"}}"#)),
+        "id",
+    );
+    ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"before the backup"}}]}}"#
+    ));
+    let key = make_key(addr, &session, "&scope=account%3Aread");
+    // While it runs: a base, then what came since.
+    let backups = data.0.join("backups");
+    let secret = data.0.join("gate.key");
+    let first = wasp::backup::make(&db, &backups, Some(&secret)).expect("backup");
+    assert!(!first.incremental && first.secret, "{first:?}");
+    ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"after it"}}]}}"#
+    ));
+    let second = wasp::backup::make(&db, &backups, Some(&secret)).expect("backup");
+    assert!(second.incremental, "{second:?}");
+    let _ = door.close(Duration::from_secs(2));
+    drop((ann, bob, db));
+
+    // A new folder from the backup. Never over a database.
+    let restored = temp_dir("restored");
+    assert!(
+        wasp::backup::restore(&backups, &data.0).is_err(),
+        "not over the old one"
+    );
+    let done = wasp::backup::restore(&backups, &restored.0).expect("restore");
+    assert!(done.contains("master secret"), "{done}");
+    assert_eq!(
+        std::fs::read(restored.0.join("gate.key")).expect("key"),
+        std::fs::read(&secret).expect("key")
+    );
+    let (door, addr, _, _) = open_nex(&restored.0, CHAT_ON);
+    // The session signed in before the backup is still good, and so is the
+    // key; a password signs in; the content and the messages are there.
+    assert_eq!(
+        call(addr, "GET", "/account/security", &session, "").status,
+        200
+    );
+    let me = call(addr, "GET", "/api/v1/me", "", "");
+    assert_eq!(me.status, 401, "no key, no answer");
+    let mut s2 = TcpStream::connect(addr).expect("connect");
+    s2.write_all(
+        format!(
+            "GET /api/v1/me HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .expect("write");
+    let mut answer = String::new();
+    let _ = s2.read_to_string(&mut answer);
+    assert!(answer.starts_with("HTTP/1.1 200"), "the key: {answer}");
+    assert_eq!(call(addr, "GET", "/", "", "").status, 200);
+    let (mut bob, _) = member(addr, &sign_in(addr, BOB));
+    let page = bob.ask(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+    assert_eq!(texts(&page), ["before the backup", "after it"]);
     let _ = door.close(Duration::from_secs(2));
 }

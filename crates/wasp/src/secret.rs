@@ -57,6 +57,31 @@ pub fn create(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Copies the secret at `from` to `to` (owner-only on Unix), replacing what
+/// is there: written to a file of its own first and renamed into place.
+///
+/// # Errors
+///
+/// When `from` is not a secret ([`LEN`] bytes) or a file cannot be written.
+#[cfg(feature = "store-nex")]
+pub fn copy(from: &Path, to: &Path) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", to.display());
+    let bytes =
+        Zeroizing::new(std::fs::read(from).map_err(|e| format!("{}: {e}", from.display()))?);
+    if bytes.len() != LEN {
+        return Err(format!("{} is not a master secret", from.display()));
+    }
+    let mut name = to.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.new", std::process::id()));
+    let draft = to.with_file_name(name);
+    let _ = std::fs::remove_file(&draft);
+    write_new(&draft, &bytes).map_err(fail)?;
+    std::fs::rename(&draft, to).map_err(|e| {
+        let _ = std::fs::remove_file(&draft);
+        fail(e)
+    })
+}
+
 /// Writes `bytes` to a new file at `path` (owner-only on Unix), synced.
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();

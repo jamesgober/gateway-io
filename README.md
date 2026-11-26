@@ -588,6 +588,8 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `chat.role.<role>.page` | 50 (100 for `editor` and `admin`) | messages in one page of history, 1 to 500 |
 | `chat.role.<role>.history` | 1000 (all for `editor` and `admin`) | how many messages back a role can page; `0` for all |
 | `site.ws_echo` | none | the echo WebSocket route's path (a build with the `ws-echo` feature; for tests and trials) |
+| `backup.path` | none | where the running site backs itself up (nex-db's online backup and the master secret): at start, every `backup.every`, and at a clean stop. `wasp restore <backup> <new data folder>` makes a data folder from it; see `deploy/BACKUP.md` |
+| `backup.every` | `1h` | how often a running site backs up (1m to 7d) |
 | `jobs.threads` | 2 | threads of the in-process job runner |
 | `jobs.queue` | 1024 | jobs that may wait; a full queue refuses new jobs |
 | `hello.slow_route` | false | `GET /slow?ms=N` waits, for drain tests (with `site.service = "hello"`; refused unless `gateway.listen` is a loopback address) |
