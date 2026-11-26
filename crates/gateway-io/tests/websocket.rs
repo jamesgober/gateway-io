@@ -3,6 +3,8 @@
 //! open connection ends when its caller is revoked, by an event or by the
 //! recheck.
 
+mod h2c;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -118,6 +120,10 @@ impl WebService for Site {
 }
 
 fn open_with(ws: WsSettings, listen: &str) -> (Door, Tokens) {
+    open_ingress(ws, listen, gateway_io::IngressMode::Direct)
+}
+
+fn open_ingress(ws: WsSettings, listen: &str, ingress: gateway_io::IngressMode) -> (Door, Tokens) {
     let tokens = Tokens::default();
     let core = Arc::new(
         Core::builder()
@@ -139,6 +145,7 @@ fn open_with(ws: WsSettings, listen: &str) -> (Door, Tokens) {
         workers: 1,
         passports: 8,
         ws,
+        ingress,
         ..Settings::default()
     };
     let door = Door::open(core, &settings, UrgentLine::detached(), web).expect("opens");
@@ -422,4 +429,50 @@ fn a_websocket_upgrades_over_the_unix_socket() {
     );
     let _ = door.close(Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn over_http2_the_websocket_route_is_refused_and_http1_still_upgrades() {
+    // Behind a trusted proxy, where the listener speaks cleartext HTTP/2.
+    let (door, tokens) = open_ingress(
+        WsSettings::default(),
+        "127.0.0.1:0",
+        gateway_io::IngressMode::Proxy {
+            trusted: vec!["127.0.0.1".into()],
+            forwarded_proto: true,
+        },
+    );
+    let addr = door.local_addr().expect("addr");
+    tokens.set("ann", 7, 1);
+    let visitor = ("x-forwarded-for", "203.0.113.10");
+    let bearer = ("authorization", "Bearer ann");
+    // WebSockets over HTTP/2 (RFC 8441, extended CONNECT) are not served:
+    // the stream is refused, never switched.
+    let extended = h2c::request(
+        addr,
+        "CONNECT",
+        "/ws",
+        &[(":protocol", "websocket"), visitor, bearer],
+    );
+    assert!(extended.spoke_h2, "{extended:?}");
+    assert!(
+        extended.reset.is_some()
+            || extended.goaway.is_some()
+            || extended.status.is_some_and(|s| s >= 400),
+        "refused: {extended:?}"
+    );
+    // A plain HTTP/2 GET of the route is an ordinary request, not a switch.
+    let get = h2c::request(addr, "GET", "/ws", &[visitor, bearer]);
+    assert!(get.status.is_some_and(|s| s != 101 && s != 200), "{get:?}");
+    assert_eq!(door.websockets(), 0);
+    // HTTP/1.1 on the same listener still upgrades.
+    let mut ws = connect(
+        addr,
+        "/ws",
+        "Authorization: Bearer ann\r\nOrigin: https://example.com\r\nX-Forwarded-For: 203.0.113.10\r\n",
+    )
+    .expect("101 over HTTP/1.1");
+    ws.send_text("hi").expect("send");
+    assert_eq!(ws.read().expect("echo"), Message::Text("hi".into()));
+    let _ = door.close(Duration::from_secs(2));
 }

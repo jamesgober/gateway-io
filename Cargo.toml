@@ -14,7 +14,7 @@ publish = false
 # net-io 0.7: serve-net 0.9, bouncer-io and web-net 0.11 are built on it, and the
 # gate and control-line types cross between them, so one net-io version must be in the tree.
 [workspace.dependencies]
-serve-net = { version = "0.9", default-features = false, features = ["http1", "ws"] }
+serve-net = { version = "0.9", default-features = false, features = ["http1", "h2", "ws"] }
 # The WebSocket protocol under serve-net's `ws` feature: its limits and origin policy.
 ws-net = { version = "0.9", default-features = false }
 net-io = "0.7.3"

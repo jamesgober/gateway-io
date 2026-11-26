@@ -32,6 +32,8 @@ gatekeeper = ["dep:gatekeeper-io"]
 bouncer-io = { workspace = true }
 # A WebSocket client for the tests.
 ws-net = { workspace = true, features = ["std"] }
+# The HPACK decoder of the tests' small HTTP/2 client.
+h2-net = { version = "0.3.1", default-features = false }
 
 [[bench]]
 name = "request_path"

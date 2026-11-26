@@ -73,6 +73,9 @@ pub struct Settings {
     /// How clients reach the listener (`[gateway] ingress`, `direct` by
     /// default, or `proxy` behind a reverse proxy).
     pub ingress: IngressMode,
+    /// Cleartext HTTP/2 with prior knowledge (`gateway.h2c`): only ever
+    /// from a trusted proxy.
+    pub h2c: H2c,
     /// Budgets per caller on some lanes (none by default): the application
     /// sets them (wasp's `[api] rate`), never the configuration reader.
     pub lane_rates: Vec<LaneRate>,
@@ -90,6 +93,23 @@ pub struct LaneRate {
     pub per_second: u32,
     /// The most at once after a quiet spell, at least `per_second`.
     pub burst: u32,
+}
+
+/// Cleartext HTTP/2 with prior knowledge (RFC 9113 section 3.3): a
+/// connection whose first bytes are the HTTP/2 preface is served as HTTP/2,
+/// any other as HTTP/1.1. Only ever on a listener behind a trusted proxy:
+/// on an open port it would let any client skip TLS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum H2c {
+    /// On behind a trusted proxy, off on a direct listener (no
+    /// `gateway.h2c`).
+    #[default]
+    Auto,
+    /// On, and a listener not behind a trusted proxy refuses to open
+    /// (`gateway.h2c = true`).
+    On,
+    /// HTTP/1.1 only (`gateway.h2c = false`).
+    Off,
 }
 
 /// How clients reach the listener.
@@ -162,6 +182,7 @@ pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "drain",
             "driver",
             "forwarded_proto",
+            "h2c",
             "head_timeout",
             "ingress",
             "keep_alive_requests",
@@ -235,6 +256,7 @@ impl Default for Settings {
             ban: Vec::new(),
             exempt: Vec::new(),
             ingress: IngressMode::Direct,
+            h2c: H2c::Auto,
             lane_rates: Vec::new(),
             ws: crate::ws::WsSettings::default(),
         }
@@ -395,6 +417,11 @@ impl Settings {
             ban: addresses(config, "door.ban")?,
             exempt: addresses(config, "door.exempt")?,
             ingress: ingress(config)?,
+            h2c: match config.get::<bool>("gateway.h2c").map_err(err)? {
+                None => H2c::Auto,
+                Some(true) => H2c::On,
+                Some(false) => H2c::Off,
+            },
             lane_rates: Vec::new(),
             ws: ws_settings(config)?,
         };
