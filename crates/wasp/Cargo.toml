@@ -30,11 +30,14 @@ luminess = { workspace = true }
 bison-db = { workspace = true }
 
 [features]
-default = ["gatekeeper"]
+default = ["gatekeeper", "tls"]
 # The gatekeeper (accounts and sessions in memory) as the site's gates. It
 # brings the only C dependency: a build without it links a static musl
 # binary without a C toolchain.
 gatekeeper = ["gateway-io/gatekeeper", "dep:gatekeeper-io", "dep:key-vault", "dep:crypt-io"]
+# TLS termination (`[tls]`, G-90). Its crypto (ring) needs a C compiler, so
+# the static cPanel bundle, behind Apache's TLS, leaves it out.
+tls = ["gateway-io/tls"]
 # nex-db as a store: `content.store = "nex"` and `auth.store = "nex"`.
 # Optional: no part of the process outside its adapter depends on it.
 store-nex = ["dep:nex-db", "dep:crypt-io"]

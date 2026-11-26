@@ -38,6 +38,8 @@ Two-step sign-in (TOTP) for nex-db accounts is the `mfa` feature. It is pure Rus
 cargo build --release -p wasp --no-default-features --features store-nex,mfa
 ```
 
+HTTPS served by wasp itself is the `tls` feature, in the default build. It uses `ring`, which needs a C compiler, so the static musl build above leaves it out: on cPanel, Apache serves HTTPS in front of wasp.
+
 ## Run
 
 ```bash
@@ -118,6 +120,28 @@ A crash restarts it after two seconds. A configuration it refuses (exit 78) or a
 - **As a launch daemon** (starts at boot, no login), add a `UserName` key with the account to run as, copy it to `/Library/LaunchDaemons/` (owned by root, mode 644), and run `sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.wasp.plist`.
 
 First make its log folder, private to the account: `mkdir -m 700 -p /usr/local/var/log/wasp`. launchd starts it again after a crash or a failed start (every 30 seconds while it keeps failing), and not after a clean stop.
+
+### HTTPS
+
+Behind Apache or nginx, the server in front serves HTTPS and wasp needs nothing. To run wasp on its own, give it the certificate and key:
+
+```toml
+[gateway]
+listen = "0.0.0.0:443"
+
+[tls]
+enabled = true
+cert = "/etc/wasp/tls/site.pem"   # the chain, PEM
+key = "/etc/wasp/tls/site.key"    # PEM, readable by wasp's account only
+redirect_from = "0.0.0.0:80"      # optional: plain HTTP sent to https://
+hsts = "max-age=31536000"         # optional: once you're sure of HTTPS
+```
+
+wasp speaks TLS 1.3 and 1.2 (1.3 whenever the browser can), and HTTP/2 or HTTP/1.1 as the browser asks. A key that other accounts can read refuses to start, so `chown wasp /etc/wasp/tls/site.key && chmod 600 /etc/wasp/tls/site.key`. With Let's Encrypt, a renewal hook that copies the new pair there does it, since certbot's own copy is root's alone.
+
+wasp checks both files every minute and loads a new pair when they change, with no restart. `systemctl reload wasp` loads them right away. A pair that doesn't load leaves the old one serving and says why in the log. Each load logs the certificate's last day, and a warning in its last 14 days.
+
+The redirect answers every request with 308 to the same path on `https://`, naming the request's host only when it is one of the site's hosts (`site.hosts` and the host profiles' names), and the first of them otherwise. It serves nothing else.
 
 ## Host profiles
 
@@ -535,6 +559,12 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `gateway.forwarded_proto` | true | with `ingress = "proxy"`, take the scheme from `X-Forwarded-Proto` (an https proxy in front makes the site https) |
 | `door.ban` | none | addresses refused at the door; changes apply on reload |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |
+| `tls.enabled` | false | serve HTTPS on `gateway.listen` (see [HTTPS](#https)); needs an address, not a Unix socket, and refuses to start with `ingress = "proxy"` |
+| `tls.cert` | none | the certificate chain, PEM; required with `tls.enabled` |
+| `tls.key` | none | the private key, PEM, readable by wasp's account only; required with `tls.enabled` |
+| `tls.reload` | `1m` | how often the two files are checked for a change (at least 1s; `0s` checks only on a reload) |
+| `tls.hsts` | none | the `Strict-Transport-Security` value, sent only over HTTPS: `max-age=<seconds>`, then `; includeSubDomains` or `; preload` as wanted |
+| `tls.redirect_from` | none | an address and port (`0.0.0.0:80`) for a plain listener that sends every request to `https://` |
 | `site.service` | `web` | which service the site profile uses: `web` (web-net) or `hello` (the passport stub) |
 | `site.base` | none | the folder the site lives under (`/blog`: a leading `/`, no trailing `/`) |
 | `site.hosts` | none | the site's hosts, canonical first; none answers only the development hosts (`localhost`, `127.0.0.1`, `[::1]`), and is refused at boot when `PORT` or `WASP_SOCKET` is set |

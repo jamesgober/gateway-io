@@ -27,6 +27,8 @@ gatekeeper-io = "0.7"
 # nex-db is not on crates.io: its git tag, never a path.
 nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.9.0" }
 key-vault = { version = "1.1", features = ["fetcher-file"] }
+# TLS termination (G-90): rustls, with ring as its provider.
+tls-net = { version = "0.11", default-features = false, features = ["ring", "net-io"] }
 crypt-io = "1.7"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
 

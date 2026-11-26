@@ -99,6 +99,52 @@ pub struct Pipeline {
     cpu: Option<Arc<crate::offload::CpuPool>>,
     /// The open WebSockets; `None` turns upgrades off.
     ws: Option<Arc<crate::ws::WsHub>>,
+    /// HSTS and the HTTPS redirect, when the gateway terminates TLS.
+    tls: Option<TlsReplies>,
+}
+
+/// What the gateway adds when it terminates TLS (G-90).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsReplies {
+    /// The `Strict-Transport-Security` value, on replies over TLS only.
+    pub hsts: Option<String>,
+    /// The hosts a redirect may name; another host goes to the first.
+    pub hosts: Vec<String>,
+    /// The HTTPS port the redirect names, set once the listener is bound.
+    pub https_port: Arc<std::sync::atomic::AtomicU16>,
+    /// The plain listener's profile: answered here, never by a site.
+    pub redirect_profile: Option<u8>,
+}
+
+impl TlsReplies {
+    /// Where a plain request goes: `https://`, the request's host when it is
+    /// the site's (else the first of the site's), the same path and query.
+    /// `None` when there is no host to send it to.
+    fn location(&self, host: Option<&str>, target: &str) -> Option<String> {
+        let asked = host
+            .map(|h| {
+                // The name without its port, lower case.
+                let name = match h.rfind(':') {
+                    Some(i) if !h.ends_with(']') => &h[..i],
+                    _ => h,
+                };
+                name.to_ascii_lowercase()
+            })
+            .filter(|h| !h.is_empty());
+        let local = |h: &str| matches!(h, "localhost" | "127.0.0.1" | "[::1]");
+        let name = match asked {
+            Some(h) if self.hosts.iter().any(|s| *s == h) => h,
+            // No site hosts (a local run): only a development host.
+            Some(h) if self.hosts.is_empty() && local(&h) => h,
+            _ => self.hosts.first()?.clone(),
+        };
+        let port = match self.https_port.load(std::sync::atomic::Ordering::Relaxed) {
+            443 => String::new(),
+            p => format!(":{p}"),
+        };
+        let target = if target.starts_with('/') { target } else { "/" };
+        Some(format!("https://{name}{port}{target}"))
+    }
 }
 
 /// A passport out of its shelf for one call. If the call unwinds (a panic in
@@ -175,6 +221,7 @@ impl Pipeline {
             budgeted: [false; 6],
             cpu: None,
             ws: None,
+            tls: None,
         }
     }
 
@@ -365,6 +412,13 @@ impl Pipeline {
     #[must_use]
     pub fn with_access(mut self, access: Option<Arc<AccessLog>>) -> Pipeline {
         self.access = access;
+        self
+    }
+
+    /// HSTS and the HTTPS redirect, when the gateway terminates TLS.
+    #[must_use]
+    pub(crate) fn with_tls_replies(mut self, tls: Option<TlsReplies>) -> Pipeline {
+        self.tls = tls;
         self
     }
 
@@ -736,6 +790,30 @@ impl HttpService for Pipeline {
     }
 
     fn call(&self, req: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
+        if let Some(tls) = &self.tls {
+            // The plain listener: everything goes to HTTPS, and nothing else
+            // is served there.
+            if tls.redirect_profile == Some(env.profile().0) {
+                match tls.location(req.head().header_str("host"), req.head().target()) {
+                    Some(to) => {
+                        reply
+                            .status(308)
+                            .header("location", to.as_bytes())
+                            .header("cache-control", "no-store");
+                    }
+                    None => {
+                        reply.text(421, "This server does not serve that host.");
+                    }
+                }
+                return Outcome::Done;
+            }
+            // HSTS, only where it was asked for and only over TLS.
+            if let Some(hsts) = &tls.hsts
+                && env.tls().is_some()
+            {
+                reply.header("strict-transport-security", hsts.as_bytes());
+            }
+        }
         // Password hashing and other slow routes, off the worker.
         if let Some(outcome) = self.offload(req, env, reply) {
             return outcome;

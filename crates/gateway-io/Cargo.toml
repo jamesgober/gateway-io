@@ -23,10 +23,14 @@ web-net = { workspace = true }
 # The gates (feature `gatekeeper`): authentication in the core, authorization
 # in web-net, sign-in and sign-out, CSRF.
 gatekeeper-io = { workspace = true, optional = true }
+# TLS termination (feature `tls`, G-90): rustls on net-io's TLS seam.
+tls-net = { workspace = true, optional = true }
 
 [features]
 default = []
 gatekeeper = ["dep:gatekeeper-io"]
+# TLS termination (`[tls]`): brings ring, which needs a C compiler.
+tls = ["dep:tls-net"]
 
 [dev-dependencies]
 bouncer-io = { workspace = true }
@@ -34,6 +38,8 @@ bouncer-io = { workspace = true }
 ws-net = { workspace = true, features = ["std"] }
 # The HPACK decoder of the tests' small HTTP/2 client.
 h2-net = { version = "0.3.1", default-features = false }
+# A TLS client for the tests (feature `tls`).
+tls-net = { workspace = true }
 
 [[bench]]
 name = "request_path"

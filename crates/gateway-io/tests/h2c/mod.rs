@@ -51,12 +51,24 @@ fn literal(out: &mut Vec<u8>, name: &str, value: &str) {
 /// hold `:protocol`) and reads until its answer ends, the stream is reset,
 /// or the connection goes.
 pub fn request(addr: SocketAddr, method: &str, path: &str, fields: &[(&str, &str)]) -> Answer {
-    let mut s = TcpStream::connect(addr).expect("connect");
+    let s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_millis(200)))
         .expect("timeout");
+    request_over(s, "http", method, path, fields)
+}
+
+/// As `request`, on a stream already open (TLS, say), with this `:scheme`.
+/// A read timeout on the stream keeps the loop turning.
+pub fn request_over<S: Read + Write>(
+    mut s: S,
+    scheme: &str,
+    method: &str,
+    path: &str,
+    fields: &[(&str, &str)],
+) -> Answer {
     let mut block = Vec::new();
     literal(&mut block, ":method", method);
-    literal(&mut block, ":scheme", "http");
+    literal(&mut block, ":scheme", scheme);
     literal(&mut block, ":authority", "localhost");
     literal(&mut block, ":path", path);
     for (n, v) in fields {
