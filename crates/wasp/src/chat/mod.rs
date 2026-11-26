@@ -345,6 +345,11 @@ pub struct RoomSettings {
     pub max_keep: u64,
     /// Room deliveries a second across the realm (`fanout`, 200,000).
     pub fanout: u32,
+    /// Entered and exited notices a second across the realm (`presence`,
+    /// 50,000): a budget of their own, so presence never starves messages.
+    pub presence: u32,
+    /// The most rooms one account may own (`max_per_account`, 20).
+    pub max_per_account: u64,
 }
 
 impl Default for RoomSettings {
@@ -356,6 +361,8 @@ impl Default for RoomSettings {
             max_present: 1000,
             max_keep: 100_000,
             fanout: 200_000,
+            presence: 50_000,
+            max_per_account: 20,
         }
     }
 }
@@ -418,7 +425,9 @@ const ROOM_KEYS: &[&str] = &[
     "filter",
     "max",
     "max_keep",
+    "max_per_account",
     "max_present",
+    "presence",
 ];
 
 /// The keys of `[chat.group]`.
@@ -596,6 +605,9 @@ const NUMBER_TRIES: u64 = 64;
 /// starts again.
 const GROUP_CACHE: usize = 10_000;
 
+/// Messages deleted in one write when a conversation is trimmed or goes.
+const PURGE_BATCH: u64 = 256;
+
 /// Accounts whose budgets are kept at once; past it the full ones go.
 const BUDGETS: usize = 100_000;
 
@@ -684,8 +696,18 @@ pub struct Chat {
     room_numbers: Mutex<HashMap<ConvId, u64>>,
     /// When each person last wrote in each room, for slow mode.
     slow: Mutex<HashMap<(ConvId, u128), u64>>,
-    /// The realm's room deliveries.
+    /// The realm's room message deliveries.
     realm_fanout: Mutex<Bucket>,
+    /// The realm's room entered and exited notices, a budget of their own
+    /// so presence never starves messages.
+    realm_presence: Mutex<Bucket>,
+    /// The site's filter words, for a lookup per word.
+    site_words: std::collections::HashSet<String>,
+    /// Who each account blocked, read from the store once and kept as
+    /// blocks change here.
+    blocks: Mutex<HashMap<u128, Arc<std::collections::HashSet<u128>>>>,
+    /// When each account's last filtered message went to the log.
+    filter_logged: Mutex<HashMap<u128, u64>>,
 }
 
 impl std::fmt::Debug for Chat {
@@ -779,6 +801,10 @@ impl Chat {
             room_numbers: Mutex::new(HashMap::new()),
             slow: Mutex::new(HashMap::new()),
             realm_fanout: Mutex::new(Bucket::full(settings.rooms.fanout.saturating_mul(2))),
+            realm_presence: Mutex::new(Bucket::full(settings.rooms.presence.saturating_mul(2))),
+            site_words: settings.rooms.filter.iter().cloned().collect(),
+            blocks: Mutex::new(HashMap::new()),
+            filter_logged: Mutex::new(HashMap::new()),
             settings,
         })
     }
@@ -842,6 +868,86 @@ impl Chat {
             .collect()
     }
 
+    /// How many connections `accounts` have open now: what a push to them
+    /// costs.
+    fn connections(&self, accounts: &[u128]) -> u64 {
+        let live = lock(&self.live);
+        accounts
+            .iter()
+            .map(|a| live.get(a).map_or(0, Vec::len) as u64)
+            .sum()
+    }
+
+    /// Who `account` blocked.
+    fn blocks_of(&self, account: u128) -> Arc<std::collections::HashSet<u128>> {
+        if let Some(b) = lock(&self.blocks).get(&account) {
+            return Arc::clone(b);
+        }
+        let read: std::collections::HashSet<u128> = self
+            .store
+            .blocks_of(account)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let read = Arc::new(read);
+        let mut cache = lock(&self.blocks);
+        if cache.len() >= BUDGETS {
+            cache.clear();
+        }
+        cache.insert(account, Arc::clone(&read));
+        read
+    }
+
+    /// Deletes messages `from` to `to` of conversation `id`, and forgets
+    /// what `members` kept there, on a thread of its own: no lock is held
+    /// and the frame that asked is answered at once.
+    fn purge(&self, id: ConvId, from: u64, to: u64, members: Vec<u128>) {
+        if from > to && members.is_empty() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let _ = std::thread::Builder::new()
+            .name("wasp-chat-purge".into())
+            .spawn(move || {
+                // In batches, so one large conversation is never one long
+                // write.
+                let mut at = from;
+                while at <= to {
+                    let end = to.min(at.saturating_add(PURGE_BATCH - 1));
+                    if store.delete_messages(&id, at, end).is_err() {
+                        return;
+                    }
+                    at = end.saturating_add(1);
+                }
+                for m in members {
+                    let _ = store.forget_member(&id, m);
+                }
+            });
+    }
+
+    /// Takes `n` deliveries from `account`'s budget if they are there:
+    /// `false` when they are not (nothing is taken then). No send is
+    /// counted.
+    fn take_deliveries(&self, account: u128, n: u64) -> bool {
+        let s = &self.settings;
+        if s.fanout == 0 {
+            return true;
+        }
+        let burst = s.fanout.saturating_mul(2);
+        let mut budgets = lock(&self.budgets);
+        let b = budgets.entry(account).or_insert_with(|| Budget {
+            sends: Bucket::full(s.burst),
+            deliveries: Bucket::full(burst),
+        });
+        b.deliveries.refill(s.fanout, burst);
+        if b.deliveries.tokens >= n as f64 {
+            b.deliveries.tokens -= n as f64;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Takes one send and `deliveries` deliveries from `account`'s budgets,
     /// or tells how many milliseconds until it could.
     fn charge(&self, account: u128, deliveries: u64) -> Result<(), u64> {
@@ -901,8 +1007,14 @@ impl Chat {
         Ok(Some(g))
     }
 
-    /// Keeps group `id`'s record.
+    /// Keeps group `id`'s record; nothing is written when it did not
+    /// change.
     fn keep_group(&self, id: &ConvId, g: Group) -> Result<Arc<Group>, String> {
+        if let Some(old) = lock(&self.groups).get(id)
+            && **old == g
+        {
+            return Ok(Arc::clone(old));
+        }
         self.store.put_group(id, &g).map_err(|_| unavailable())?;
         let g = Arc::new(g);
         lock(&self.groups).insert(*id, Arc::clone(&g));
@@ -940,11 +1052,7 @@ impl Chat {
             ConvKind::Room => {
                 return match self.room(id)? {
                     Some(r) if r.may_enter(me, rank, now_ms()) => Ok(Access::Room(c, r)),
-                    _ => Err(error(
-                        "chat.no_room",
-                        "There is no such room you may enter.",
-                        None,
-                    )),
+                    _ => Err(not()),
                 };
             }
             ConvKind::Group => {}
@@ -1263,7 +1371,7 @@ impl ChatConn {
                 continue;
             };
             // In a group, an author this reader blocked is not shown.
-            if matches!(access, Access::Group(..)) && m.author != self.account {
+            if matches!(access, Access::Group(..) | Access::Room(..)) && m.author != self.account {
                 let skip = match hidden.get(&m.author) {
                     Some(s) => *s,
                     None => {
@@ -1328,7 +1436,7 @@ impl ChatConn {
             .ok_or_else(|| error("chat.bad_body", "`body` is a list of spans.", None))?;
         let body = read_spans(body, advanced, chat.settings.max_length)
             .map_err(|why| error("chat.bad_body", why, None))?;
-        if let Err(ms) = chat.charge(self.account, recipients.len() as u64) {
+        if let Err(ms) = chat.charge(self.account, chat.connections(&recipients)) {
             return Err(Obj::new()
                 .str("op", "error")
                 .str("code", "chat.slow_down")
@@ -1404,7 +1512,7 @@ impl ChatConn {
         let group = matches!(access, Access::Group(..));
         for member in chat.online(recipients) {
             if chat.store.muted(&id, member).unwrap_or(false)
-                || (group && chat.store.blocked(member, self.account).unwrap_or(false))
+                || (group && chat.blocks_of(member).contains(&self.account))
             {
                 continue;
             }
@@ -1517,6 +1625,7 @@ impl ChatConn {
             .store
             .set_blocked(self.account, whom, on)
             .map_err(|_| unavailable())?;
+        lock(&self.chat.blocks).remove(&self.account);
         Ok(Obj::new()
             .str("op", "blocked")
             .str("account", &hex(whom))
@@ -2260,13 +2369,15 @@ mod tests {
     }
 
     #[test]
-    fn sends_are_charged_per_delivery() {
+    fn sends_are_charged_to_the_account() {
+        // Deliveries count the connections reached (none here: the socket
+        // tests count them); every send costs one of the account's sends.
         let Group3 { id, ann, .. } = team(ChatSettings {
-            fanout: 2,
+            rate: 1,
+            burst: 4,
             ..ChatSettings::default()
         });
-        // Two others: each message costs two of four (the burst is twice
-        // the rate).
+        // Two invites made by the team already spent two of four.
         let send = |nonce: &str| {
             ann.handle(&format!(
                 r#"{{"op":"send","conversation":"{id}","nonce":"{nonce}","body":[{{"text":"hi"}}]}}"#
@@ -2415,11 +2526,11 @@ mod tests {
         );
         assert_eq!(
             code(&bob.handle(&format!(r#"{{"op":"enter","room":"{secret}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         assert_eq!(
             code(&bob.handle(&format!(r#"{{"op":"enter","room":"{staff}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         assert_eq!(
             op(&ann.handle(&format!(
@@ -2553,10 +2664,10 @@ mod tests {
         assert_eq!(op(&send(&ann)), "sent");
         // Kicked: out now, and back only after the time.
         assert_eq!(op(&act(&mo, "room_kick", 3, "")), "kicked");
-        assert_eq!(code(&send(&ann)), "chat.no_room");
+        assert_eq!(code(&send(&ann)), "chat.not_a_member");
         assert_eq!(
             code(&ann.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         assert_eq!(op(&act(&mo, "room_unban", 3, "")), "unbanned");
         assert_eq!(
@@ -2590,7 +2701,7 @@ mod tests {
         assert_eq!(op(&act(&site, "room_ban", 3, "")), "banned");
         assert_eq!(
             code(&ann.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         let private =
             id_of(&ann.handle(r#"{"op":"create_room","name":"Ours","access":"private"}"#));
@@ -2599,16 +2710,16 @@ mod tests {
                 r#"{{"op":"room_ban","room":"{private}","account":"{:032x}"}}"#,
                 2
             ))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         // It cannot read a private room, but it can close one.
         assert_eq!(
             code(&site.handle(&format!(r#"{{"op":"history","conversation":"{private}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         assert_eq!(
             code(&mo.handle(&format!(r#"{{"op":"delete_room","room":"{private}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
         assert_eq!(
             op(&site.handle(&format!(r#"{{"op":"delete_room","room":"{private}"}}"#))),
@@ -2620,7 +2731,7 @@ mod tests {
         );
         assert_eq!(
             code(&mo.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#))),
-            "chat.no_room"
+            "chat.not_a_member"
         );
     }
 
@@ -2701,5 +2812,411 @@ mod tests {
         assert_eq!(code(&ban(&site, 8)), "chat.not_allowed", "never oneself");
         assert_eq!(op(&ban(&site, 2)), "account_banned");
         assert_eq!(*lock(&directory.banned), vec![2]);
+    }
+
+    // The security read of groups and rooms: one test per finding.
+
+    fn who_has(c: &ChatConn, id: &str, n: u128) -> bool {
+        c.handle(&format!(r#"{{"op":"who","room":"{id}"}}"#))
+            .contains(&format!("{n:032x}"))
+    }
+
+    #[test]
+    fn made_up_ids_never_fill_a_record_and_lists_are_capped() {
+        let store = Arc::new(MemoryChat::new());
+        let chat = Chat::new(
+            store.clone(),
+            Arc::new(Everyone),
+            "users",
+            ChatSettings::default(),
+        );
+        let ann = member(&chat, 1);
+        let id = id_of(&ann.handle(r#"{"op":"create","name":"Team"}"#));
+        // 404 is no one (the test directory): banning it is refused.
+        let ban = |n: u128| {
+            ann.handle(&format!(
+                r#"{{"op":"kick","conversation":"{id}","account":"{n:032x}","ban":true}}"#
+            ))
+        };
+        assert_eq!(code(&ban(404)), "chat.cannot_write");
+        for n in 1000..1000 + group::MAX_BANS as u128 {
+            assert_eq!(op(&ban(n)), "kicked");
+        }
+        assert_eq!(code(&ban(5000)), "chat.full", "the ban list is capped");
+        // Inviting again does not write the record again.
+        let invite = || {
+            ann.handle(&format!(
+                r#"{{"op":"invite","conversation":"{id}","account":"{:032x}"}}"#,
+                2
+            ))
+        };
+        assert_eq!(op(&invite()), "invite");
+        let conv: ConvId = id.parse().expect("id");
+        let first = store.group(&conv).expect("read").expect("there");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(op(&invite()), "invite");
+        assert_eq!(store.group(&conv).expect("read").expect("there"), first);
+        // In a room too.
+        let ed = editor(&chat, 9);
+        let room = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        let mute = ed.handle(&format!(
+            r#"{{"op":"room_mute","room":"{room}","account":"{:032x}"}}"#,
+            404
+        ));
+        assert_eq!(code(&mute), "chat.cannot_write");
+    }
+
+    #[test]
+    fn presence_is_paid_for_by_whoever_moves() {
+        let chat = chat(ChatSettings {
+            rate: 1,
+            burst: 3,
+            rooms: RoomSettings {
+                presence: 1,
+                ..RoomSettings::default()
+            },
+            ..ChatSettings::default()
+        });
+        let ed = editor(&chat, 1);
+        let rooms: Vec<String> = (0..4)
+            .map(|n| id_of(&ed.handle(&format!(r#"{{"op":"create_room","name":"R{n}"}}"#))))
+            .collect();
+        let ann = member(&chat, 2);
+        let bob = member(&chat, 3);
+        bob.handle(&format!(r#"{{"op":"enter","room":"{}"}}"#, rooms[0]));
+        // Entering costs a send: three, then the account must wait.
+        for r in &rooms[..3] {
+            assert_eq!(
+                op(&ann.handle(&format!(r#"{{"op":"enter","room":"{r}"}}"#))),
+                "room"
+            );
+        }
+        let slow = ann.handle(&format!(r#"{{"op":"enter","room":"{}"}}"#, rooms[3]));
+        assert_eq!(code(&slow), "chat.slow_down", "{slow}");
+        // The presence budget is spent; messages have their own.
+        let sent = bob.handle(&format!(
+            r#"{{"op":"send","conversation":"{}","body":[{{"text":"hi"}}]}}"#,
+            rooms[0]
+        ));
+        assert_eq!(op(&sent), "sent", "{sent}");
+    }
+
+    #[test]
+    fn whoever_may_no_longer_enter_is_put_out() {
+        let chat = chat(ChatSettings::default());
+        let ed = editor(&chat, 1);
+        let ann = member(&chat, 2);
+        let mo = member(&chat, 3);
+        let id = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        ann.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+        assert!(who_has(ed_in(&ed, &id), &id, 2));
+        // The room is raised to editors: Ann is put out.
+        ed.handle(&format!(
+            r#"{{"op":"room_settings","room":"{id}","role":"editor"}}"#
+        ));
+        assert!(!who_has(&ed, &id, 2), "a member is out of an editors' room");
+        // A private room: a moderator not on its list is out once demoted.
+        let secret = id_of(&ed.handle(r#"{"op":"create_room","name":"S","access":"private"}"#));
+        ed.handle(&format!(
+            r#"{{"op":"room_role","room":"{secret}","account":"{:032x}","role":"moderator"}}"#,
+            3
+        ));
+        assert_eq!(
+            op(&mo.handle(&format!(r#"{{"op":"enter","room":"{secret}"}}"#))),
+            "room"
+        );
+        ed.handle(&format!(r#"{{"op":"enter","room":"{secret}"}}"#));
+        ed.handle(&format!(
+            r#"{{"op":"room_role","room":"{secret}","account":"{:032x}","role":"member"}}"#,
+            3
+        ));
+        assert!(!who_has(&ed, &secret, 3), "the demoted moderator is out");
+    }
+
+    /// `ed`, entered in room `id` (to read its people).
+    fn ed_in<'a>(ed: &'a ChatConn, id: &str) -> &'a ChatConn {
+        ed.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+        ed
+    }
+
+    #[test]
+    fn room_settings_keep_to_each_ones_rights() {
+        let chat = chat(ChatSettings::default());
+        let ann = member(&chat, 1);
+        let ed = editor(&chat, 2);
+        let site = admin(&chat, 3);
+        // A member's unlisted room may not be made public.
+        let hidden = id_of(&ann.handle(r#"{"op":"create_room","name":"H","access":"unlisted"}"#));
+        assert_eq!(
+            code(&ann.handle(&format!(
+                r#"{{"op":"room_settings","room":"{hidden}","access":"public"}}"#
+            ))),
+            "chat.not_allowed"
+        );
+        // Site staff set the topic, slow mode and words, nothing else.
+        let lobby = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby","persistent":false}"#));
+        for frame in [
+            r#""persistent":true"#,
+            r#""access":"unlisted""#,
+            r#""role":"admin""#,
+            r#""name":"Mine""#,
+        ] {
+            let e = site.handle(&format!(
+                r#"{{"op":"room_settings","room":"{lobby}",{frame}}}"#
+            ));
+            assert_eq!(code(&e), "chat.not_allowed", "{frame}: {e}");
+        }
+        assert_eq!(
+            op(&site.handle(&format!(
+                r#"{{"op":"room_settings","room":"{lobby}","topic":"Be kind","slow":5}}"#
+            ))),
+            "room"
+        );
+    }
+
+    #[test]
+    fn a_banned_moderator_stays_out() {
+        let chat = chat(ChatSettings::default());
+        let ed = editor(&chat, 1);
+        let mo = member(&chat, 2);
+        let id = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        ed.handle(&format!(
+            r#"{{"op":"room_role","room":"{id}","account":"{:032x}","role":"moderator"}}"#,
+            2
+        ));
+        assert_eq!(
+            op(&ed.handle(&format!(
+                r#"{{"op":"room_ban","room":"{id}","account":"{:032x}"}}"#,
+                2
+            ))),
+            "banned"
+        );
+        assert_eq!(
+            code(&mo.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#))),
+            "chat.not_a_member"
+        );
+        let record = ed.handle(&format!(r#"{{"op":"room","room":"{id}"}}"#));
+        assert!(
+            !record.contains(&format!("{:032x}", 2)),
+            "no longer a moderator: {record}"
+        );
+    }
+
+    #[test]
+    fn rooms_are_capped_per_account_and_the_site_cap_is_for_public_ones() {
+        let chat = chat(ChatSettings {
+            rooms: RoomSettings {
+                max: 1,
+                max_per_account: 2,
+                ..RoomSettings::default()
+            },
+            ..ChatSettings::default()
+        });
+        let ed = editor(&chat, 1);
+        let other = editor(&chat, 2);
+        assert_eq!(op(&ed.handle(r#"{"op":"create_room","name":"A"}"#)), "room");
+        assert_eq!(
+            code(&other.handle(r#"{"op":"create_room","name":"B"}"#)),
+            "chat.full"
+        );
+        assert_eq!(
+            op(&other.handle(r#"{"op":"create_room","name":"B","access":"private"}"#)),
+            "room"
+        );
+        assert_eq!(
+            op(&ed.handle(r#"{"op":"create_room","name":"C","access":"unlisted"}"#)),
+            "room"
+        );
+        assert_eq!(
+            code(&ed.handle(r#"{"op":"create_room","name":"D","access":"private"}"#)),
+            "chat.quota"
+        );
+    }
+
+    #[test]
+    fn blocks_hold_in_rooms_and_one_connection_is_in_few_rooms() {
+        let chat = chat(ChatSettings {
+            rooms: RoomSettings {
+                max_per_account: 50,
+                ..RoomSettings::default()
+            },
+            ..ChatSettings::default()
+        });
+        let ed = editor(&chat, 1);
+        let ann = member(&chat, 2);
+        let bob = member(&chat, 3);
+        let id = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        for c in [&ann, &bob] {
+            c.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+        }
+        ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{id}","body":[{{"text":"from ann"}}]}}"#
+        ));
+        bob.handle(&format!(
+            r#"{{"op":"block","account":"{:032x}","on":true}}"#,
+            2
+        ));
+        let page = bob.handle(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+        assert!(
+            texts(&page).is_empty(),
+            "the blocked author is not shown: {page}"
+        );
+        // At most ten rooms on one connection.
+        let many: Vec<String> = (0..room::ROOMS_PER_CONNECTION + 1)
+            .map(|n| id_of(&ed.handle(&format!(r#"{{"op":"create_room","name":"R{n}"}}"#))))
+            .collect();
+        let walker = member(&chat, 4);
+        let mut answers = Vec::new();
+        for r in &many {
+            answers.push(code(
+                &walker.handle(&format!(r#"{{"op":"enter","room":"{r}"}}"#)),
+            ));
+        }
+        assert_eq!(
+            answers.last().map(String::as_str),
+            Some("chat.quota"),
+            "{answers:?}"
+        );
+    }
+
+    #[test]
+    fn one_answer_for_what_one_may_not_see() {
+        let chat = chat(ChatSettings::default());
+        let ed = editor(&chat, 1);
+        let ann = member(&chat, 2);
+        let secret = id_of(&ed.handle(r#"{"op":"create_room","name":"S","access":"private"}"#));
+        let made_up = format!("{:032x}", 12345);
+        let answers: Vec<String> = [
+            format!(r#"{{"op":"enter","room":"{secret}"}}"#),
+            format!(r#"{{"op":"enter","room":"{made_up}"}}"#),
+            format!(r#"{{"op":"history","conversation":"{secret}"}}"#),
+            format!(r#"{{"op":"history","conversation":"{made_up}"}}"#),
+        ]
+        .iter()
+        .map(|f| ann.handle(f))
+        .collect();
+        assert!(answers.iter().all(|a| a == &answers[0]), "{answers:?}");
+        assert_eq!(code(&answers[0]), "chat.not_a_member");
+    }
+
+    #[test]
+    fn the_filter_sees_words_across_spans_and_costs_a_send() {
+        let chat = chat(ChatSettings {
+            rate: 1,
+            burst: 3,
+            rooms: RoomSettings {
+                filter: vec!["darn".to_owned()],
+                ..RoomSettings::default()
+            },
+            ..ChatSettings::default()
+        });
+        let ed = editor(&chat, 1);
+        let ann = member(&chat, 2);
+        let id = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        ann.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+        let split = ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{id}","body":[{{"text":"da"}},{{"text":"rn"}}]}}"#
+        ));
+        assert_eq!(code(&split), "chat.filtered");
+        // Refused, it still cost a send: one left, then wait.
+        let clean = |t: &str| {
+            ann.handle(&format!(
+                r#"{{"op":"send","conversation":"{id}","body":[{{"text":"{t}"}}]}}"#
+            ))
+        };
+        assert_eq!(op(&clean("hi")), "sent");
+        assert_eq!(code(&clean("hi")), "chat.slow_down");
+    }
+
+    /// Waits up to two seconds for `cond`.
+    fn soon(mut cond: impl FnMut() -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(2) {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    #[test]
+    fn retention_follows_a_change_at_once() {
+        let store = Arc::new(MemoryChat::new());
+        let chat = Chat::new(
+            store.clone(),
+            Arc::new(Everyone),
+            "users",
+            ChatSettings::default(),
+        );
+        let ed = editor(&chat, 1);
+        let id = id_of(&ed.handle(r#"{"op":"create_room","name":"Lobby"}"#));
+        let conv: ConvId = id.parse().expect("id");
+        ed.handle(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+        for n in 0..6 {
+            ed.handle(&format!(
+                r#"{{"op":"send","conversation":"{id}","body":[{{"text":"m{n}"}}]}}"#
+            ));
+        }
+        // Keep two: the first four go now, not one per message to come.
+        ed.handle(&format!(
+            r#"{{"op":"room_settings","room":"{id}","keep":2}}"#
+        ));
+        assert!(soon(|| (1..=4).all(|n| store
+            .message(&conv, n)
+            .ok()
+            .flatten()
+            .is_none())));
+        assert!(store.message(&conv, 6).expect("read").is_some());
+        // Ephemeral: what was kept goes, and never comes back.
+        ed.handle(&format!(
+            r#"{{"op":"room_settings","room":"{id}","persistent":false}}"#
+        ));
+        assert!(soon(|| store.message(&conv, 6).ok().flatten().is_none()));
+        ed.handle(&format!(
+            r#"{{"op":"room_settings","room":"{id}","persistent":true}}"#
+        ));
+        let page = ed.handle(&format!(r#"{{"op":"history","conversation":"{id}"}}"#));
+        assert!(texts(&page).is_empty(), "{page}");
+        // A group's last member out: its messages and marks go.
+        let ann = member(&chat, 2);
+        let group = id_of(&ann.handle(r#"{"op":"create","name":"G"}"#));
+        let gid: ConvId = group.parse().expect("id");
+        ann.handle(&format!(
+            r#"{{"op":"send","conversation":"{group}","body":[{{"text":"hi"}}]}}"#
+        ));
+        assert_eq!(store.read_marker(&gid, 2).expect("read"), 1);
+        ann.handle(&format!(r#"{{"op":"leave","conversation":"{group}"}}"#));
+        assert!(soon(|| store.message(&gid, 1).ok().flatten().is_none()
+            && store.read_marker(&gid, 2).ok() == Some(0)));
+    }
+
+    #[test]
+    fn an_invite_lapses_with_whoever_made_it() {
+        let Group3 {
+            id, ann, bob, chat, ..
+        } = team(ChatSettings::default());
+        ann.handle(&format!(
+            r#"{{"op":"role","conversation":"{id}","account":"{:032x}","role":"moderator"}}"#,
+            2
+        ));
+        let dan = member(&chat, 4);
+        assert_eq!(
+            op(&bob.handle(&format!(
+                r#"{{"op":"invite","conversation":"{id}","account":"{:032x}"}}"#,
+                4
+            ))),
+            "invite"
+        );
+        // Bob is demoted: his invite no longer opens the door.
+        ann.handle(&format!(
+            r#"{{"op":"role","conversation":"{id}","account":"{:032x}","role":"member"}}"#,
+            2
+        ));
+        assert!(!dan.handle(r#"{"op":"invites"}"#).contains(&id));
+        assert_eq!(
+            code(&dan.handle(&format!(r#"{{"op":"join","conversation":"{id}"}}"#))),
+            "chat.not_invited"
+        );
     }
 }

@@ -4,8 +4,8 @@
 //! are listed in a directory; unlisted ones are entered by id; private ones
 //! only by the accounts on their list.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::api::{Obj, list};
 use crate::json::Value;
@@ -23,7 +23,15 @@ pub const TOPIC_MAX: usize = 200;
 /// The most words a room's own filter holds.
 pub const ROOM_WORDS: usize = 100;
 /// The most bans, and the most mutes, one room holds at once.
-pub const MAX_HOLDS: usize = 1000;
+pub const MAX_HOLDS: usize = 200;
+/// The most rooms one connection is in at once.
+pub const ROOMS_PER_CONNECTION: usize = 10;
+/// The most rooms one account is in at once, over all its connections.
+pub const ROOMS_PER_ACCOUNT: usize = 20;
+/// Slow-mode notes kept before the old ones go.
+const SLOW_NOTES: usize = 100_000;
+/// The longest slow mode, in seconds.
+const SLOW_MAX_SECS: u64 = 3600;
 /// Rooms in one page of the directory.
 const DIRECTORY_PAGE: usize = 50;
 /// People in one page of `who`.
@@ -137,11 +145,14 @@ impl Room {
     /// Whether `account`, of site `rank`, may enter at `now`.
     #[must_use]
     pub fn may_enter(&self, account: u128, rank: u8, now: u64) -> bool {
-        if account == self.owner || self.moderators.contains(&account) {
+        if account == self.owner {
             return true;
         }
         if self.bans.iter().any(|b| b.account == account && b.on(now)) {
             return false;
+        }
+        if self.moderators.contains(&account) {
+            return true;
         }
         match self.access {
             RoomAccess::Private => self.list.contains(&account),
@@ -315,6 +326,14 @@ impl super::RoomSettings {
                 100_000_000,
             )?)
             .unwrap_or(u32::MAX),
+            presence: u32::try_from(ranged(
+                "chat.rooms.presence",
+                u64::from(d.presence),
+                0,
+                100_000_000,
+            )?)
+            .unwrap_or(u32::MAX),
+            max_per_account: ranged("chat.rooms.max_per_account", d.max_per_account, 1, 1000)?,
         })
     }
 }
@@ -322,8 +341,16 @@ impl super::RoomSettings {
 /// Every room's record, once read.
 pub(super) type RoomCache = Option<HashMap<ConvId, Arc<Room>>>;
 
-/// Who is in each room now: for each account, its connections there.
-pub(super) type Presence = HashMap<ConvId, HashMap<u128, Vec<u64>>>;
+/// One account in a room: its site rank (0 member, 1 editor, 2 admin)
+/// and its connections there.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Seat {
+    pub(super) rank: u8,
+    pub(super) conns: Vec<u64>,
+}
+
+/// Who is in each room now: each account's seat.
+pub(super) type Presence = HashMap<ConvId, HashMap<u128, Seat>>;
 
 /// The room's record as people see it; a moderator sees its words too.
 fn room_json(id: &ConvId, r: &Room, people: usize, moderator: bool) -> String {
@@ -382,7 +409,24 @@ fn bad_room() -> String {
 }
 
 fn not_here() -> String {
-    error("chat.no_room", "There is no such room you may enter.", None)
+    error(
+        "chat.not_a_member",
+        "There is no such conversation of yours.",
+        None,
+    )
+}
+
+/// Over a budget: try again in `ms`.
+pub(super) fn slow_down(ms: u64) -> String {
+    Obj::new()
+        .str("op", "error")
+        .str("code", "chat.slow_down")
+        .str(
+            "message",
+            "You are sending faster than you may. Wait a moment.",
+        )
+        .num("retry_ms", ms)
+        .end()
 }
 
 fn not_allowed() -> String {
@@ -393,8 +437,8 @@ fn not_allowed() -> String {
     )
 }
 
-/// Whether `text` holds one of `words` as a whole word, ignoring case.
-fn filtered(text: &str, site: &[String], room: &[String]) -> bool {
+/// Whether `text` holds one of the words as a whole word, ignoring case.
+fn filtered(text: &str, site: &HashSet<String>, room: &[String]) -> bool {
     if site.is_empty() && room.is_empty() {
         return false;
     }
@@ -420,7 +464,13 @@ impl super::Chat {
         Ok(self.room_cache()?.as_ref().and_then(|c| c.get(id).cloned()))
     }
 
+    /// Keeps room `id`'s record; nothing is written when it did not change.
     fn keep_room(&self, id: &ConvId, r: Room) -> Result<Arc<Room>, String> {
+        if let Some(old) = self.room(id)?
+            && *old == r
+        {
+            return Ok(old);
+        }
         self.store.put_room(id, &r).map_err(|_| unavailable())?;
         let r = Arc::new(r);
         if let Some(c) = self.room_cache()?.as_mut() {
@@ -434,15 +484,24 @@ impl super::Chat {
         lock(&self.presence).get(id).map_or(0, HashMap::len)
     }
 
-    /// Takes `n` deliveries from the realm's room budget: `false` when it is
-    /// spent.
-    fn realm_take(&self, n: u64) -> bool {
-        let rate = self.settings.rooms.fanout;
+    /// The connections in room `id` other than `account`'s: what a push
+    /// from it costs.
+    fn audience(&self, id: &ConvId, account: u128) -> u64 {
+        lock(&self.presence).get(id).map_or(0, |p| {
+            p.iter()
+                .filter(|(a, _)| **a != account)
+                .map(|(_, s)| s.conns.len() as u64)
+                .sum()
+        })
+    }
+
+    /// Takes `n` from a realm budget: `false` when it is spent.
+    fn take_realm(bucket: &Mutex<super::Bucket>, rate: u32, n: u64) -> bool {
         if rate == 0 {
             return true;
         }
         let burst = rate.saturating_mul(2);
-        let mut b = lock(&self.realm_fanout);
+        let mut b = lock(bucket);
         b.refill(rate, burst);
         if b.tokens >= n as f64 {
             b.tokens -= n as f64;
@@ -452,25 +511,67 @@ impl super::Chat {
         }
     }
 
-    /// Sends `text` to the connections in room `id`, but `except`'s; with
-    /// `budget`, only while the realm's budget lasts. The number reached.
-    fn push_room(&self, id: &ConvId, text: &str, except: Option<u128>, budget: bool) -> usize {
+    /// Takes `n` message deliveries from the realm's room budget.
+    fn realm_take(&self, n: u64) -> bool {
+        Self::take_realm(&self.realm_fanout, self.settings.rooms.fanout, n)
+    }
+
+    /// Takes `n` notice deliveries from the realm's presence budget.
+    fn presence_take(&self, n: u64) -> bool {
+        Self::take_realm(&self.realm_presence, self.settings.rooms.presence, n)
+    }
+
+    /// Sends `text` to the connections in room `id`: never to `except`, nor
+    /// to anyone who blocked `from`. A `notice` goes only while the realm's
+    /// presence budget lasts, and is dropped, never queued, past it; a
+    /// message was charged before. The connections reached.
+    fn push_room(
+        &self,
+        id: &ConvId,
+        text: &str,
+        from: Option<u128>,
+        except: Option<u128>,
+        notice: bool,
+    ) -> u64 {
         let targets: Vec<(u128, Vec<u64>)> = lock(&self.presence)
             .get(id)
             .map(|p| {
                 p.iter()
                     .filter(|(a, _)| Some(**a) != except)
-                    .map(|(a, c)| (*a, c.clone()))
+                    .map(|(a, s)| (*a, s.conns.clone()))
                     .collect()
             })
             .unwrap_or_default();
-        if budget && !self.realm_take(targets.len() as u64) {
+        let targets: Vec<(u128, Vec<u64>)> = match from {
+            Some(f) => targets
+                .into_iter()
+                .filter(|(a, _)| !self.blocks_of(*a).contains(&f))
+                .collect(),
+            None => targets,
+        };
+        let n: u64 = targets.iter().map(|(_, c)| c.len() as u64).sum();
+        if notice && !self.presence_take(n) {
             return 0;
         }
         for (account, conns) in &targets {
             self.push_to(*account, conns, text);
         }
-        targets.len()
+        n
+    }
+
+    /// Tells room `id` that `account` left, when its budget and the realm's
+    /// allow; leaving itself is never refused.
+    fn tell_left(&self, id: &ConvId, account: u128) {
+        let n = self.audience(id, account);
+        if self.take_deliveries(account, n) {
+            self.push_room(
+                id,
+                &presence_event("exited", id, account),
+                Some(account),
+                Some(account),
+                true,
+            );
+        }
     }
 
     /// Takes `account`'s connections out of room `id`, telling the room.
@@ -480,16 +581,45 @@ impl super::Chat {
             let Some(room) = presence.get_mut(id) else {
                 return Vec::new();
             };
-            let gone = room.remove(&account).unwrap_or_default();
+            let gone = room.remove(&account).map(|s| s.conns).unwrap_or_default();
             if room.is_empty() {
                 presence.remove(id);
             }
             gone
         };
         if !gone.is_empty() {
-            self.push_room(id, &presence_event("exited", id, account), None, true);
+            self.tell_left(id, account);
         }
         gone
+    }
+
+    /// Puts out of room `id` everyone in it who may no longer enter (its
+    /// access, role, list, moderators or bans changed), telling them.
+    fn recheck_room(&self, id: &ConvId, r: &Room) {
+        let now = now_ms();
+        let out: Vec<(u128, Vec<u64>)> = lock(&self.presence)
+            .get(id)
+            .map(|p| {
+                p.iter()
+                    .filter(|(a, s)| {
+                        !(r.may_enter(**a, s.rank, now)
+                            || (s.rank >= 2 && r.access != RoomAccess::Private))
+                    })
+                    .map(|(a, s)| (*a, s.conns.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (account, conns) in out {
+            self.push_to(
+                account,
+                &conns,
+                &Obj::new()
+                    .str("op", "room_left")
+                    .str("room", &id.to_string())
+                    .end(),
+            );
+            self.put_out(id, account);
+        }
     }
 
     /// Connection `conn` of `account` closed: out of every room it was in.
@@ -498,9 +628,9 @@ impl super::Chat {
         {
             let mut presence = lock(&self.presence);
             presence.retain(|id, room| {
-                if let Some(conns) = room.get_mut(&account) {
-                    conns.retain(|c| *c != conn);
-                    if conns.is_empty() {
+                if let Some(seat) = room.get_mut(&account) {
+                    seat.conns.retain(|c| *c != conn);
+                    if seat.conns.is_empty() {
                         room.remove(&account);
                         emptied.push(*id);
                     }
@@ -509,8 +639,50 @@ impl super::Chat {
             });
         }
         for id in emptied {
-            self.push_room(&id, &presence_event("exited", &id, account), None, true);
+            self.tell_left(&id, account);
         }
+    }
+
+    /// Notes that `account` wrote in room `id` now, for slow mode; the
+    /// notes older than any slow mode go when there are many.
+    fn wrote(&self, id: &ConvId, account: u128, now: u64) {
+        let mut slow = lock(&self.slow);
+        if slow.len() >= SLOW_NOTES {
+            slow.retain(|_, at| now.saturating_sub(*at) < SLOW_MAX_SECS * 1000);
+        }
+        slow.insert((*id, account), now);
+    }
+
+    /// Whether a filtered message of `account` goes to the log: one a
+    /// minute at most.
+    fn log_filtered(&self, account: u128, now: u64) -> bool {
+        let mut logged = lock(&self.filter_logged);
+        if logged.len() >= SLOW_NOTES {
+            logged.retain(|_, at| now.saturating_sub(*at) < MINUTE_MS);
+        }
+        match logged.get(&account) {
+            Some(at) if now.saturating_sub(*at) < MINUTE_MS => false,
+            _ => {
+                logged.insert(account, now);
+                true
+            }
+        }
+    }
+
+    /// How many rooms `account` owns.
+    fn owned_by(&self, account: u128) -> Result<u64, String> {
+        Ok(self.room_cache()?.as_ref().map_or(0, |c| {
+            c.values().filter(|r| r.owner == account).count() as u64
+        }))
+    }
+
+    /// How many public rooms the site holds.
+    fn public_rooms(&self) -> Result<u64, String> {
+        Ok(self.room_cache()?.as_ref().map_or(0, |c| {
+            c.values()
+                .filter(|r| r.access == RoomAccess::Public)
+                .count() as u64
+        }))
     }
 }
 
@@ -589,7 +761,7 @@ impl ChatConn {
         lock(&self.chat.presence)
             .get(id)
             .and_then(|r| r.get(&self.account))
-            .is_some_and(|c| c.contains(&self.id))
+            .is_some_and(|s| s.conns.contains(&self.id))
     }
 
     /// Changes room `id` under its lock, from its record as kept.
@@ -743,10 +915,17 @@ impl ChatConn {
         };
         let persistent = v.get("persistent").and_then(Value::as_bool).unwrap_or(true);
         let _quota = lock(stripe(&chat.account_locks, self.account as u64));
-        if chat.room_cache()?.as_ref().map_or(0, HashMap::len) as u64 >= s.max {
+        if chat.owned_by(self.account)? >= s.max_per_account {
+            return Err(error(
+                "chat.quota",
+                "You own as many rooms as you may.",
+                None,
+            ));
+        }
+        if access == RoomAccess::Public && chat.public_rooms()? >= s.max {
             return Err(error(
                 "chat.full",
-                "The site holds as many rooms as it may.",
+                "The site holds as many public rooms as it may.",
                 None,
             ));
         }
@@ -799,25 +978,46 @@ impl ChatConn {
         if !(r.may_enter(self.account, self.rank, now_ms()) || self.moderates(&r)) {
             return Err(not_here());
         }
+        if self.present(&id) {
+            return Ok(room_json(&id, &r, chat.people(&id), self.moderates(&r)));
+        }
+        // Entering is a send: it costs the account's budget, and a delivery
+        // for each connection that hears of it.
+        chat.charge(self.account, chat.audience(&id, self.account))
+            .map_err(slow_down)?;
         let first = {
             let mut presence = lock(&chat.presence);
+            let (mine, this) =
+                presence
+                    .values()
+                    .fold((0, 0), |(m, t), p| match p.get(&self.account) {
+                        Some(s) => (m + 1, t + usize::from(s.conns.contains(&self.id))),
+                        None => (m, t),
+                    });
+            if this >= ROOMS_PER_CONNECTION || mine >= ROOMS_PER_ACCOUNT {
+                return Err(error(
+                    "chat.quota",
+                    "You are in as many rooms as you may be at once.",
+                    None,
+                ));
+            }
             let room = presence.entry(id).or_default();
             if !room.contains_key(&self.account)
                 && room.len() as u64 >= chat.settings.rooms.max_present
             {
                 return Err(error("chat.full", "The room is full.", None));
             }
-            let conns = room.entry(self.account).or_default();
-            let first = conns.is_empty();
-            if !conns.contains(&self.id) {
-                conns.push(self.id);
-            }
+            let seat = room.entry(self.account).or_default();
+            seat.rank = self.rank;
+            let first = seat.conns.is_empty();
+            seat.conns.push(self.id);
             first
         };
         if first {
             chat.push_room(
                 &id,
                 &presence_event("entered", &id, self.account),
+                Some(self.account),
                 Some(self.account),
                 true,
             );
@@ -832,10 +1032,10 @@ impl ChatConn {
             let mut presence = lock(&chat.presence);
             let mut last = false;
             if let Some(room) = presence.get_mut(&id)
-                && let Some(conns) = room.get_mut(&self.account)
+                && let Some(seat) = room.get_mut(&self.account)
             {
-                conns.retain(|c| *c != self.id);
-                if conns.is_empty() {
+                seat.conns.retain(|c| *c != self.id);
+                if seat.conns.is_empty() {
                     room.remove(&self.account);
                     last = true;
                 }
@@ -846,12 +1046,7 @@ impl ChatConn {
             last
         };
         if last {
-            chat.push_room(
-                &id,
-                &presence_event("exited", &id, self.account),
-                None,
-                true,
-            );
+            chat.tell_left(&id, self.account);
         }
         Ok(Obj::new()
             .str("op", "exited")
@@ -862,6 +1057,7 @@ impl ChatConn {
 
     fn who(&self, v: &Value) -> Result<String, String> {
         let id = room_of(v).ok_or_else(bad_room)?;
+        self.chat.charge(self.account, 0).map_err(slow_down)?;
         if !self.present(&id) {
             return Err(error(
                 "chat.not_in_room",
@@ -939,34 +1135,24 @@ impl ChatConn {
             .ok_or_else(|| error("chat.bad_body", "`body` is a list of spans.", None))?;
         let body = read_spans(body, self.advanced && r.advanced, chat.settings.max_length)
             .map_err(|why| error("chat.bad_body", why, None))?;
-        let text: String = body
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if filtered(&text, &chat.settings.rooms.filter, &r.words) {
-            chat.audit(self.account, "chat.filtered", self.account, id);
+        // The budgets first: a refused message costs a send like any other.
+        let others = chat.audience(id, self.account);
+        chat.charge(self.account, others).map_err(slow_down)?;
+        // Spans are joined as they read, so a word split over two spans is
+        // still one word.
+        let text: String = body.iter().map(|s| s.text.as_str()).collect();
+        if filtered(&text, &chat.site_words, &r.words) {
+            if chat.log_filtered(self.account, now) {
+                chat.audit(self.account, "chat.filtered", self.account, id);
+            }
             return Err(error(
                 "chat.filtered",
                 "The message holds a word this room does not allow.",
                 None,
             ));
         }
-        let others = chat.people(id).saturating_sub(1) as u64;
-        let slow = |ms: u64| {
-            Obj::new()
-                .str("op", "error")
-                .str("code", "chat.slow_down")
-                .str(
-                    "message",
-                    "You are sending faster than you may. Wait a moment.",
-                )
-                .num("retry_ms", ms)
-                .end()
-        };
-        chat.charge(self.account, others).map_err(slow)?;
         if !chat.realm_take(others) {
-            return Err(slow(1000));
+            return Err(slow_down(1000));
         }
         let mut m = Message {
             conversation: *id,
@@ -1009,7 +1195,8 @@ impl ChatConn {
                     .map_err(|_| unavailable())?;
                 // The room keeps its last `keep`: the one before them goes.
                 if m.number > r.keep {
-                    let _ = chat.store.delete_message(id, m.number - r.keep);
+                    let n = m.number - r.keep;
+                    let _ = chat.store.delete_messages(id, n, n);
                 }
             }
             usage.messages += 1;
@@ -1020,7 +1207,7 @@ impl ChatConn {
             *n += 1;
             m.number = *n;
         }
-        lock(&chat.slow).insert((*id, self.account), now);
+        chat.wrote(id, self.account, now);
         let push = Obj::new()
             .str("op", "message")
             .raw(
@@ -1034,7 +1221,7 @@ impl ChatConn {
                     .end(),
             )
             .end();
-        chat.push_room(id, &push, None, false);
+        chat.push_room(id, &push, Some(self.account), None, false);
         let o = Obj::new()
             .str("op", "sent")
             .str("conversation", &id.to_string())
@@ -1124,15 +1311,39 @@ impl ChatConn {
             || keep.is_some()
             || persistent.is_some()
             || advanced.is_some();
+        // Making a room public takes the right to make public rooms.
+        if access == Some(RoomAccess::Public) && self.limits.rooms < RoomRight::Public {
+            return Err(error(
+                "chat.not_allowed",
+                "Your role may not make that kind of room.",
+                None,
+            ));
+        }
+        let chat = &self.chat;
+        let public_now = chat.public_rooms()?;
+        let max_public = s.max;
+        let mut before: Option<(bool, u64)> = None;
         let (staff, r) = self.change_room(&id, |r| {
             let owner = r.owner == me;
             let moderator = r.moderators.contains(&me);
             let staff = !owner && !moderator && rank >= 2 && r.access != RoomAccess::Private;
-            // Moderators may change the topic, slow mode and words only.
-            let may = owner || staff || (moderator && !owners_only);
+            // Moderators and site staff may change the topic, slow mode and
+            // words only; the rest is the owner's.
+            let may = owner || ((moderator || staff) && !owners_only);
             if !may {
                 return Err(not_allowed());
             }
+            if access == Some(RoomAccess::Public)
+                && r.access != RoomAccess::Public
+                && public_now >= max_public
+            {
+                return Err(error(
+                    "chat.full",
+                    "The site holds as many public rooms as it may.",
+                    None,
+                ));
+            }
+            before = Some((r.persistent, r.keep));
             if let Some(x) = name {
                 r.name = x;
             }
@@ -1168,7 +1379,6 @@ impl ChatConn {
             }
             Ok(staff)
         })?;
-        let chat = &self.chat;
         chat.audit(
             me,
             if staff {
@@ -1179,19 +1389,38 @@ impl ChatConn {
             r.owner,
             &id,
         );
-        let people = chat.people(&id);
-        chat.push_room(&id, &room_json(&id, &r, people, false), Some(me), true);
-        // Someone who may no longer enter is put out.
-        let now = now_ms();
-        let present: Vec<u128> = lock(&chat.presence)
-            .get(&id)
-            .map(|p| p.keys().copied().collect())
-            .unwrap_or_default();
-        for a in present {
-            if !r.may_enter(a, 0, now) && r.access == RoomAccess::Private {
-                chat.put_out(&id, a);
+        // What it keeps follows the change now, not one message at a time.
+        let last = chat
+            .store
+            .conversation(&id)
+            .map_err(|_| unavailable())?
+            .map_or(0, |c| c.last);
+        if let Some((was_persistent, was_keep)) = before {
+            if was_persistent && !r.persistent {
+                // Nothing kept from now on: what was kept goes, and the
+                // numbers go on from the last one.
+                lock(&chat.room_numbers).insert(id, last);
+                chat.purge(id, 1, last, Vec::new());
+            } else if !was_persistent && r.persistent {
+                let n = lock(&chat.room_numbers).remove(&id).unwrap_or(0);
+                if n > last {
+                    let _ = chat.store.set_last(&id, n, now_ms());
+                }
+            } else if r.persistent && r.keep < was_keep && last > r.keep {
+                let from = last.saturating_sub(was_keep).saturating_add(1).max(1);
+                chat.purge(id, from, last - r.keep, Vec::new());
             }
         }
+        let people = chat.people(&id);
+        chat.push_room(
+            &id,
+            &room_json(&id, &r, people, false),
+            None,
+            Some(me),
+            true,
+        );
+        // Anyone who may no longer enter is put out.
+        chat.recheck_room(&id, &r);
         Ok(room_json(&id, &r, chat.people(&id), true))
     }
 
@@ -1219,7 +1448,13 @@ impl ChatConn {
             now.saturating_add(minutes.saturating_mul(MINUTE_MS))
         };
         let rank = self.rank;
-        let (staff, _) = self.change_room(&id, |r| {
+        let chat = &self.chat;
+        // Only someone: in the room, on its list, or an account that is
+        // there to write to. Made-up ids would only fill the record.
+        let here = lock(&chat.presence)
+            .get(&id)
+            .is_some_and(|p| p.contains_key(&target));
+        let (staff, r) = self.change_room(&id, |r| {
             let owner = r.owner == me;
             let moderator = r.moderators.contains(&me);
             let staff = !owner && !moderator && rank >= 2 && r.access != RoomAccess::Private;
@@ -1229,6 +1464,12 @@ impl ChatConn {
             // Never the owner; a moderator never another moderator.
             if target == r.owner || (!owner && r.moderators.contains(&target)) {
                 return Err(not_allowed());
+            }
+            if !(here || r.list.contains(&target) || chat.directory.reachable(target)) {
+                return Err(cannot_write());
+            }
+            if kind != HoldKind::Mute {
+                r.moderators.retain(|m| *m != target);
             }
             let holds = match kind {
                 HoldKind::Mute => &mut r.mutes,
@@ -1248,7 +1489,6 @@ impl ChatConn {
             });
             Ok(staff)
         })?;
-        let chat = &self.chat;
         let (op, action) = match (kind, staff) {
             (HoldKind::Mute, false) => ("muted", "chat.room_mute"),
             (HoldKind::Mute, true) => ("muted", "chat.staff_room_mute"),
@@ -1262,12 +1502,13 @@ impl ChatConn {
         // out of it when kicked or banned.
         let conns: Vec<u64> = lock(&chat.presence)
             .get(&id)
-            .and_then(|p| p.get(&target).cloned())
+            .and_then(|p| p.get(&target).map(|s| s.conns.clone()))
             .unwrap_or_default();
         chat.push_to(target, &conns, &hold_event(op, &id, until, me));
         if kind != HoldKind::Mute {
             chat.put_out(&id, target);
         }
+        chat.recheck_room(&id, &r);
         Ok(Obj::new()
             .str("op", op)
             .str("room", &id.to_string())
@@ -1356,9 +1597,15 @@ impl ChatConn {
         })?;
         self.chat.audit(me, "chat.room_role", target, &id);
         let people = self.chat.people(&id);
-        self.chat
-            .push_room(&id, &room_json(&id, &r, people, false), Some(me), true);
-        Ok(room_json(&id, &r, people, true))
+        self.chat.push_room(
+            &id,
+            &room_json(&id, &r, people, false),
+            None,
+            Some(me),
+            true,
+        );
+        self.chat.recheck_room(&id, &r);
+        Ok(room_json(&id, &r, self.chat.people(&id), true))
     }
 
     /// Puts `account` on a private room's list, or takes it off.
@@ -1373,8 +1620,12 @@ impl ChatConn {
         })?;
         let me = self.account;
         let chat = &self.chat;
+        if on {
+            chat.charge(me, chat.connections(&[target]))
+                .map_err(slow_down)?;
+        }
         let cap = chat.settings.rooms.max_present;
-        let (name, _) = self.change_room(&id, |r| {
+        let (name, r) = self.change_room(&id, |r| {
             if !(r.owner == me || r.moderators.contains(&me)) {
                 return Err(not_allowed());
             }
@@ -1413,7 +1664,7 @@ impl ChatConn {
                     .end(),
             );
         } else {
-            chat.put_out(&id, target);
+            chat.recheck_room(&id, &r);
         }
         Ok(Obj::new()
             .str("op", if on { "room_invite" } else { "room_uninvite" })
@@ -1426,6 +1677,8 @@ impl ChatConn {
         let id = room_of(v).ok_or_else(bad_room)?;
         let chat = &self.chat;
         let staff;
+        let owner;
+        let last;
         {
             let _order = chat.conversation_lock(&id);
             let Some(r) = chat.room(&id)? else {
@@ -1434,6 +1687,7 @@ impl ChatConn {
             // A site admin may close any room, a private one too (without
             // reading it), so abuse there is never out of reach.
             staff = r.owner != self.account;
+            owner = r.owner;
             if staff && self.rank < 2 {
                 return Err(if r.may_enter(self.account, self.rank, now_ms()) {
                     not_allowed()
@@ -1441,18 +1695,20 @@ impl ChatConn {
                     not_here()
                 });
             }
-            let last = chat
+            last = chat
                 .store
                 .conversation(&id)
                 .map_err(|_| unavailable())?
                 .map_or(0, |c| c.last);
             chat.store
-                .delete_conversation(&id, last)
+                .delete_conversation(&id)
                 .map_err(|_| unavailable())?;
             if let Some(c) = chat.room_cache()?.as_mut() {
                 c.remove(&id);
             }
         }
+        chat.purge(id, 1, last, Vec::new());
+        lock(&chat.slow).retain(|(room, _), _| *room != id);
         chat.audit(
             self.account,
             if staff {
@@ -1460,14 +1716,14 @@ impl ChatConn {
             } else {
                 "chat.delete_room"
             },
-            self.account,
+            owner,
             &id,
         );
         let closed = Obj::new()
             .str("op", "room_closed")
             .str("room", &id.to_string())
             .end();
-        chat.push_room(&id, &closed, None, false);
+        chat.push_room(&id, &closed, None, None, false);
         lock(&chat.presence).remove(&id);
         lock(&chat.room_numbers).remove(&id);
         Ok(closed)
@@ -1570,9 +1826,9 @@ mod tests {
         };
         assert_eq!(Room::from_json(&r.to_json()), Some(r));
         let words = vec!["darn".to_owned()];
-        assert!(filtered("well, DARN it", &[], &words));
-        assert!(!filtered("darning socks", &[], &words));
-        assert!(!filtered("anything", &[], &[]));
+        assert!(filtered("well, DARN it", &HashSet::new(), &words));
+        assert!(!filtered("darning socks", &HashSet::new(), &words));
+        assert!(!filtered("anything", &HashSet::new(), &[]));
         assert_eq!(filter_word("Darn"), Some("darn".to_owned()));
         assert_eq!(filter_word("two words"), None);
     }

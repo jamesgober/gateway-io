@@ -17,7 +17,7 @@ use super::{
 pub const NAME_MAX: usize = 100;
 
 /// The most accounts one group may ban.
-pub const MAX_BANS: usize = 1000;
+pub const MAX_BANS: usize = 200;
 
 /// Members in one page of `members`.
 const MEMBERS_PAGE: usize = 100;
@@ -217,11 +217,19 @@ impl Group {
         self.invited.retain(|i| i.until_ms > now);
     }
 
-    /// The open invite of `account`, when there is one at `now`.
+    /// The open invite of `account`, when there is one at `now`, made by
+    /// someone who may still invite: a kicked or demoted inviter's invites
+    /// lapse with them.
     fn invite_of(&self, account: u128, now: u64) -> Option<&Invite> {
         self.invited
             .iter()
-            .find(|i| i.account == account && i.until_ms > now)
+            .find(|i| i.account == account && i.until_ms > now && self.may_invite(i.by))
+    }
+
+    /// Whether `account` may invite now.
+    fn may_invite(&self, account: u128) -> bool {
+        self.member(account)
+            .is_some_and(|m| m.role != GroupRole::Member || self.settings.members_invite)
     }
 
     /// Places taken: members and open invites.
@@ -474,9 +482,12 @@ impl ChatConn {
         let chat = &self.chat;
         let me = self.account;
         let days = chat.settings.invite_days;
+        // An invite is a send: it costs the budget, and a delivery for each
+        // connection of the one invited.
+        chat.charge(me, chat.connections(&[target]))
+            .map_err(super::room::slow_down)?;
         let (name, _) = self.change(&id, true, |g, _| {
-            let mine = g.member(me).map_or(GroupRole::Member, |m| m.role);
-            if mine == GroupRole::Member && !g.settings.members_invite {
+            if !g.may_invite(me) {
                 return Err(not_allowed());
             }
             if g.member(target).is_some() {
@@ -492,10 +503,10 @@ impl ChatConn {
                 return Err(cannot_write());
             }
             let until_ms = now.saturating_add(days.saturating_mul(DAY_MS));
-            if let Some(open) = g.invited.iter_mut().find(|i| i.account == target) {
-                open.until_ms = until_ms;
-                open.by = me;
+            if g.invite_of(target, now).is_some() {
+                // Open already: nothing to write.
             } else {
+                g.invited.retain(|i| i.account != target);
                 if g.taken() >= g.settings.cap {
                     return Err(error("chat.full", "The group is full.", None));
                 }
@@ -646,9 +657,12 @@ impl ChatConn {
                 let _ = chat.store.set_invited(invite.account, &id, false);
             }
             chat.store
-                .delete_conversation(&id, last)
+                .delete_conversation(&id)
                 .map_err(|_| unavailable())?;
+            chat.purge(id, 1, last, vec![me]);
+            chat.audit(me, "chat.group_deleted", me, &id);
         } else {
+            let _ = chat.store.forget_member(&id, me);
             chat.push_group(&g, &member_event(&id, me, "left", me, None));
             if let Some(o) = owner {
                 chat.push_group(
@@ -671,9 +685,16 @@ impl ChatConn {
         if target == me {
             return Err(error("chat.self", "To go, leave the group.", None));
         }
+        let chat = &self.chat;
         let (was_member, g) = self.change(&id, true, |g, _| {
             let mine = g.member(me).map_or(GroupRole::Member, |m| m.role);
             let theirs = g.member(target).map(|m| m.role);
+            // Only someone: a member, an invitee, or an account that is there
+            // to write to. Made-up ids would only fill the record.
+            let invited = g.invited.iter().any(|i| i.account == target);
+            if theirs.is_none() && !invited && !chat.directory.reachable(target) {
+                return Err(cannot_write());
+            }
             let may = match mine {
                 GroupRole::Owner => true,
                 GroupRole::Moderator => theirs.is_none_or(|r| r == GroupRole::Member),

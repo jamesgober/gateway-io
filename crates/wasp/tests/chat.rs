@@ -961,3 +961,50 @@ fn a_room_is_about_who_is_in_it_now() {
     assert_eq!(texts(&page), ["hello room"]);
     let _ = door.close(Duration::from_secs(2));
 }
+
+#[test]
+fn in_a_room_a_block_keeps_the_blocked_out_of_sight() {
+    let data = temp_dir("roomblock");
+    let (door, addr) = open(&data.0);
+    let (ed_s, ann_s, bob_s, eve_s) = (
+        sign_in(addr, ED),
+        sign_in(addr, ANN),
+        sign_in(addr, BOB),
+        sign_in(addr, EVE),
+    );
+    let (mut ed, _) = member(addr, &ed_s);
+    let (mut ann, ann_id) = member(addr, &ann_s);
+    let (mut bob, _) = member(addr, &bob_s);
+    let (mut eve, _) = member(addr, &eve_s);
+    let id = s(&ed.ask(r#"{"op":"create_room","name":"Lobby"}"#), "id");
+    bob.ask(&format!(
+        r#"{{"op":"block","account":"{ann_id}","on":true}}"#
+    ));
+    for c in [&mut bob, &mut eve] {
+        c.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    }
+    ann.ask(&format!(r#"{{"op":"enter","room":"{id}"}}"#));
+    ann.ask(&format!(
+        r#"{{"op":"send","conversation":"{id}","body":[{{"text":"hello"}}]}}"#
+    ));
+    // Eve hears Ann come in and speak; Bob, who blocked her, hears neither.
+    assert_eq!(s(&eve.next_op("entered"), "account"), ann_id);
+    assert_eq!(
+        texts(&Value::Obj(vec![(
+            "messages".into(),
+            Value::Arr(vec![
+                eve.next_op("message").get("message").expect("m").clone()
+            ]),
+        )])),
+        ["hello"]
+    );
+    let frames = bob.frames_until_answer(r#"{"op":"invites"}"#, "invites");
+    assert!(
+        !frames
+            .iter()
+            .any(|f| s(f, "op") == "message"
+                || (s(f, "op") == "entered" && s(f, "account") == ann_id)),
+        "{frames:?}"
+    );
+    let _ = door.close(Duration::from_secs(2));
+}

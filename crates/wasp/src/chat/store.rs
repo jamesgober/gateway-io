@@ -112,6 +112,8 @@ pub trait ChatStore: Send + Sync + 'static {
     fn blocked(&self, who: u128, whom: u128) -> Result<bool, StoreError>;
     /// `who` blocks or unblocks `whom`.
     fn set_blocked(&self, who: u128, whom: u128, on: bool) -> Result<(), StoreError>;
+    /// Everyone `who` blocked (at most 10,000).
+    fn blocks_of(&self, who: u128) -> Result<Vec<u128>, StoreError>;
     /// What `account` has used of its quotas.
     fn usage(&self, account: u128) -> Result<Usage, StoreError>;
     /// Keeps what `account` has used.
@@ -126,17 +128,23 @@ pub trait ChatStore: Send + Sync + 'static {
     fn set_invited(&self, account: u128, id: &ConvId, on: bool) -> Result<(), StoreError>;
     /// The groups `account` holds invites to (at most 1,000).
     fn invites_of(&self, account: u128) -> Result<Vec<ConvId>, StoreError>;
-    /// Deletes conversation `id`: its record, its group or room record,
-    /// and its messages up to `last`.
-    fn delete_conversation(&self, id: &ConvId, last: u64) -> Result<(), StoreError>;
+    /// Deletes conversation `id`'s record and its group or room record, so
+    /// no one reaches it from now on. Its messages go with
+    /// [`delete_messages`](Self::delete_messages), and each member's marks
+    /// with [`forget_member`](Self::forget_member).
+    fn delete_conversation(&self, id: &ConvId) -> Result<(), StoreError>;
+    /// Forgets what `account` kept in conversation `id`: its read marker and
+    /// its mute.
+    fn forget_member(&self, id: &ConvId, account: u128) -> Result<(), StoreError>;
     /// The record of room `id`, when there is one.
     fn room(&self, id: &ConvId) -> Result<Option<Room>, StoreError>;
     /// Keeps room `id`'s record.
     fn put_room(&self, id: &ConvId, room: &Room) -> Result<(), StoreError>;
     /// Every room (at most 1,000,000).
     fn rooms(&self) -> Result<Vec<(ConvId, Room)>, StoreError>;
-    /// Deletes message `number` of conversation `id`, when it is there.
-    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError>;
+    /// Deletes messages `from` to `to` (both included) of conversation
+    /// `id`, those that are there.
+    fn delete_messages(&self, id: &ConvId, from: u64, to: u64) -> Result<(), StoreError>;
 }
 
 /// Everything in memory: gone at a restart. For tests and trials.
@@ -299,6 +307,17 @@ impl ChatStore for MemoryChat {
         Ok(())
     }
 
+    fn blocks_of(&self, who: u128) -> Result<Vec<u128>, StoreError> {
+        Ok(self.with(|i| {
+            i.blocked
+                .iter()
+                .filter(|(a, _)| *a == who)
+                .map(|(_, b)| *b)
+                .take(10_000)
+                .collect()
+        }))
+    }
+
     fn usage(&self, account: u128) -> Result<Usage, StoreError> {
         Ok(self.with(|i| i.usage.get(&account).copied().unwrap_or_default()))
     }
@@ -352,15 +371,22 @@ impl ChatStore for MemoryChat {
         }))
     }
 
-    fn delete_conversation(&self, id: &ConvId, _last: u64) -> Result<(), StoreError> {
+    fn delete_conversation(&self, id: &ConvId) -> Result<(), StoreError> {
         self.with(|i| {
             i.conversations.remove(id);
-            i.messages.remove(id);
             i.groups.remove(id);
             i.rooms.remove(id);
             for l in i.lists.values_mut() {
                 l.remove(id);
             }
+        });
+        Ok(())
+    }
+
+    fn forget_member(&self, id: &ConvId, account: u128) -> Result<(), StoreError> {
+        self.with(|i| {
+            i.read.remove(&(*id, account));
+            i.muted.remove(&(*id, account));
         });
         Ok(())
     }
@@ -380,10 +406,13 @@ impl ChatStore for MemoryChat {
         Ok(self.with(|i| i.rooms.iter().map(|(k, v)| (*k, v.clone())).collect()))
     }
 
-    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError> {
+    fn delete_messages(&self, id: &ConvId, from: u64, to: u64) -> Result<(), StoreError> {
         self.with(|i| {
             if let Some(m) = i.messages.get_mut(id) {
-                m.remove(&number);
+                m.retain(|n, _| *n < from || *n > to);
+                if m.is_empty() {
+                    i.messages.remove(id);
+                }
             }
         });
         Ok(())
