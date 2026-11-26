@@ -1,6 +1,6 @@
 //! The gateway's settings, from the `[gateway]` and `[door]` sections.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use wasp_core::suite::config::Config;
@@ -81,6 +81,8 @@ pub struct Settings {
     pub lane_rates: Vec<LaneRate>,
     /// WebSockets (`[ws]`): sizes, keepalive, budgets, the recheck.
     pub ws: crate::ws::WsSettings,
+    /// TLS termination (`[tls]`, G-90): `None` unless `tls.enabled`.
+    pub tls: Option<TlsSettings>,
 }
 
 /// A lane's budget for each caller: a signed-in caller (a session or an API
@@ -200,6 +202,10 @@ pub const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("door", &["ban", "exempt"]),
     (
+        "tls",
+        &["cert", "enabled", "hsts", "key", "redirect_from", "reload"],
+    ),
+    (
         "ws",
         &[
             "burst",
@@ -259,6 +265,7 @@ impl Default for Settings {
             h2c: H2c::Auto,
             lane_rates: Vec::new(),
             ws: crate::ws::WsSettings::default(),
+            tls: None,
         }
     }
 }
@@ -424,6 +431,7 @@ impl Settings {
             },
             lane_rates: Vec::new(),
             ws: ws_settings(config)?,
+            tls: tls_settings(config)?,
         };
         let explicit_ingress = config
             .get::<String>("gateway.ingress")
@@ -501,6 +509,84 @@ impl Settings {
 }
 
 /// `[ws]`, every key optional.
+/// TLS termination (`[tls]`, G-90).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsSettings {
+    /// The certificate chain, PEM (`tls.cert`).
+    pub cert: std::path::PathBuf,
+    /// The private key, PEM (`tls.key`): readable by its owner only.
+    pub key: std::path::PathBuf,
+    /// How often the files are checked for a change (`tls.reload`, 1 m;
+    /// zero turns it off).
+    pub reload: Duration,
+    /// The `Strict-Transport-Security` value, sent on replies over TLS
+    /// only (`tls.hsts`, none).
+    pub hsts: Option<String>,
+    /// A plain listener that sends every request to `https://`
+    /// (`tls.redirect_from`, none).
+    pub redirect_from: Option<SocketAddr>,
+    /// The hosts a redirect may name (`site.hosts` and every host profile's
+    /// exact names); a request for another host is sent to the first.
+    pub redirect_hosts: Vec<String>,
+}
+
+fn tls_settings(config: &Config) -> Result<Option<TlsSettings>, SettingsError> {
+    let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());
+    if !config.get_or("tls.enabled", false).map_err(err)? {
+        return Ok(None);
+    }
+    let path = |key: &str| -> Result<std::path::PathBuf, SettingsError> {
+        config
+            .get::<std::path::PathBuf>(key)
+            .map_err(err)?
+            .ok_or_else(|| SettingsError(format!("tls.enabled needs {key}")))
+    };
+    let reload: Duration = config
+        .get_or("tls.reload", Duration::from_secs(60))
+        .map_err(err)?;
+    if !reload.is_zero() && reload < Duration::from_secs(1) {
+        return Err(SettingsError(
+            "tls.reload must be at least 1s, or 0s for no checks".into(),
+        ));
+    }
+    let hsts: Option<String> = config.get("tls.hsts").map_err(err)?;
+    if let Some(h) = &hsts
+        && (!h.starts_with("max-age=") || h.bytes().any(|b| b < 0x20 || b == 0x7f))
+    {
+        return Err(SettingsError(
+            "tls.hsts is a Strict-Transport-Security value: max-age=<seconds>, then ; includeSubDomains or ; preload as wanted".into(),
+        ));
+    }
+    let redirect_from = match config.get::<String>("tls.redirect_from").map_err(err)? {
+        None => None,
+        Some(a) => Some(a.parse::<SocketAddr>().map_err(|_| {
+            SettingsError(format!(
+                "tls.redirect_from is an address and port (0.0.0.0:80), not `{a}`"
+            ))
+        })?),
+    };
+    let mut redirect_hosts: Vec<String> = config
+        .get_or("site.hosts", Vec::<String>::new())
+        .map_err(err)?;
+    for profile in config.keys("host") {
+        let hosts: Vec<String> = config
+            .get_or(&format!("host.{profile}.hosts"), Vec::<String>::new())
+            .map_err(err)?;
+        redirect_hosts.extend(hosts.into_iter().filter(|h| !h.starts_with("*.")));
+    }
+    for h in &mut redirect_hosts {
+        h.make_ascii_lowercase();
+    }
+    Ok(Some(TlsSettings {
+        cert: path("tls.cert")?,
+        key: path("tls.key")?,
+        reload,
+        hsts,
+        redirect_from,
+        redirect_hosts,
+    }))
+}
+
 fn ws_settings(config: &Config) -> Result<crate::ws::WsSettings, SettingsError> {
     let d = crate::ws::WsSettings::default();
     let err = |e: wasp_core::suite::Error| SettingsError(e.to_string());

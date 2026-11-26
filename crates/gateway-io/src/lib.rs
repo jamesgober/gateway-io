@@ -34,6 +34,8 @@ pub mod rules;
 pub mod settings;
 pub mod stages;
 pub mod tickets;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod web;
 pub mod ws;
 
@@ -45,7 +47,9 @@ pub use crate::load::{LoadSignal, ShedMarks};
 pub use crate::observe::{ServerTime, ServerTimeSummary, TimeObserver};
 pub use crate::pipeline::{PassportAdmit, Pipeline};
 pub use crate::rules::LogRules;
-pub use crate::settings::{Driver, H2c, IngressMode, LaneRate, Settings, SettingsError};
+pub use crate::settings::{
+    Driver, H2c, IngressMode, LaneRate, Settings, SettingsError, TlsSettings,
+};
 pub use crate::stages::StageTimes;
 pub use crate::tickets::RequestTickets;
 pub use crate::web::{Answered, Caller, WaspGate, WebGate, WebService, WebServices, Who};
