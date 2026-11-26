@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use nex_db::Patch;
-
 use super::{NexDb, StoreError, nex};
 use crate::chat::store::{ChatStore, Conversation, Usage};
 use crate::chat::{ConvId, Group, Message, Room};
@@ -103,7 +101,12 @@ impl NexChat {
         }
     }
 
-    /// Writes `fields` to the entity at `path`, making it when there is none.
+    /// Makes the entity at `path` hold exactly `fields`, keeping no
+    /// history: nex-db keeps a revision of every changed publish, so a
+    /// record changed again and again (a group's members, a read marker, a
+    /// conversation's last number) is never published over. The old entity
+    /// is deleted, with its revisions, and the new one put, in one commit.
+    /// Nothing is written when the entity already holds `fields`.
     fn upsert(
         &self,
         kind: &str,
@@ -111,26 +114,47 @@ impl NexChat {
         author: Option<u128>,
         fields: &[(&str, String)],
     ) -> Result<(), StoreError> {
-        if let Some((rid, _)) = self.entry(path)? {
-            return self.change(rid, fields);
+        let mut entity = nex_db::Entity::new(kind)
+            .site(self.site.as_ref())
+            .path(path);
+        if let Some(a) = author {
+            entity = entity.author(account_id(a));
         }
-        if !self.put(kind, path, author, fields)? {
-            // Made meanwhile: write to it.
-            if let Some((rid, _)) = self.entry(path)? {
-                return self.change(rid, fields);
+        for (k, v) in fields {
+            entity = entity.field(*k, v.as_str());
+        }
+        // Another writer of the same path may come between the read and
+        // the commit: read again and retry.
+        for _ in 0..4 {
+            let result = match self.entry(path)? {
+                Some((_, e)) if fields.iter().all(|(k, v)| Self::text(&e, k) == *v) => {
+                    return Ok(());
+                }
+                Some((rid, _)) => self
+                    .db
+                    .db()
+                    .commit(|tx| {
+                        let mut c = tx.content();
+                        c.delete(rid)?;
+                        c.put(entity.clone())
+                    })
+                    .map(|_| ()),
+                None => self.content().put(entity.clone()).map(|_| ()),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(
+                    nex_db::Error::AlreadyExists { .. }
+                    | nex_db::Error::Conflict
+                    | nex_db::Error::Invalid { .. },
+                ) => {}
+                Err(e) => return Err(nex(e)),
             }
         }
-        Ok(())
-    }
-
-    fn change(&self, rid: nex_db::EntityId, fields: &[(&str, String)]) -> Result<(), StoreError> {
-        let content = self.content();
-        let patch = fields
-            .iter()
-            .fold(Patch::new(), |p, (k, v)| p.set(*k, v.as_str()));
-        content.save_draft(rid, patch).map_err(nex)?;
-        content.publish(rid).map_err(nex)?;
-        Ok(())
+        Err(StoreError::new(
+            crate::content::StoreErrorKind::Conflict,
+            "another writer kept changing the same record",
+        ))
     }
 
     fn remove(&self, path: &str) -> Result<(), StoreError> {
@@ -244,15 +268,22 @@ impl ChatStore for NexChat {
     }
 
     fn set_last(&self, id: &ConvId, number: u64, at_ms: u64) -> Result<(), StoreError> {
-        let Some((rid, e)) = self.entry(&format!("/c/{id}"))? else {
+        let Some((_, e)) = self.entry(&format!("/c/{id}"))? else {
             return Ok(());
         };
         if number <= Self::number(&e, "last") {
             return Ok(());
         }
-        self.change(
-            rid,
-            &[("last", number.to_string()), ("at", at_ms.to_string())],
+        self.upsert(
+            CONV_KIND,
+            &format!("/c/{id}"),
+            None,
+            &[
+                ("kind", Self::text(&e, "kind")),
+                ("members", Self::text(&e, "members")),
+                ("last", number.to_string()),
+                ("at", at_ms.to_string()),
+            ],
         )
     }
 
@@ -313,6 +344,39 @@ impl ChatStore for NexChat {
         } else {
             self.remove(&path)
         }
+    }
+
+    fn blocks_of(&self, who: u128) -> Result<Vec<u128>, StoreError> {
+        let content = self.content();
+        let mut page = content
+            .list(
+                &nex_db::Listing::latest(BLOCK_KIND)
+                    .site(self.site.as_ref())
+                    .by_author(account_id(who))
+                    .limit(1000),
+            )
+            .map_err(nex)?;
+        let prefix = format!("/b/{}/", hex(who));
+        let mut out = Vec::new();
+        loop {
+            for item in page.items() {
+                if let Some(a) = item
+                    .route()
+                    .and_then(|(_, p)| p.strip_prefix(&prefix))
+                    .and_then(|h| u128::from_str_radix(h, 16).ok())
+                {
+                    out.push(a);
+                }
+            }
+            if out.len() >= 10_000 {
+                break;
+            }
+            match page.next() {
+                Some(c) => page = content.next_page(c).map_err(nex)?,
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     fn usage(&self, account: u128) -> Result<Usage, StoreError> {
@@ -392,13 +456,15 @@ impl ChatStore for NexChat {
             .collect())
     }
 
-    fn delete_conversation(&self, id: &ConvId, last: u64) -> Result<(), StoreError> {
-        for n in 1..=last {
-            self.remove(&format!("/c/{id}/m/{n:020}"))?;
-        }
+    fn delete_conversation(&self, id: &ConvId) -> Result<(), StoreError> {
+        self.remove(&format!("/c/{id}"))?;
         self.remove(&format!("/c/{id}/g"))?;
-        self.remove(&format!("/c/{id}/room"))?;
-        self.remove(&format!("/c/{id}"))
+        self.remove(&format!("/c/{id}/room"))
+    }
+
+    fn forget_member(&self, id: &ConvId, account: u128) -> Result<(), StoreError> {
+        self.remove(&format!("/c/{id}/r/{}", hex(account)))?;
+        self.remove(&format!("/c/{id}/mute/{}", hex(account)))
     }
 
     fn room(&self, id: &ConvId) -> Result<Option<Room>, StoreError> {
@@ -452,7 +518,83 @@ impl ChatStore for NexChat {
         Ok(out)
     }
 
-    fn delete_message(&self, id: &ConvId, number: u64) -> Result<(), StoreError> {
-        self.remove(&format!("/c/{id}/m/{number:020}"))
+    fn delete_messages(&self, id: &ConvId, from: u64, to: u64) -> Result<(), StoreError> {
+        for n in from..=to {
+            self.remove(&format!("/c/{id}/m/{n:020}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::{Group, GroupMember, GroupRole, GroupSettings};
+
+    fn group(name: &str, banned: Vec<u128>) -> Group {
+        Group {
+            name: name.to_owned(),
+            members: vec![GroupMember {
+                account: 1,
+                role: GroupRole::Owner,
+                joined: 0,
+            }],
+            invited: Vec::new(),
+            banned,
+            settings: GroupSettings {
+                cap: 50,
+                advanced: false,
+                history: 0,
+                before_join: false,
+                members_invite: false,
+            },
+        }
+    }
+
+    #[test]
+    fn records_are_overwritten_without_history() {
+        let db = NexDb::open_temporary().expect("db");
+        let chat = NexChat::new(db, super::super::DEFAULT_REALM);
+        let id = ConvId([7; 16]);
+        let revisions = |chat: &NexChat, path: &str| {
+            let (rid, _) = chat.entry(path).expect("read").expect("there");
+            chat.content().revisions(rid).expect("revisions").len()
+        };
+        // A record changed again and again keeps one revision, never a
+        // history that grows with each change.
+        for n in 0..20u128 {
+            chat.put_group(&id, &group("Team", (0..n).collect()))
+                .expect("put");
+        }
+        let path = format!("/c/{id}/g");
+        assert_eq!(revisions(&chat, &path), 1);
+        assert_eq!(
+            chat.group(&id).expect("read").map(|g| g.banned.len()),
+            Some(19)
+        );
+        // Writing what is there already writes nothing.
+        let (before, _) = chat.entry(&path).expect("read").expect("there");
+        chat.put_group(&id, &group("Team", (0..19).collect()))
+            .expect("put");
+        let (after, _) = chat.entry(&path).expect("read").expect("there");
+        assert_eq!(before, after, "the same entity, untouched");
+        // So does every hot record: a read marker, a usage count.
+        for n in 1..=20 {
+            chat.set_read(&id, 2, n).expect("read marker");
+            chat.set_usage(
+                2,
+                crate::chat::Usage {
+                    started: 1,
+                    messages: n,
+                },
+            )
+            .expect("usage");
+        }
+        assert_eq!(revisions(&chat, &format!("/c/{id}/r/{:032x}", 2)), 1);
+        assert_eq!(revisions(&chat, &format!("/q/{:032x}", 2)), 1);
+        assert_eq!(chat.read_marker(&id, 2).expect("read"), 20);
+        // What a leaver kept goes.
+        chat.forget_member(&id, 2).expect("forget");
+        assert_eq!(chat.read_marker(&id, 2).expect("read"), 0);
     }
 }
