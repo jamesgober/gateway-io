@@ -28,6 +28,7 @@
   let pages = 0; // pages of the conversation list read since the first
   const MAX_PAGES = 20;
   const conversations = new Map(); // id -> summary
+  const pending = new Map(); // nonce -> the text sent, until it is answered
   const shown = new Set(); // numbers on the page, for the open conversation
 
   const say = (text) => { status.textContent = text; };
@@ -105,9 +106,14 @@
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = r.name + ' (' + r.people + ')';
-      b.title = r.topic || '';
       b.addEventListener('click', () => { leaveRoom(); send({ op: 'enter', room: r.id }); });
       li.appendChild(b);
+      if (r.topic) {
+        const topic = document.createElement('span');
+        topic.className = 'chat-topic';
+        topic.textContent = r.topic;
+        li.appendChild(topic);
+      }
       roomList.appendChild(li);
     }
   }
@@ -155,6 +161,11 @@
       if (!conversations.has(f.id)) conversations.set(f.id, { id: f.id, members: f.members, unread: 0, read: 0, last: 0 });
       drawList();
       select(f.id);
+      say('');
+    },
+    sent(f) {
+      pending.delete(f.nonce);
+      say('');
     },
     history(f) {
       if (f.conversation !== current) return;
@@ -205,15 +216,23 @@
     },
     left(f) { handlers.removed(f); say('You left the group.'); },
     invite() { say('Invited.'); },
+    member(f) {
+      const c = conversations.get(f.conversation);
+      if (!c || f.account === me) return;
+      const what = { joined: 'joined', left: 'left', kicked: 'was taken out of', role: 'has a new role in', owner: 'now owns' }[f.event];
+      if (what) say(f.account + ' ' + what + ' ' + (c.name || 'the group') + '.');
+    },
     rooms(f) { drawRooms(f.items || []); },
     room(f) {
       if (room === f.id || current === f.id) return;
       room = f.id;
       conversations.set(f.id, { id: f.id, kind: 'room', name: f.name, unread: 0, read: 0, last: 0 });
+      drawList();
       select(f.id);
       inviteForm.hidden = true;
       say('In ' + f.name + '.');
       send({ op: 'who', room: f.id });
+      send({ op: 'rooms' });
     },
     entered(f) { if (f.room === room) send({ op: 'who', room }); },
     exited(f) { if (f.room === room && f.account !== me) send({ op: 'who', room }); },
@@ -221,8 +240,19 @@
     kicked(f) { outOfRoom(f.room, 'You were put out of the room.'); },
     banned(f) { outOfRoom(f.room, 'You may not come back to that room for now.'); },
     room_closed(f) { outOfRoom(f.room, 'The room was closed.'); },
+    room_left(f) { outOfRoom(f.room, 'You may no longer be in that room.'); },
     muted() { say('You may not write in this room for now.'); },
-    error(f) { say(f.message || 'Something went wrong.'); },
+    error(f) {
+      say(f.message || 'Something went wrong.');
+      // A refused message: its text goes back in the box, so nothing typed
+      // is lost.
+      const text = f.nonce && pending.get(f.nonce);
+      if (text) {
+        pending.delete(f.nonce);
+        const box = sendForm.elements.text;
+        if (!box.value) box.value = text;
+      }
+    },
   };
 
   function connect() {
@@ -283,6 +313,7 @@
   $('chat-open').addEventListener('submit', (e) => {
     e.preventDefault();
     send({ op: 'open', with: e.target.elements.with.value.trim().toLowerCase() });
+    e.target.reset();
   });
   sendForm.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -290,6 +321,8 @@
     const text = box.value;
     if (!current || !text.trim()) return;
     nonce += 1;
+    pending.set(String(nonce), text);
+    if (pending.size > 50) pending.delete(pending.keys().next().value);
     send({ op: 'send', conversation: current, nonce: String(nonce), body: [{ text }] });
     box.value = '';
   });

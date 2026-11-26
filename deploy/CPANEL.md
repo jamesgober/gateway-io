@@ -105,5 +105,5 @@ To see one line per request for a while, set `access_log = true` under `[gateway
   1. Stop the application.
   2. Replace `wasp`, `app.js` and `themes/default` with the new bundle's. Keep `wasp.conf` and `data/`. `run/` may stay; a socket left in it is replaced at the next start.
   3. Start it again.
-- **Back up:** copy the `data` folder while the application is stopped. Only one process may open the database at a time.
+- **Back up:** add `[backup] path = "/home/<account>/wasp-backups"` (outside `data/` and outside `public_html`) to `wasp.conf`, and wasp backs itself up while it runs: at start, every hour (`every`), and at a clean stop. Copy that folder off the server on a schedule. To restore, run `./wasp restore /home/<account>/wasp-backups /home/<account>/wasp-data-restored` and point `nex.path` at the new folder. [BACKUP.md](BACKUP.md) has the whole procedure and what a restore can't bring back. Never copy `data/nex` while wasp runs: a copy made mid-write is not a backup.
 - **A full disk:** when the account's quota fills, the database stops taking writes: sign-in and saves answer 503, and `/ready` answers 503. Free some space, then restart the application.

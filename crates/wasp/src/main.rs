@@ -30,6 +30,27 @@ fn main() -> ExitCode {
     #[cfg(unix)]
     let parent = std::os::unix::process::parent_id();
 
+    // `wasp restore <backup folder> <data folder>` needs no site: it runs
+    // before anything boots, and exits.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "store-nex")]
+    if args.first().map(String::as_str) == Some("restore") {
+        let (Some(from), Some(into)) = (args.get(1), args.get(2)) else {
+            eprintln!("usage: wasp restore <backup folder> <new data folder>");
+            return ExitCode::from(64);
+        };
+        return match wasp::backup::restore(std::path::Path::new(from), std::path::Path::new(into)) {
+            Ok(done) => {
+                println!("{done}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("restore refused: {reason}");
+                ExitCode::from(REFUSED)
+            }
+        };
+    }
+
     // PHASE 0: the foundation and the kernel. Nothing is open yet.
     // No single-instance lock: a restart behind an application server
     // overlaps the old process's drain, and the database has its own lock.
@@ -46,7 +67,6 @@ fn main() -> ExitCode {
     };
 
     // `wasp import <folder>`: content into the store, then exit.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("import") {
         let Some(from) = args.get(1) else {
             eprintln!("usage: wasp import <folder with posts/ and pages/>");
@@ -123,6 +143,15 @@ fn main() -> ExitCode {
     }
 
     watch_providers(boot.foundation(), wiring.core.clone());
+
+    // Backups start before the door, so they stop after it: the last one
+    // is made when nothing more is written.
+    #[cfg(feature = "store-nex")]
+    if let Some(backups) = wiring.backups
+        && let Err(error) = boot.start(backups)
+    {
+        return failed(boot.foundation(), &error);
+    }
 
     // PHASE 4: the door opens last.
     if let Err(error) = boot.start(

@@ -6,6 +6,8 @@ pub mod api;
 #[cfg(feature = "gatekeeper")]
 pub mod auth;
 #[cfg(feature = "store-nex")]
+pub mod backup;
+#[cfg(feature = "store-nex")]
 pub mod chat;
 pub mod content;
 pub mod events;
@@ -81,6 +83,10 @@ pub struct Wiring {
     /// Ends open WebSockets on account events; attach it to the gateway
     /// once it is open.
     pub revoker: gateway_io::Revoker,
+    /// Backups of the running site (`[backup]`), when configured: start it
+    /// before the door, so its last backup comes after the door closed.
+    #[cfg(feature = "store-nex")]
+    pub backups: Option<backup::Backups>,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -115,19 +121,7 @@ fn site_keys(
     secret_dir: Option<&std::path::Path>,
     boot: Option<String>,
 ) -> Result<site_nex::SiteKeys, String> {
-    let named: Option<std::path::PathBuf> = config.get("auth.secret").map_err(|e| e.to_string())?;
-    // Beside the database, so it follows the site (and its backups) and two
-    // sites never share it.
-    let database: Option<std::path::PathBuf> = config.get("nex.path").map_err(|e| e.to_string())?;
-    let beside = database.map(|db| {
-        db.parent()
-            .unwrap_or_else(|| std::path::Path::new(""))
-            .join("gate.key")
-    });
-    let master = match named
-        .or(beside)
-        .or_else(|| secret_dir.map(|d| d.join("gate.key")))
-    {
+    let master = match master_secret_path(config, secret_dir)? {
         Some(path) => secret::read_or_create(&path)?,
         None => secret::fresh()?,
     };
@@ -139,6 +133,26 @@ fn site_keys(
         ),
         boot,
     })
+}
+
+/// Where the master secret lives: `auth.secret`, else beside the database
+/// (`gate.key` next to `nex.path`), so it follows the site and its
+/// backups and two sites never share it, else in `secret_dir`.
+#[cfg(feature = "store-nex")]
+fn master_secret_path(
+    config: &Config,
+    secret_dir: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let named: Option<std::path::PathBuf> = config.get("auth.secret").map_err(|e| e.to_string())?;
+    let database: Option<std::path::PathBuf> = config.get("nex.path").map_err(|e| e.to_string())?;
+    let beside = database.map(|db| {
+        db.parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("gate.key")
+    });
+    Ok(named
+        .or(beside)
+        .or_else(|| secret_dir.map(|d| d.join("gate.key"))))
 }
 
 /// The nex-db database (`[nex] path`, default `<data_dir>/nex`), opened once
@@ -472,6 +486,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("nex", &["lock_wait", "path"]),
     ("admin", &["custom_theme", "theme"]),
     ("api", &["burst", "enabled", "prefix", "rate"]),
+    ("backup", &["every", "path"]),
     (
         "chat",
         &[
@@ -1023,6 +1038,26 @@ fn wire_with(
     let theme = watchers
         .next()
         .ok_or_else(|| "no theme was loaded".to_owned())?;
+    // Backups need the database they back up.
+    #[cfg(feature = "store-nex")]
+    let backups = match (backup::BackupSettings::from_config(config)?, &shared.nex) {
+        (None, _) => None,
+        (Some(settings), Some(db)) => Some(backup::Backups::new(
+            settings,
+            db.clone(),
+            master_secret_path(config, secret_dir)?,
+        )),
+        (Some(_), None) => {
+            return Err(
+                "backup.path backs up the nex-db database: set content.store or auth.store to \"nex\""
+                    .to_owned(),
+            );
+        }
+    };
+    #[cfg(not(feature = "store-nex"))]
+    if config.contains("backup.path") {
+        return Err("backup.path needs nex-db: build wasp with the `store-nex` feature".to_owned());
+    }
     Ok(Wiring {
         core,
         site,
@@ -1030,6 +1065,8 @@ fn wire_with(
         gatekeeper,
         #[cfg(feature = "store-nex")]
         nex: shared.nex,
+        #[cfg(feature = "store-nex")]
+        backups,
         theme,
         more_themes: watchers.collect(),
         auth_policy,

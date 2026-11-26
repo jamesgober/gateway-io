@@ -299,6 +299,34 @@ impl NexDb {
     fn db(&self) -> &nex_db::Database {
         &self.db
     }
+
+    /// Backs the database up into `to` while it runs: a base into an empty
+    /// folder (writes wait while it is written; reads go on), then only
+    /// what was committed since. `true` when it appended.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreErrorKind::Invalid`] when `to` holds something that is not a
+    /// backup of this database, or one its log moved past.
+    pub fn backup(&self, to: &std::path::Path) -> Result<bool, StoreError> {
+        self.db
+            .backup(to)
+            .map(|info| info.incremental())
+            .map_err(nex)
+    }
+}
+
+/// Makes a database in `into` (empty) from the backup in `backup`, at the
+/// last commit it holds. Revocations committed after that point are
+/// applied again when it first opens.
+///
+/// # Errors
+///
+/// When `into` is not empty or the backup fails nex-db's checks.
+pub fn restore(backup: &std::path::Path, into: &std::path::Path) -> Result<(), StoreError> {
+    nex_db::restore(backup, into, nex_db::RestorePoint::Latest)
+        .map(|_| ())
+        .map_err(nex)
 }
 
 impl std::fmt::Debug for NexDb {
