@@ -531,6 +531,7 @@ A key wasp does not know, in any section, refuses the boot with its name, so a t
 | `gateway.stage_timing` | false | record where each request's server time goes; logged per stage when the gateway stops |
 | `gateway.ingress` | `direct` | `direct`, or `proxy` behind a reverse proxy: the client is the address in `X-Forwarded-For`, believed only from `gateway.trusted_proxies`, and the door bans and charges that client; a trusted proxy that sends no header is refused |
 | `gateway.trusted_proxies` | none | the proxies' addresses or blocks (`127.0.0.1`, `10.0.0.0/8`); required with `ingress = "proxy"` |
+| `gateway.h2c` | on behind a trusted proxy | cleartext HTTP/2 with prior knowledge: a connection that opens with the HTTP/2 preface is served as HTTP/2, any other as HTTP/1.1. Only ever behind a trusted proxy (`ingress = "proxy"`, or the start shim's socket), never on an open port, where it would let a client skip TLS. `false` turns it off; `true` refuses to start without a trusted proxy. WebSockets stay on HTTP/1.1 |
 | `gateway.forwarded_proto` | true | with `ingress = "proxy"`, take the scheme from `X-Forwarded-Proto` (an https proxy in front makes the site https) |
 | `door.ban` | none | addresses refused at the door; changes apply on reload |
 | `door.exempt` | none | addresses exempt from the door's budgets (local load tests); changes apply on reload |

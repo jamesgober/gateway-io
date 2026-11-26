@@ -140,6 +140,7 @@ impl Door {
         let (bouncer, ejector) =
             bouncer::build(settings, events).map_err(|e| OpenError(format!("bouncer: {e}")))?;
 
+        let engine = engine(settings)?;
         let mut builder = Server::builder()
             .listener(listener(settings)?)
             .limits(limits)
@@ -153,6 +154,7 @@ impl Door {
         for p in core.profiles() {
             builder = builder.profile(
                 serve_net::Profile::new(serve_net::ProfileId(p.id.0))
+                    .engine(engine)
                     .tag(p.service.0)
                     .lane(serve_net::Lane(p.lane.0))
                     .critical(p.critical)
@@ -294,6 +296,24 @@ impl Door {
         // drain ends.
         self.ejector.detach();
         self.running.drain(deadline)
+    }
+}
+
+/// The protocol engine of every profile: HTTP/1.1, or HTTP/1.1 and
+/// cleartext HTTP/2 by the connection preface behind a trusted proxy
+/// (`gateway.h2c`, G-87). HTTP/2 over TLS (ALPN `h2`) waits for wasp to
+/// terminate TLS itself.
+fn engine(settings: &Settings) -> Result<serve_net::EngineChoice, OpenError> {
+    // A Unix socket behind the start shim is proxy ingress too (G-79).
+    let behind_proxy = matches!(settings.ingress, IngressMode::Proxy { .. });
+    match (settings.h2c, behind_proxy) {
+        (crate::settings::H2c::Off, _) | (crate::settings::H2c::Auto, false) => {
+            Ok(serve_net::EngineChoice::Http1)
+        }
+        (crate::settings::H2c::On, false) => Err(OpenError(
+            "gateway.h2c = true needs a trusted proxy in front (gateway.ingress = \"proxy\" or the start shim's socket): cleartext HTTP/2 on an open port would let any client skip TLS".into(),
+        )),
+        (_, true) => Ok(serve_net::EngineChoice::Http1OrH2ByPreface),
     }
 }
 
